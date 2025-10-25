@@ -162,35 +162,31 @@ export async function GET(req: Request, { params }: { params: { ticker: string }
     const bundle: DataBundle = { ticker: t, fundamentals, prices: priceFeed, sources_used };
     const { subscores, maxes } = computeScore(bundle);
 
-    // ===== Couverture affichée (UI) = par PILIERS =====
-    const qualityPresent   = typeof fundamentals.op_margin.value === "number";
-    const safetyPresent    =
-      typeof fundamentals.current_ratio.value === "number" || typeof fundamentals.net_cash.value === "number";
-    const valuationPresent =
-      typeof fundamentals.fcf_yield.value === "number" || typeof fundamentals.earnings_yield.value === "number";
-    const momentumPresent  =
-      typeof priceFeed.px_vs_200dma.value === "number" ||
-      (typeof priceFeed.ret_60d.value === "number" && priceFeed.ret_60d.value > 0);
+    // ===== Fiabilité (UI) basée sur les *maxes* réellement disponibles =====
+    // Chaque pilier est ramené à son plafond interne (8/6/10/15) puis mappé sur (35/25/25/15).
+    const covQuality = Math.min(1, (maxes.quality || 0) / 8) * 35;   // 0..35
+    const covSafety  = Math.min(1, (maxes.safety  || 0) / 6) * 25;   // 0..25
+    const covVal     = Math.min(1, (maxes.valuation|| 0) / 10) * 25; // 0..25
+    const covMom     = Math.min(1, (maxes.momentum || 0) / 15) * 15; // 0..15
+    const coverage_display = Math.round(covQuality + covSafety + covVal + covMom); // 0..100
 
-    const coverage_display =
-      (qualityPresent ? 35 : 0) +
-      (safetyPresent ? 25 : 0) +
-      (valuationPresent ? 25 : 0) +
-      (momentumPresent ? 15 : 0);
-
-    // ===== Couverture pour la normalisation du score = “maxes” dispos =====
+    // ===== Couverture pour la normalisation du score (dénominateur) =====
+    // Somme des maxes effectivement disponibles (0..39)
     const denom = Math.max(
       1,
-      Math.round(maxes.quality + maxes.safety + maxes.valuation + maxes.momentum) // typiquement ≤ 39
+      Math.round(maxes.quality + maxes.safety + maxes.valuation + maxes.momentum)
     );
 
     const total = subscores.quality + subscores.safety + subscores.valuation + subscores.momentum;
     const raw = Math.max(0, Math.min(100, Math.round(total)));
-    const score_adj = Math.round((total / denom) * 100); // ← remet des 60–80 quand les briques clés sont là
+    const score_adj = Math.round((total / denom) * 100); // normalisation → 0..100
 
     // Couleur & verdict basés sur le score affiché (shown)
     const shown = score_adj ?? raw;
     const color: ScorePayload["color"] = shown >= 65 ? "green" : shown >= 50 ? "orange" : "red";
+
+    // Momentum “présent” uniquement si la 200DMA est vraiment calculable (≥200 points)
+    const momentumPresent = typeof priceFeed.px_vs_200dma.value === "number";
 
     const { verdict, reason } = makeVerdict({
       coverage: coverage_display,
@@ -431,17 +427,15 @@ function computeScore(d: DataBundle) {
   const f = d.fundamentals,
     p = d.prices;
 
-  // Qualité (35)
-  let q = 0,
-    qMax = 0;
+  // Qualité (35) — plafond interne 8
+  let q = 0, qMax = 0;
   if (typeof f.op_margin.value === "number") {
     qMax += 8;
     q += f.op_margin.value >= 0.25 ? 8 : f.op_margin.value >= 0.15 ? 6 : f.op_margin.value >= 0.05 ? 3 : 0;
   }
 
-  // Sécurité (25)
-  let s = 0,
-    sMax = 0;
+  // Sécurité (25) — plafond interne 6 (4 + 2)
+  let s = 0, sMax = 0;
   if (typeof f.current_ratio.value === "number") {
     sMax += 4;
     s += f.current_ratio.value > 1.5 ? 4 : f.current_ratio.value >= 1 ? 2 : 0;
@@ -451,9 +445,8 @@ function computeScore(d: DataBundle) {
     s += f.net_cash.value > 0 ? 2 : 0;
   }
 
-  // Valorisation (25)
-  let v = 0,
-    vMax = 0;
+  // Valorisation (25) — plafond interne 10
+  let v = 0, vMax = 0;
   if (typeof f.fcf_yield.value === "number") {
     vMax += 10;
     const y = f.fcf_yield.value;
@@ -464,9 +457,8 @@ function computeScore(d: DataBundle) {
     v += y > 0.07 ? 9 : y >= 0.05 ? 6 : y >= 0.03 ? 3 : 1;
   }
 
-  // Momentum (15)
-  let m = 0,
-    mMax = 0;
+  // Momentum (15) — plafond interne 15
+  let m = 0, mMax = 0;
   if (typeof p.px_vs_200dma.value === "number") {
     mMax += 10;
     m += p.px_vs_200dma.value >= 0.05 ? 10 : p.px_vs_200dma.value > -0.05 ? 6 : 2;
@@ -481,7 +473,7 @@ function computeScore(d: DataBundle) {
   }
   // borne logique côté score
   m = Math.min(m, 15);
-  // mMax reste *ce qui est réellement disponible* (0..15)
+  // mMax reste ce qui est réellement disponible (0..15)
 
   const subscores = {
     quality: clip(q, 0, 35),
@@ -505,7 +497,7 @@ function buildReasons(_d: DataBundle, subs: Record<string, number>) {
 
 function makeVerdict(args: { coverage: number; total: number; momentumPresent: boolean; score_adj: number }) {
   const { coverage, momentumPresent, score_adj } = args;
-  const coverageOk = coverage >= 40; // assoupli
+  const coverageOk = coverage >= 40; // assoupli pour éviter “À SURVEILLER” partout
   if (score_adj >= 70 && coverageOk && momentumPresent) return { verdict: "sain" as const, reason: "Score élevé et couverture suffisante" };
   if (score_adj >= 50 || momentumPresent) return { verdict: "a_surveiller" as const, reason: "Signal positif mais incomplet" + (coverageOk ? "" : " (couverture limitée)") };
   return { verdict: "fragile" as const, reason: "Signal faible" + (coverageOk ? "" : " (données partielles)") };
