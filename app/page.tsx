@@ -13,15 +13,15 @@ type ScoreResponse = {
   verdict: "sain" | "a_surveiller" | "fragile";
   verdict_reason: string;
   proof?: {
-    price_source?: "yahoo" | "stooq.com" | "stooq.pl";
+    price_source?: string;
     price_points?: number;
     price_has_200dma: boolean;
     price_recency_days?: number | null;
     sec_used?: string[];
     sec_note?: string | null;
     valuation_used?: boolean;
+    sources_used?: string[];
   };
-  debug?: Record<string, any>;
 };
 
 type SuggestItem = { symbol: string; shortname: string; exchDisp: string };
@@ -33,7 +33,7 @@ export default function Page() {
   const [data, setData] = useState<ScoreResponse | null>(null);
   const [error, setError] = useState<string | null>(null);
 
-  // suggestions (Yahoo search) — supposé par ton endpoint /api/suggest
+  // suggestions via /api/suggest (déjà présent chez toi)
   useEffect(() => {
     const t = setTimeout(async () => {
       if (!q || q.trim().length < 2) { setSuggests([]); return; }
@@ -42,7 +42,7 @@ export default function Page() {
         const js = await res.json();
         setSuggests(js.items || []);
       } catch { setSuggests([]); }
-    }, 220);
+    }, 200);
     return () => clearTimeout(t);
   }, [q]);
 
@@ -59,9 +59,7 @@ export default function Page() {
         throw new Error(j?.error || `API ${res.status}`);
       }
       const json: ScoreResponse = await res.json();
-      setData(json);
-      setSuggests([]);
-      setQ(tick);
+      setData(json); setSuggests([]); setQ(tick);
     } catch (e: any) {
       setError(e?.message || "Erreur inconnue");
     } finally {
@@ -69,15 +67,10 @@ export default function Page() {
     }
   };
 
-  const onEnter = (e: React.KeyboardEvent<HTMLInputElement>) => {
-    if (e.key === "Enter") lookup();
-  };
+  const onEnter = (e: React.KeyboardEvent<HTMLInputElement>) => { if (e.key === "Enter") lookup(); };
 
   // UI helpers
-  const scoreDisplay = useMemo(() => {
-    if (!data) return 0;
-    return typeof data.score_adj === "number" ? data.score_adj : data.score;
-  }, [data]);
+  const scoreDisplay = useMemo(() => (!data ? 0 : typeof data.score_adj === "number" ? data.score_adj : data.score), [data]);
 
   const verdictChip = (v: ScoreResponse["verdict"]) =>
     v === "sain" ? "bg-green-600/20 text-green-300 border-green-500/40"
@@ -99,8 +92,7 @@ export default function Page() {
 
   const ringStyle = useMemo(() => {
     const pct = Math.max(0, Math.min(100, scoreDisplay));
-    const hue =
-      pct >= 70 ? 140 : pct >= 40 ? 40 : 0; // vert / ambre / rouge
+    const hue = pct >= 70 ? 140 : pct >= 40 ? 40 : 0;
     const grad = `conic-gradient(hsl(${hue}deg 70% 50%) ${pct * 3.6}deg, rgba(148,163,184,.2) 0)`;
     return { backgroundImage: grad };
   }, [scoreDisplay]);
@@ -123,7 +115,7 @@ export default function Page() {
               value={q}
               onChange={(e) => setQ(e.target.value)}
               onKeyDown={onEnter}
-              placeholder="Rechercher une action : AAPL, RACE, OR.PA, 7203.T, TSLA…"
+              placeholder="Rechercher : AAPL, RACE, OR.PA, 7203.T, TSLA…"
               className="flex-1 bg-transparent px-3 py-3 outline-none placeholder:text-slate-500"
             />
             <button
@@ -158,22 +150,25 @@ export default function Page() {
           </div>
         )}
 
-        {/* Result card */}
+        {/* Result */}
         {data && (
           <section className="mt-8">
             <div className="rounded-3xl border border-slate-700/70 bg-slate-900/60 backdrop-blur shadow-xl p-6 md:p-8">
-              {/* Top row: title + verdict + score ring */}
+              {/* Top row */}
               <div className="grid grid-cols-1 md:grid-cols-[1fr_auto] gap-6 items-center">
                 <div className="space-y-2">
                   <div className="flex items-center gap-3 flex-wrap">
                     <h2 className="text-2xl md:text-3xl font-bold tracking-tight">{data.ticker.toUpperCase()}</h2>
                     {coverageBadge(data.coverage)}
                     <span
-                      className={`px-2 py-1 text-xs rounded-full border ${verdictChip(data.verdict)}`}
+                      className={`px-2 py-1 text-xs rounded-full border ${
+                        data.verdict === "sain" ? "bg-green-600/20 text-green-300 border-green-500/40"
+                        : data.verdict === "a_surveiller" ? "bg-amber-600/20 text-amber-300 border-amber-500/40"
+                        : "bg-red-600/20 text-red-300 border-red-500/40"
+                      }`}
                       title={data.verdict_reason}
                     >
-                      {data.verdict === "sain" ? "SAIN"
-                        : data.verdict === "a_surveiller" ? "À SURVEILLER" : "FRAGILE"}
+                      {data.verdict === "sain" ? "SAIN" : data.verdict === "a_surveiller" ? "À SURVEILLER" : "FRAGILE"}
                     </span>
                   </div>
                   <div className="text-sm text-slate-400">{data.verdict_reason}</div>
@@ -222,12 +217,13 @@ export default function Page() {
                 </div>
               </div>
 
-              {/* Subscores as bars */}
+              {/* Subscores bars */}
               <div className="mt-6">
                 <h3 className="text-sm uppercase tracking-wide text-slate-400">Sous-scores</h3>
                 <div className="mt-3 space-y-3">
                   {Object.entries(data.subscores).map(([k, v]) => {
-                    const pct = Math.max(0, Math.min(100, Math.round((v / (k === "momentum" ? 15 : k === "quality" ? 35 : k === "safety" ? 25 : 25)) * 100)));
+                    const max = k === "momentum" ? 15 : k === "quality" ? 35 : k === "safety" ? 25 : 25;
+                    const pct = Math.max(0, Math.min(100, Math.round((v / max) * 100)));
                     return (
                       <div key={k}>
                         <div className="flex items-center justify-between text-xs mb-1">
@@ -235,10 +231,7 @@ export default function Page() {
                           <span className="tabular-nums text-slate-400">{Math.round(v)}</span>
                         </div>
                         <div className="h-2.5 rounded-full bg-slate-800 overflow-hidden">
-                          <div
-                            className="h-full rounded-full transition-all"
-                            style={{ width: `${pct}%`, backgroundImage: "linear-gradient(90deg, #22d3ee, #34d399)" }}
-                          />
+                          <div className="h-full rounded-full transition-all" style={{ width: `${pct}%`, backgroundImage: "linear-gradient(90deg, #22d3ee, #34d399)" }} />
                         </div>
                       </div>
                     );
@@ -246,8 +239,8 @@ export default function Page() {
                 </div>
               </div>
 
-              {/* PROOFS */}
-              {"proof" in (data as any) && data.proof && (
+              {/* Proofs & sources */}
+              {data.proof && (
                 <details className="mt-6 text-xs text-slate-400 group">
                   <summary className="cursor-pointer inline-flex items-center gap-2">
                     <span className="w-1.5 h-1.5 rounded-full bg-slate-500 group-open:bg-emerald-400 transition" />
@@ -268,6 +261,16 @@ export default function Page() {
                       <div>Valuation utilisée : {data.proof.valuation_used ? "oui" : "non"}</div>
                     </div>
                   </div>
+
+                  {!!data.proof.sources_used?.length && (
+                    <div className="mt-3 flex flex-wrap gap-2">
+                      {data.proof.sources_used.map((s, i) => (
+                        <span key={i} className="px-2 py-1 rounded-full bg-slate-800/60 border border-slate-700">
+                          {s}
+                        </span>
+                      ))}
+                    </div>
+                  )}
                 </details>
               )}
             </div>
