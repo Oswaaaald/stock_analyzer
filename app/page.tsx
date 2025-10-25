@@ -347,20 +347,26 @@ export default function Page() {
           {/* Left: Score & pillars */}
           <div className="lg:col-span-2">
             <div className="rounded-3xl border border-slate-800 bg-gradient-to-b from-slate-900/60 to-slate-900/30 p-6 md:p-7">
-              {/* Header line: name + chips */}
+              {/* Header line: ticker (gros) + nom en dessous + chips */}
               <div className="flex items-start gap-4">
                 <div className="flex-1">
                   <div className="flex items-center gap-3 flex-wrap">
                     <h2 className="text-2xl font-semibold tracking-tight">
-                      {selected?.name
-                        ? `${selected.name}${selected.exchange ? " — " + selected.exchange?.toUpperCase() : ""}`
-                        : data.ticker.toUpperCase()}
+                      {data.ticker.toUpperCase()}
                     </h2>
                     {verdictBadge}
                     <span className="text-xs px-2 py-0.5 rounded-full border border-slate-700 text-slate-300">
                       Couverture des données&nbsp;: {data.coverage}%
                     </span>
                   </div>
+
+                  {/* NOM COMPLET — PLACE (revenu “comme avant”) */}
+                  {selected?.name && (
+                    <div className="mt-1 text-sm text-slate-400">
+                      {selected.name}
+                      {selected.exchange ? ` — ${selected.exchange.toUpperCase()}` : ""}
+                    </div>
+                  )}
 
                   {/* Score line */}
                   <div className="mt-3 flex items-end gap-4 flex-wrap">
@@ -391,6 +397,13 @@ export default function Page() {
                 <h3 className="text-sm uppercase tracking-wide text-slate-400">Piliers de performance</h3>
                 <div className="mt-3 grid grid-cols-1 sm:grid-cols-2 gap-3">
                   {Object.entries(data.subscores || {}).map(([k, v]) => {
+                    const PILLAR_MAX: Record<string, number> = { quality: 35, safety: 25, valuation: 25, momentum: 15 };
+                    const PILLAR_LABEL: Record<string, string> = {
+                      quality: "Qualité opérationnelle",
+                      safety: "Solidité financière",
+                      valuation: "Valorisation",
+                      momentum: "Momentum / Tendance",
+                    };
                     const max = PILLAR_MAX[k] ?? 10;
                     const pct = Math.max(0, Math.min(100, (v / max) * 100));
                     return (
