@@ -179,27 +179,36 @@ function parseStooqCsv(csv: string): { dates: string[]; closes: number[] } {
    - /api/xbrl/companyfacts/CIK####.json -> facts (assets, liabilities, revenue, opInc, cashflow, shares)
 */
 
-let TICKER_MAP: Record<string, { cik_str: number; ticker: string; title: string }> | null = null;
+// AVANT
+// let TICKER_MAP: Record<string, { cik_str: number; ticker: string; title: string }> | null = null;
+// let TICKER_MAP_EXP = 0;
+
+// APRES
+let TICKER_MAP: Record<string, { cik_str: number; ticker: string; title: string }> = {};
 let TICKER_MAP_EXP = 0;
 
-async function loadTickerMap(): Promise<typeof TICKER_MAP> {
+async function loadTickerMap(): Promise<Record<string, { cik_str: number; ticker: string; title: string }>> {
   const now = Date.now();
-  if (TICKER_MAP && TICKER_MAP_EXP > now) return TICKER_MAP;
+  if (Object.keys(TICKER_MAP).length && TICKER_MAP_EXP > now) return TICKER_MAP;
+
   const url = "https://www.sec.gov/files/company_tickers.json";
   const res = await fetch(url, {
     headers: { "User-Agent": `StockAnalyzer/1.0 (${CONTACT_EMAIL})`, "Accept": "application/json" }
   });
-  if (!res.ok) throw new Error(`SEC map HTTP ${res.status}`);
+  if (!res.ok) {
+    // en cas d’échec, renvoie au moins un objet vide (pas de null)
+    return TICKER_MAP;
+  }
   const js = await res.json();
-  // le JSON est un objet indexé 0..N => on le convertit en map par ticker upper
   const map: Record<string, { cik_str: number; ticker: string; title: string }> = {};
   Object.values(js as any).forEach((row: any) => {
     map[String(row.ticker).toUpperCase()] = { cik_str: row.cik_str, ticker: row.ticker, title: row.title };
   });
   TICKER_MAP = map;
   TICKER_MAP_EXP = now + 24*60*60*1000; // 24h
-  return map;
+  return TICKER_MAP;
 }
+
 
 async function fetchFromSEC_US_IfPossible(ticker: string, lastPrice: number | null) {
   const fund = {
@@ -213,8 +222,8 @@ async function fetchFromSEC_US_IfPossible(ticker: string, lastPrice: number | nu
   // map ticker -> CIK (US only)
   let cik: string | null = null;
   try {
-    const map = await loadTickerMap();
-    const hit = map[ticker.toUpperCase()];
+    const tickerMap = await loadTickerMap();
+	const hit = tickerMap[ticker.toUpperCase()];
     if (hit) cik = String(hit.cik_str).padStart(10, "0");
   } catch { /* ignore */ }
 
