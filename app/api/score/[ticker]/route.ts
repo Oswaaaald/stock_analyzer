@@ -46,38 +46,41 @@ export async function GET(
     const bundle = await fetchAllNoKeyStooq(t);
 
     // ----- scoring adaptatif -----
-    const { subscores, malus, maxes } = computeScore(bundle);
+// ----- scoring corrigé (PAS de normalisation à 100) -----
+const { subscores, malus, maxes } = computeScore(bundle);
 
-    const total =
-      subscores.quality +
-      subscores.safety +
-      subscores.valuation +
-      subscores.momentum;
+// total sur l'échelle officielle (0..100) : 35 + 25 + 25 + 15
+const total =
+  subscores.quality +
+  subscores.safety +
+  subscores.valuation +
+  subscores.momentum;
 
-    const maxPossible =
-      maxes.quality + maxes.safety + maxes.valuation + maxes.momentum;
+// on n’adapte PAS à 100 : si seul momentum (max 15), le score max = 15/100
+const raw = Math.round(total);
+const final = Math.max(0, Math.min(100, raw - malus));
 
-    const raw = maxPossible > 0 ? Math.round((total / maxPossible) * 100) : 0;
-    const final = Math.max(0, Math.min(100, raw)); // malus = 0 en stooq-only
+const color: ScorePayload["color"] =
+  final >= 70 ? "green" : final >= 50 ? "orange" : "red";
 
-    const color: ScorePayload["color"] =
-      final >= 70 ? "green" : final >= 50 ? "orange" : "red";
+const reasons = buildReasons(bundle, subscores);
+const flags = detectRedFlags(bundle);
 
-    const reasons = buildReasons(bundle, subscores);
-    const flags = detectRedFlags(bundle);
+// coverage = points max effectivement disponibles (ex: seulement momentum => 15)
+const maxPossible =
+  maxes.quality + maxes.safety + maxes.valuation + maxes.momentum;
 
-    const payload: ScorePayload = {
-      ticker: t,
-      score: final,
-      color,
-      reasons_positive: reasons.slice(0, 3),
-      red_flags: flags.slice(0, 2),
-      subscores,
-      coverage: Math.max(
-        0,
-        Math.min(100, Math.round(maxPossible)) // ex: 15 -> 15%
-      ),
-    };
+const payload: ScorePayload = {
+  ticker: t,
+  score: final,
+  color,
+  reasons_positive: reasons.slice(0, 3),
+  red_flags: flags.slice(0, 2),
+  subscores,
+  // @ts-ignore: notre type peut déjà inclure coverage si tu l'as gardé
+  coverage: Math.max(0, Math.min(100, Math.round(maxPossible))),
+};
+
 
     MEM[key] = { expires: now + TTL_MS, data: payload };
     return NextResponse.json(payload, {
