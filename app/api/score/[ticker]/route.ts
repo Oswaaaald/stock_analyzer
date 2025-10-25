@@ -162,29 +162,29 @@ export async function GET(req: Request, { params }: { params: { ticker: string }
     const bundle: DataBundle = { ticker: t, fundamentals, prices: priceFeed, sources_used };
     const { subscores, maxes } = computeScore(bundle);
 
-    // ===== Couverture basée sur les PILIERS présents (corrige le 100% systématique) =====
-    const qualityPresent   = typeof fundamentals.op_margin.value === "number";
-    const safetyPresent    =
-      typeof fundamentals.current_ratio.value === "number" || typeof fundamentals.net_cash.value === "number";
-    const valuationPresent =
-      typeof fundamentals.fcf_yield.value === "number" || typeof fundamentals.earnings_yield.value === "number";
-    const momentumPresent  =
-      typeof priceFeed.px_vs_200dma.value === "number" ||
-      (typeof priceFeed.ret_60d.value === "number" && priceFeed.ret_60d.value > 0);
-
-    const coverage =
-      (qualityPresent ? 35 : 0) +
-      (safetyPresent ? 25 : 0) +
-      (valuationPresent ? 25 : 0) +
-      (momentumPresent ? 15 : 0);
+    // ===== Couverture basée sur les métriques réellement disponibles =====
+    // (somme des max partiels : reflète quelles briques sont présentes)
+    const coverage = Math.max(
+      0,
+      Math.min(
+        100,
+        Math.round(maxes.quality + maxes.safety + maxes.valuation + maxes.momentum)
+      )
+    );
 
     const total = subscores.quality + subscores.safety + subscores.valuation + subscores.momentum;
     const raw = Math.max(0, Math.min(100, Math.round(total)));
+
     const score_adj = coverage > 0 ? Math.round((total / coverage) * 100) : 0;
 
     // Couleur & verdict basés sur le score affiché (shown)
     const shown = score_adj ?? raw;
     const color: ScorePayload["color"] = shown >= 65 ? "green" : shown >= 50 ? "orange" : "red";
+
+    // Momentum présent si 200DMA dispo et/ou tendance 60j > 0 (pour le wording du verdict)
+    const momentumPresent =
+      (typeof priceFeed.px_vs_200dma.value === "number") ||
+      (typeof priceFeed.ret_60d.value === "number" && priceFeed.ret_60d.value > 0);
 
     const { verdict, reason } = makeVerdict({ coverage, total, momentumPresent, score_adj: shown });
 
@@ -393,9 +393,12 @@ function computeFundamentalsFromV10(r: any): Fundamentals {
   const fcf_over_ni = fcf != null && ni0 != null && ni0 !== 0 ? fcf / ni0 : null;
 
   // ROIC ~ NOPAT / (Debt + Equity - Cash)
+  // - NOPAT ≈ operatingIncome * (1 - taxRate)
+  // - Fallback si operatingIncome manquant: NOPAT ≈ netIncome (proxy prudente)
   const taxRate =
     preTax0 && taxExp0 != null && preTax0 !== 0 ? Math.min(0.5, Math.max(0, taxExp0 / preTax0)) : 0.21;
-  const nopat = opInc0 != null ? opInc0 * (1 - taxRate) : (ni0 != null ? ni0 : null);
+  const nopat =
+    opInc0 != null ? opInc0 * (1 - taxRate) : (ni0 != null ? ni0 : null);
   const invested =
     (debt ?? null) != null || (eq0 ?? null) != null ? ((debt ?? 0) + (eq0 ?? 0) - (cash ?? 0)) : null;
   const roic = nopat != null && invested && invested !== 0 ? nopat / invested : null;
