@@ -7,17 +7,17 @@ import { NextResponse } from "next/server";
 const MEM: Record<string, { expires: number; data: any }> = {};
 const TTL_MS = 30 * 60 * 1000; // 30 min
 
-// Email de contact SEC (obligatoire dans User-Agent SEC). Mets le tien via ENV si possible.
+// Email SEC (exigé par la SEC dans le User-Agent). Tu peux configurer CONTACT_EMAIL sur Vercel (facultatif).
 const CONTACT_EMAIL = process.env.CONTACT_EMAIL || "contact@example.com";
 
 type DataBundle = {
   ticker: string;
   fundamentals: {
-    op_margin: number | null;             // operating margin (TTM/annual approx)
-    current_ratio: number | null;         // current assets / current liabilities
-    dilution_3y: number | null;           // variation des actions en 3 ans (ratio)
-    fcf_positive_last4: number | null;    // nb d'années positives (0..4)
-    fcf_yield: number | null;             // FCF / market cap approx
+    op_margin: number | null;
+    current_ratio: number | null;
+    dilution_3y: number | null;
+    fcf_positive_last4: number | null;
+    fcf_yield: number | null;
   };
   prices: {
     px: number | null;
@@ -29,14 +29,13 @@ type DataBundle = {
 
 type ScorePayload = {
   ticker: string;
-  score: number;                 // score brut /100 (échelle officielle)
-  score_adj?: number;            // score ajusté à la couverture (/coverage)
+  score: number;                 // /100 officiel (35+25+25+15)
+  score_adj?: number;            // /coverage (optionnel)
   color: "green" | "orange" | "red";
   reasons_positive: string[];
   red_flags: string[];
   subscores: Record<string, number>;
-  coverage: number;              // points max “disponibles” (0..100)
-  debug?: Record<string, any>;   // optionnel pour vérifier les inputs
+  coverage: number;              // points max effectivement disponibles (0..100)
 };
 
 export async function GET(
@@ -52,24 +51,24 @@ export async function GET(
   if (hit && hit.expires > now) return NextResponse.json(hit.data);
 
   try {
-    // 1) Prix & 200DMA via Stooq (no-key)
-    const stooq = await fetchFromStooq(t);
+    // 1) Prix & 200DMA (Yahoo Chart -> Stooq .com -> Stooq .pl)
+    const pricesAny = await fetchPricesAny(t);
 
-    // 2) Fundamentals via SEC (US & IFRS foreign filers), si possible
-    const sec = await fetchFromSEC_US_IfPossible(t, stooq.px);
+    // 2) Fundamentals via SEC (US + foreign filers IFRS), si possibles
+    const sec = await fetchFromSEC_US_IfPossible(t, pricesAny.px);
 
     const bundle: DataBundle = {
       ticker: t,
       fundamentals: sec.fundamentals,
       prices: {
-        px: stooq.px,
-        px_vs_200dma: stooq.px_vs_200dma,
+        px: pricesAny.px,
+        px_vs_200dma: pricesAny.px_vs_200dma,
         rs_6m_vs_sector_percentile: 0.5,
         eps_revisions_3m: 0,
       },
     };
 
-    // ----- scoring (échelle officielle 0..100, pas de normalisation à 100) -----
+    // ----- Scoring (échelle officielle 0..100) -----
     const { subscores, malus, maxes } = computeScore(bundle);
 
     const total =
@@ -82,8 +81,7 @@ export async function GET(
     const coverage =
       maxes.quality + maxes.safety + maxes.valuation + maxes.momentum; // 0..100
 
-    const score_adj =
-      coverage > 0 ? Math.round((total / coverage) * 100) : 0; // pour affichage optionnel
+    const score_adj = coverage > 0 ? Math.round((total / coverage) * 100) : 0;
 
     const color: ScorePayload["color"] =
       raw >= 70 ? "green" : raw >= 50 ? "orange" : "red";
@@ -100,7 +98,6 @@ export async function GET(
       red_flags: flags.slice(0, 2),
       subscores,
       coverage: Math.max(0, Math.min(100, Math.round(coverage))),
-      // debug: { ...bundle.fundamentals, px_vs_200dma: bundle.prices.px_vs_200dma }, // <- décommente pour debug
     };
 
     MEM[key] = { expires: now + TTL_MS, data: payload };
@@ -113,57 +110,122 @@ export async function GET(
   }
 }
 
-/* ============================ STQOOQ (prix + 200DMA) ============================ */
+/* ============================ AGRÉGATEUR PRIX (monde entier) ============================ */
 
-async function fetchFromStooq(ticker: string): Promise<{ px: number | null; px_vs_200dma: number | null; }> {
-  const candidates = makeStooqCandidates(ticker);
-  let closes: number[] | null = null;
+async function fetchPricesAny(ticker: string): Promise<{ px: number | null; px_vs_200dma: number | null; }> {
+  // 1) Yahoo Chart (global, sans crumb)
+  try {
+    const y = await fetchYahooChartCloses(ticker);
+    if (y && y.length) return calcPxAnd200DMA(y);
+  } catch {}
 
-  for (const sym of candidates) {
-    try {
-      const csv = await fetchCsv(`https://stooq.com/q/d/l/?s=${encodeURIComponent(sym)}&i=d`);
-      const parsed = parseStooqCsv(csv);
-      if (parsed.closes.length > 0) { closes = parsed.closes; break; }
-    } catch {}
-  }
-  if (!closes || closes.length === 0) {
-    throw new Error(`Aucune donnée Stooq pour ${ticker} (essais: ${candidates.join(", ")})`);
-  }
+  // 2) Stooq (.com)
+  try {
+    const closes = await fetchStooqCloses(ticker, "https://stooq.com");
+    if (closes && closes.length) return calcPxAnd200DMA(closes);
+  } catch {}
 
+  // 3) Stooq (.pl)
+  try {
+    const closes = await fetchStooqCloses(ticker, "https://stooq.pl");
+    if (closes && closes.length) return calcPxAnd200DMA(closes);
+  } catch {}
+
+  throw new Error(`Aucune donnée de prix pour ${ticker} (Yahoo+Stooq échecs)`);
+}
+
+function calcPxAnd200DMA(closes: number[]) {
   const px = closes.at(-1) ?? null;
   let px_vs_200dma: number | null = null;
   if (closes.length >= 200 && typeof px === "number") {
-    const avg = closes.slice(-200).reduce((a,b)=>a+b,0)/200;
-    if (avg) px_vs_200dma = (px - avg)/avg;
+    const avg = closes.slice(-200).reduce((a, b) => a + b, 0) / 200;
+    if (avg) px_vs_200dma = (px - avg) / avg;
   }
   return { px, px_vs_200dma };
+}
+
+async function fetchYahooChartCloses(ticker: string): Promise<number[] | null> {
+  const headers = {
+    "User-Agent": "Mozilla/5.0 (compatible; StockAnalyzer/1.0)",
+    "Accept": "application/json, text/plain, */*",
+  };
+
+  let js = await fetchJsonSafe(
+    `https://query1.finance.yahoo.com/v8/finance/chart/${encodeURIComponent(ticker)}?range=2y&interval=1d`,
+    headers
+  );
+  if (!js) {
+    js = await fetchJsonSafe(
+      `https://query2.finance.yahoo.com/v8/finance/chart/${encodeURIComponent(ticker)}?range=2y&interval=1d`,
+      headers
+    );
+  }
+  if (!js) return null;
+
+  const res = js?.chart?.result?.[0];
+  if (!res) return null;
+  const closes: number[] = (res?.indicators?.quote?.[0]?.close || []) as number[];
+  const adj: number[] = (res?.indicators?.adjclose?.[0]?.adjclose || []) as number[];
+  const arr = (closes?.filter(n => typeof n === "number")?.length ? closes : adj) || [];
+  return arr.filter((n) => typeof n === "number" && Number.isFinite(n));
+}
+
+async function fetchJsonSafe(url: string, headers: Record<string, string>) {
+  try {
+    const r = await fetch(url, { headers });
+    if (!r.ok) return null;
+    return await r.json();
+  } catch {
+    return null;
+  }
+}
+
+async function fetchStooqCloses(ticker: string, origin: "https://stooq.com" | "https://stooq.pl") {
+  const candidates = makeStooqCandidates(ticker);
+  for (const sym of candidates) {
+    const urlDaily = `${origin}/q/d/l/?s=${encodeURIComponent(sym)}&i=d`;
+    const csvDaily = await fetchCsvSafe(urlDaily);
+    const parsedDaily = csvDaily ? parseStooqCsv(csvDaily) : null;
+    if (parsedDaily?.closes?.length) return parsedDaily.closes;
+
+    const urlSnap = `${origin}/q/l/?s=${encodeURIComponent(sym)}&f=sd2t2ohlcv&h&e=csv`;
+    const csvSnap = await fetchCsvSafe(urlSnap);
+    const parsedSnap = csvSnap ? parseStooqLiteCsv(csvSnap) : null;
+    if (parsedSnap?.closes?.length) return parsedSnap.closes;
+  }
+  return null;
 }
 
 function makeStooqCandidates(ticker: string): string[] {
   const t = ticker.toLowerCase();
   const out = new Set<string>();
-  out.add(t);
-  out.add(`${t}.us`);
-  out.add(`${t.replace(/\./g, "-")}.us`);
-  out.add(t.replace(/\./g, "-"));
-  if (/\.[a-z]{2,3}$/.test(t)) out.add(t);
+  out.add(t);                               // aapl
+  out.add(`${t}.us`);                       // aapl.us
+  out.add(t.replace(/\./g, "-"));           // brk-b
+  out.add(`${t.replace(/\./g, "-")}.us`);   // brk-b.us
+  if (/\.[a-z]{2,3}$/.test(t)) out.add(t);  // or.pa / 7203.t etc.
   return Array.from(out);
 }
 
-async function fetchCsv(url: string): Promise<string> {
-  const r = await fetch(url, {
-    headers: {
-      "User-Agent": "Mozilla/5.0 (compatible; StockAnalyzer/1.0)",
-      "Accept": "text/csv, text/plain, */*",
-      "Cache-Control": "no-cache",
-    },
-  });
-  if (!r.ok) throw new Error(`HTTP ${r.status} on ${url}`);
-  return r.text();
+async function fetchCsvSafe(url: string): Promise<string | null> {
+  try {
+    const r = await fetch(url, {
+      headers: {
+        "User-Agent": "Mozilla/5.0 (compatible; StockAnalyzer/1.0)",
+        "Accept": "text/csv, text/plain, */*",
+        "Cache-Control": "no-cache",
+      },
+    });
+    if (!r.ok) return null;
+    return await r.text();
+  } catch {
+    return null;
+  }
 }
 
+// CSV “q/d/l/”: Date,Open,High,Low,Close,Volume
 function parseStooqCsv(csv: string): { dates: string[]; closes: number[] } {
-  const lines = csv.trim().split(/\r?\\n/);
+  const lines = csv.trim().split(/\r?\n/);
   if (lines.length <= 1) return { dates: [], closes: [] };
   const header = lines[0].split(",");
   const idxDate = header.indexOf("Date");
@@ -179,7 +241,22 @@ function parseStooqCsv(csv: string): { dates: string[]; closes: number[] } {
   return { dates, closes };
 }
 
-/* ============================ SEC EDGAR (US + IFRS) ============================ */
+// CSV “q/l/ … &e=csv”: symbol,date,time,open,high,low,close,volume
+function parseStooqLiteCsv(csv: string): { dates: string[]; closes: number[] } {
+  const lines = csv.trim().split(/\r?\n/);
+  if (lines.length <= 1) return { dates: [], closes: [] };
+  const dates: string[] = [];
+  const closes: number[] = [];
+  for (let i = 1; i < lines.length; i++) {
+    const parts = lines[i].split(",");
+    const d = parts[1];
+    const c = parseFloat(parts[6]);
+    if (d && Number.isFinite(c)) { dates.push(d); closes.push(c); }
+  }
+  return { dates, closes };
+}
+
+/* ============================ SEC EDGAR (US + IFRS foreign filers) ============================ */
 
 let TICKER_MAP: Record<string, { cik_str: number; ticker: string; title: string }> = {};
 let TICKER_MAP_EXP = 0;
@@ -192,14 +269,14 @@ async function loadTickerMap(): Promise<Record<string, { cik_str: number; ticker
   const res = await fetch(url, {
     headers: { "User-Agent": `StockAnalyzer/1.0 (${CONTACT_EMAIL})`, "Accept": "application/json" }
   });
-  if (!res.ok) return TICKER_MAP; // renvoie l'existant (évent. vide) pour éviter null
+  if (!res.ok) return TICKER_MAP;
   const js = await res.json();
   const map: Record<string, { cik_str: number; ticker: string; title: string }> = {};
   Object.values(js as any).forEach((row: any) => {
     map[String(row.ticker).toUpperCase()] = { cik_str: row.cik_str, ticker: row.ticker, title: row.title };
   });
   TICKER_MAP = map;
-  TICKER_MAP_EXP = now + 24*60*60*1000; // 24h
+  TICKER_MAP_EXP = now + 24*60*60*1000;
   return TICKER_MAP;
 }
 
@@ -228,17 +305,15 @@ async function fetchFromSEC_US_IfPossible(ticker: string, lastPrice: number | nu
     fcf_yield: null as number | null,
   };
 
-  // map ticker -> CIK
   let cik: string | null = null;
   try {
     const tickerMap = await loadTickerMap();
     const hit = tickerMap[ticker.toUpperCase()];
     if (hit) cik = String(hit.cik_str).padStart(10, "0");
-  } catch { /* ignore */ }
+  } catch {}
 
-  if (!cik) return { fundamentals: fund }; // pas dans le mapping SEC
+  if (!cik) return { fundamentals: fund }; // pas US/ADR listé à la SEC
 
-  // companyfacts
   let usgaap: Taxo = {}, ifrs: Taxo = {};
   try {
     const factsUrl = `https://data.sec.gov/api/xbrl/companyfacts/CIK${cik}.json`;
@@ -253,11 +328,10 @@ async function fetchFromSEC_US_IfPossible(ticker: string, lastPrice: number | nu
     return { fundamentals: fund };
   }
 
-  // Revenue & Operating Income -> Operating Margin (TTM approx si possible)
+  // Operating margin (TTM si possible)
   const revUSD  = usgaap.RevenueFromContractWithCustomerExcludingAssessedTax?.units?.USD
                || usgaap.Revenues?.units?.USD;
   const opUSD   = usgaap.OperatingIncomeLoss?.units?.USD;
-
   const revIFRS = ifrs.Revenue?.units?.USD
                || ifrs.RevenueFromContractsWithCustomersExcludingAssessedTax?.units?.USD;
   const opIFRS  = ifrs.OperatingProfitLoss?.units?.USD
@@ -287,7 +361,7 @@ async function fetchFromSEC_US_IfPossible(ticker: string, lastPrice: number | nu
     fund.current_ratio = ca / cl;
   }
 
-  // Dilution 3 ans (shares)
+  // Dilution 3 ans
   const shUSD = usgaap.CommonStockSharesOutstanding?.units?.shares
              || usgaap.EntityCommonStockSharesOutstanding?.units?.shares;
   const shIFR = ifrs.NumberOfSharesOutstanding?.units?.shares
@@ -303,7 +377,7 @@ async function fetchFromSEC_US_IfPossible(ticker: string, lastPrice: number | nu
     }
   }
 
-  // FCF (CFO - CapEx), positif sur 4 dernières périodes & FCF yield
+  // FCF (CFO - CapEx) + FCF positif & FCF yield
   const cfoUSD = usgaap.NetCashProvidedByUsedInOperatingActivities?.units?.USD
               || usgaap.NetCashProvidedByUsedInOperatingActivitiesContinuingOperations?.units?.USD;
   const cfoIFR = ifrs.CashFlowsFromUsedInOperatingActivities?.units?.USD
@@ -356,7 +430,7 @@ function computeScore(data: DataBundle) {
   const f = data.fundamentals;
   const p = data.prices;
 
-  // Qualité (max 35) — on ne score que ce qu’on a
+  // Qualité (max 35) — on score ce qu’on a
   let q = 0, qMax = 0;
   if (typeof f.op_margin === "number") {
     qMax += 8;
