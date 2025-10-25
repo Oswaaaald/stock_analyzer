@@ -300,75 +300,104 @@ async function fetchYahooV10(ticker: string, sess: YSession, retryOnce: boolean)
 }
 
 function computeFundamentalsFromV10(r: any): Fundamentals {
-  // --- existants ---
-  const price = num(r?.price?.regularMarketPrice?.raw ?? r?.price?.regularMarketPrice);
-  const shares = num(r?.defaultKeyStatistics?.sharesOutstanding?.raw ?? r?.defaultKeyStatistics?.sharesOutstanding);
-  const trailingPE = num(r?.summaryDetail?.trailingPE?.raw ?? r?.defaultKeyStatistics?.trailingPE?.raw);
-  const priceToBook = num(r?.defaultKeyStatistics?.priceToBook?.raw ?? r?.defaultKeyStatistics?.priceToBook);
+  // --- champs v10 de base ---
+  const price        = num(r?.price?.regularMarketPrice?.raw ?? r?.price?.regularMarketPrice);
+  const shares       = num(r?.defaultKeyStatistics?.sharesOutstanding?.raw ?? r?.defaultKeyStatistics?.sharesOutstanding);
+  const trailingPE   = num(r?.summaryDetail?.trailingPE?.raw ?? r?.defaultKeyStatistics?.trailingPE?.raw);
+  const priceToBook  = num(r?.defaultKeyStatistics?.priceToBook?.raw ?? r?.defaultKeyStatistics?.priceToBook);
   const currentRatio = num(r?.financialData?.currentRatio?.raw ?? r?.financialData?.currentRatio);
-  const fcf = num(r?.financialData?.freeCashflow?.raw ?? r?.financialData?.freeCashflow);
-  const opm = num(r?.financialData?.operatingMargins?.raw ?? r?.financialData?.operatingMargins);
-  const cash = num(r?.financialData?.totalCash?.raw ?? r?.financialData?.totalCash);
-  const debt = num(r?.financialData?.totalDebt?.raw ?? r?.financialData?.totalDebt);
+  const fcf          = num(r?.financialData?.freeCashflow?.raw ?? r?.financialData?.freeCashflow);
+  const opm          = num(r?.financialData?.operatingMargins?.raw ?? r?.financialData?.operatingMargins);
+  const cash         = num(r?.financialData?.totalCash?.raw ?? r?.financialData?.totalCash);
+  const debt         = num(r?.financialData?.totalDebt?.raw ?? r?.financialData?.totalDebt);
 
-  // --- nouveaux (annual, via modules ajoutés) ---
-  const ishs = r?.incomeStatementHistory?.incomeStatementHistory
-    || r?.incomeStatementHistory?.incomeStatementHistory?.incomeStatementHistory; // (formats Yahoo varient parfois)
-  const bsh  = r?.balanceSheetHistory?.balanceSheetStatements;
+  // --- historiques annuels (modules ajoutés) ---
+  // (les structures Yahoo varient, on sécurise les chemins)
+  const ishs =
+    r?.incomeStatementHistory?.incomeStatementHistory ??
+    r?.incomeStatementHistory?.incomeStatementHistory?.incomeStatementHistory ??
+    r?.incomeStatementHistory;
 
-  const ni0 = num(ishs?.[0]?.netIncome?.raw ?? ishs?.[0]?.netIncome);
-  const ni1 = num(ishs?.[1]?.netIncome?.raw ?? ishs?.[1]?.netIncome);
-  const opInc0 = num(ishs?.[0]?.operatingIncome?.raw ?? ishs?.[0]?.operatingIncome);
-  const taxExp0 = num(ishs?.[0]?.incomeTaxExpense?.raw ?? ishs?.[0]?.incomeTaxExpense);
-  const preTax0 = num(ishs?.[0]?.incomeBeforeTax?.raw ?? ishs?.[0]?.incomeBeforeTax);
+  const bsh =
+    r?.balanceSheetHistory?.balanceSheetStatements ??
+    r?.balanceSheetHistory;
 
-  const eq0 = num(bsh?.[0]?.totalStockholderEquity?.raw ?? bsh?.[0]?.totalStockholderEquity);
-  const eq1 = num(bsh?.[1]?.totalStockholderEquity?.raw ?? bsh?.[1]?.totalStockholderEquity);
-  const assets0 = num(bsh?.[0]?.totalAssets?.raw ?? bsh?.[0]?.totalAssets);
+  const ni0      = num(ishs?.[0]?.netIncome?.raw         ?? ishs?.[0]?.netIncome);
+  const ni1      = num(ishs?.[1]?.netIncome?.raw         ?? ishs?.[1]?.netIncome);
+  const opInc0   = num(ishs?.[0]?.operatingIncome?.raw   ?? ishs?.[0]?.operatingIncome);
+  const taxExp0  = num(ishs?.[0]?.incomeTaxExpense?.raw  ?? ishs?.[0]?.incomeTaxExpense);
+  const preTax0  = num(ishs?.[0]?.incomeBeforeTax?.raw   ?? ishs?.[0]?.incomeBeforeTax);
 
-  // EY & FCFY
-  const ey = trailingPE && trailingPE > 0 ? 1 / trailingPE : null;
-  const mc = price && shares ? price * shares : null;
-  const fcfy = mc && fcf != null ? fcf / mc : null;
+  const eq0      = num(bsh?.[0]?.totalStockholderEquity?.raw ?? bsh?.[0]?.totalStockholderEquity);
+  const eq1      = num(bsh?.[1]?.totalStockholderEquity?.raw ?? bsh?.[1]?.totalStockholderEquity);
+  const assets0  = num(bsh?.[0]?.totalAssets?.raw             ?? bsh?.[0]?.totalAssets);
 
-  // net_cash proxy
+  // --- EY & FCFY ---
+  const ey   = (typeof trailingPE === "number" && trailingPE > 0) ? 1 / trailingPE : null;
+  const mcap = (typeof price === "number" && typeof shares === "number") ? price * shares : null;
+  const fcfy = (typeof mcap === "number" && typeof fcf === "number" && mcap > 0) ? (fcf / mcap) : null;
+
+  // --- Net cash proxy ---
   let netCash: number | null = null;
-  if (cash != null && debt != null) netCash = cash - debt > 0 ? 1 : 0;
-  else if (priceToBook && priceToBook > 0) netCash = priceToBook < 1.2 ? 1 : 0;
+  if (typeof cash === "number" && typeof debt === "number") {
+    netCash = cash - debt > 0 ? 1 : 0;
+  } else if (typeof priceToBook === "number" && priceToBook > 0) {
+    netCash = priceToBook < 1.2 ? 1 : 0;
+  }
 
-  // ROE: best-effort (moyenne equity si dispo) ou financialData.returnOnEquity si présent
+  // --- ROE (direct ou calculé) ---
   const roe_direct = num(r?.financialData?.returnOnEquity?.raw ?? r?.financialData?.returnOnEquity);
-  const avgEq = (eq0 != null && eq1 != null) ? (eq0 + eq1) / 2 : eq0 ?? null;
-  const roe_calc = (ni0 != null && avgEq && avgEq !== 0) ? (ni0 / avgEq) : null;
-  const roe = roe_direct ?? roe_calc;
+  const avgEq      = (typeof eq0 === "number" && typeof eq1 === "number") ? (eq0 + eq1) / 2 : (typeof eq0 === "number" ? eq0 : null);
+  const roe_calc   = (typeof ni0 === "number" && typeof avgEq === "number" && avgEq !== 0) ? (ni0 / avgEq) : null;
+  const roe        = (typeof roe_direct === "number") ? roe_direct : roe_calc;
 
-  // ROA: via financialData ou NI / Assets
+  // --- ROA (direct ou calculé) ---
   const roa_direct = num(r?.financialData?.returnOnAssets?.raw ?? r?.financialData?.returnOnAssets);
-  const roa_calc = (ni0 != null && assets0) ? (ni0 / assets0) : null;
-  const roa = roa_direct ?? roa_calc;
+  const roa_calc   = (typeof ni0 === "number" && typeof assets0 === "number" && assets0 !== 0) ? (ni0 / assets0) : null;
+  const roa        = (typeof roa_direct === "number") ? roa_direct : roa_calc;
 
-  // FCF / Net Income (qualité cash) — on accepte mismatch TTM vs annual
-  const fcf_over_ni = (fcf != null && ni0 != null && ni0 !== 0) ? (fcf / ni0) : null;
+  // --- FCF / Net Income ---
+  const fcf_over_ni = (typeof fcf === "number" && typeof ni0 === "number" && ni0 !== 0) ? (fcf / ni0) : null;
 
-  // ROIC (approx): NOPAT / (Debt + Equity - Cash)
-  const taxRate = (preTax0 && taxExp0 != null && preTax0 !== 0) ? Math.min(0.5, Math.max(0, taxExp0 / preTax0)) : 0.21;
-  const nopat = (opInc0 != null) ? opInc0 * (1 - taxRate) : null;
-  const invested = (debt ?? null) != null || (eq0 ?? null) != null ? ((debt ?? 0) + (eq0 ?? 0) - (cash ?? 0)) : null;
-  const roic = (nopat != null && invested && invested !== 0) ? (nopat / invested) : null;
+  // --- ROIC (robuste) : NOPAT / InvestedCapital
+  // Taux d'impôt : direct (si dispo) sinon calculé (tax/pre-tax), sinon 21%
+  const taxRateDirect = num(r?.financialData?.effectiveTaxRate?.raw ?? r?.financialData?.effectiveTaxRate);
+  const taxRateCalc   = (typeof preTax0 === "number" && typeof taxExp0 === "number" && preTax0 !== 0)
+    ? Math.max(0, Math.min(0.5, taxExp0 / preTax0))
+    : null;
+  const taxRate = (typeof taxRateDirect === "number") ? taxRateDirect : (taxRateCalc ?? 0.21);
+
+  const nopat = (typeof opInc0 === "number") ? opInc0 * (1 - taxRate) : null;
+
+  // Invested A = Debt + Equity − Cash  (peut être ≤0 si equity très comprimé)
+  const investedA = ((debt ?? 0) + (eq0 ?? 0) - (cash ?? 0));
+  // Invested B (fallback) = TotalAssets − Cash  (souvent ≥0)
+  const investedB = (typeof assets0 === "number") ? (assets0 - (cash ?? 0)) : null;
+
+  let invested: number | null = null;
+  if (Number.isFinite(investedA) && investedA > 0) invested = investedA;
+  else if (typeof investedB === "number" && investedB > 0) invested = investedB;
+
+  const roic = (typeof nopat === "number" && typeof invested === "number" && invested !== 0)
+    ? (nopat / invested)
+    : null;
 
   return {
-    op_margin:      asMetric(opm, opm != null ? 0.45 : 0, "yahoo-v10"),
-    current_ratio:  asMetric(currentRatio, currentRatio != null ? 0.4 : 0, "yahoo-v10"),
+    // fondamentaux “socle”
+    op_margin:      asMetric(opm,          opm != null          ? 0.45 : 0, "yahoo-v10"),
+    current_ratio:  asMetric(currentRatio, currentRatio != null ? 0.40 : 0, "yahoo-v10"),
     fcf_yield:      asMetric(fcfy != null ? clampFcfy(fcfy) : null, fcfy != null ? 0.45 : 0, "yahoo-v10"),
-    earnings_yield: asMetric(ey, ey != null ? 0.45 : 0, "yahoo-v10"),
-    net_cash:       asMetric(netCash, netCash != null ? 0.35 : 0, "yahoo-v10"),
+    earnings_yield: asMetric(ey,           ey != null           ? 0.45 : 0, "yahoo-v10"),
+    net_cash:       asMetric(netCash,      netCash != null      ? 0.35 : 0, "yahoo-v10"),
 
-    roe:                asMetric(roe ?? null, roe != null ? 0.45 : 0, roe_direct != null ? "yahoo-v10" : "calc"),
-    roa:                asMetric(roa ?? null, roa != null ? 0.4  : 0, roa_direct != null ? "yahoo-v10" : "calc"),
-    fcf_over_netincome: asMetric(fcf_over_ni, fcf_over_ni != null ? 0.35 : 0, "calc"),
-    roic:               asMetric(roic, roic != null ? 0.3 : 0, "calc"),
+    // ratios ajoutés
+    roe:                asMetric(roe ?? null,              roe  != null ? 0.45 : 0, (typeof roe_direct === "number") ? "yahoo-v10" : "calc"),
+    roa:                asMetric(roa ?? null,              roa  != null ? 0.40 : 0, (typeof roa_direct === "number") ? "yahoo-v10" : "calc"),
+    fcf_over_netincome: asMetric(fcf_over_ni,              fcf_over_ni != null ? 0.35 : 0, "calc"),
+    roic:               asMetric(roic,                     roic != null ? 0.30 : 0, "calc"),
   };
 }
+
 const clampFcfy = (y: number) => Math.max(-0.05, Math.min(0.08, y));
 
 /* ========================== Scoring ========================== */
