@@ -542,14 +542,46 @@ function computeScore(d: DataBundle) {
   return { subscores, maxes };
 }
 
-function buildReasons(_d: DataBundle, subs: Record<string, number>) {
+function buildReasons(d: DataBundle, subs: Record<string, number>) {
   const out: string[] = [];
-  if (subs.quality >= 6) out.push("Marge opérationnelle décente");
-  if (subs.safety >= 4) out.push("Bilans plutôt sains");
-  if (subs.valuation >= 7) out.push("Valorisation potentiellement attractive");
-  if (subs.momentum >= 8) out.push("Au-dessus de la 200j + dynamique positive");
+  const f = d.fundamentals;
+  const p = d.prices;
+
+  // --- Qualité (marge op) ---
+  if (typeof f.op_margin.value === "number") {
+    if (f.op_margin.value >= 0.15) out.push("Marge opérationnelle solide (≥ 15 %)");
+    else if (f.op_margin.value >= 0.05) out.push("Marge opérationnelle correcte (≥ 5 %)");
+  }
+
+  // --- Sécurité (liquidité, net cash) ---
+  if (typeof f.current_ratio.value === "number" && f.current_ratio.value >= 1) {
+    out.push("Liquidité correcte (ratio courant ≥ 1)");
+  }
+  if (typeof f.net_cash.value === "number" && f.net_cash.value > 0) {
+    out.push("Trésorerie nette (cash supérieur à la dette)");
+  }
+
+  // --- Valorisation (FCF yield prioritaire, sinon earnings yield) ---
+  if (typeof f.fcf_yield.value === "number") {
+    if (f.fcf_yield.value >= 0.04) out.push("Rendement FCF intéressant (≥ 4 %)");
+    else if (f.fcf_yield.value >= 0.02) out.push("Rendement FCF correct (≥ 2 %)");
+  } else if (typeof f.earnings_yield.value === "number") {
+    if (f.earnings_yield.value >= 0.05) out.push("Rendement des bénéfices élevé (EY ≥ 5 %)");
+    else if (f.earnings_yield.value >= 0.03) out.push("Rendement des bénéfices correct (EY ≥ 3 %)");
+  }
+
+  // --- Momentum (200DMA + returns récents) ---
+  if (typeof p.px_vs_200dma.value === "number" && p.px_vs_200dma.value >= 0) {
+    out.push("Cours au-dessus de la moyenne mobile 200 jours");
+  }
+  const pos20 = typeof p.ret_20d.value === "number" && p.ret_20d.value > 0;
+  const pos60 = typeof p.ret_60d.value === "number" && p.ret_60d.value > 0;
+  if (pos20 || pos60) {
+    out.push("Tendance récente positive (20–60 jours)");
+  }
+
   if (!out.length) out.push("Données limitées : vérifiez les détails");
-  return out;
+  return out.slice(0, 4); // limite à 4 bullets max (plus lisible)
 }
 
 function makeVerdict(args: { coverage: number; total: number; momentumPresent: boolean; score_adj: number }) {
