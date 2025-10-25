@@ -1,6 +1,7 @@
 "use client";
-import { useEffect, useMemo, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 
+/* ================== Types côté score ================== */
 type ScoreResponse = {
   ticker: string;
   score: number;
@@ -24,6 +25,17 @@ type ScoreResponse = {
   };
 };
 
+/* ================== Types côté suggest ================== */
+type Suggest = {
+  symbol: string;
+  name?: string | null;
+  exchange?: string | null;
+  type?: string | null;
+  score?: number | null;
+  region?: string | null;
+  currency?: string | null;
+};
+
 const SUGGESTIONS = ["AAPL", "MSFT", "NVDA", "TSLA", "RMS.PA", "MC.PA", "ASML.AS"];
 
 export default function Page() {
@@ -31,6 +43,13 @@ export default function Page() {
   const [loading, setLoading] = useState(false);
   const [data, setData] = useState<ScoreResponse | null>(null);
   const [error, setError] = useState<string | null>(null);
+
+  // Autocomplete state
+  const [open, setOpen] = useState(false);
+  const [items, setItems] = useState<Suggest[]>([]);
+  const [highlight, setHighlight] = useState(0);
+  const abortRef = useRef<AbortController | null>(null);
+  const debouncedQ = useDebouncedValue(q, 200);
 
   // Pré-remplir depuis URL ?ticker=...
   useEffect(() => {
@@ -43,6 +62,7 @@ export default function Page() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
+  /* ================== Lookup score ================== */
   async function lookup(ticker?: string) {
     const sym = (ticker ?? q).trim();
     if (!sym) return;
@@ -67,8 +87,60 @@ export default function Page() {
     }
   }
 
+  /* ================== Fetch suggestions ================== */
+  useEffect(() => {
+    if (!debouncedQ || debouncedQ.trim().length < 2) {
+      setItems([]);
+      setOpen(false);
+      return;
+    }
+    // Annuler la requête précédente si nécessaire
+    if (abortRef.current) abortRef.current.abort();
+    const ac = new AbortController();
+    abortRef.current = ac;
+
+    const run = async () => {
+      try {
+        const url = `/api/suggest?q=${encodeURIComponent(debouncedQ.trim())}`;
+        const r = await fetch(url, { signal: ac.signal, cache: "no-store" });
+        if (!r.ok) return;
+        const js = await r.json();
+        const list: Suggest[] = Array.isArray(js?.suggestions) ? js.suggestions : [];
+        setItems(list);
+        setOpen(list.length > 0);
+        setHighlight(0);
+      } catch {
+        // ignoré (abort / net)
+      }
+    };
+    run();
+
+    return () => ac.abort();
+  }, [debouncedQ]);
+
   const onEnter = (e: React.KeyboardEvent<HTMLInputElement>) => {
-    if (e.key === "Enter") lookup();
+    if (e.key === "Enter") {
+      // si le menu est ouvert, Enter valide la sélection en surbrillance
+      if (open && items.length > 0) {
+        onSelect(items[highlight]);
+      } else {
+        lookup();
+      }
+    } else if (e.key === "ArrowDown" && open && items.length > 0) {
+      e.preventDefault();
+      setHighlight((h) => Math.min(h + 1, items.length - 1));
+    } else if (e.key === "ArrowUp" && open && items.length > 0) {
+      e.preventDefault();
+      setHighlight((h) => Math.max(h - 1, 0));
+    } else if (e.key === "Escape") {
+      setOpen(false);
+    }
+  };
+
+  const onSelect = (s: Suggest) => {
+    setQ(s.symbol);
+    setOpen(false);
+    setTimeout(() => lookup(s.symbol), 0);
   };
 
   const verdictBadge = useMemo(() => {
@@ -113,15 +185,50 @@ export default function Page() {
       {/* Search */}
       <section className="max-w-6xl mx-auto px-5 pt-8">
         <div className="grid gap-4 md:grid-cols-[1fr_auto]">
-          <div className="flex rounded-2xl border border-slate-800 bg-slate-900/40 focus-within:ring-2 focus-within:ring-sky-500">
+          {/* Input + dropdown */}
+          <div className="relative flex rounded-2xl border border-slate-800 bg-slate-900/40 focus-within:ring-2 focus-within:ring-sky-500">
             <input
               value={q}
-              onChange={(e) => setQ(e.target.value)}
+              onChange={(e) => {
+                setQ(e.target.value);
+                if (!e.target.value) setOpen(false);
+              }}
               onKeyDown={onEnter}
+              onFocus={() => items.length && setOpen(true)}
               placeholder="Tapez un ticker… (AAPL, TSLA, RMS.PA, ASML.AS)"
               className="flex-1 px-4 py-3.5 bg-transparent outline-none placeholder:text-slate-500"
+              aria-autocomplete="list"
+              aria-expanded={open}
+              aria-controls="suggest-list"
             />
+
+            {/* Dropdown */}
+            {open && items.length > 0 && (
+              <ul
+                id="suggest-list"
+                className="absolute top-[105%] left-0 z-20 mt-1 max-h-80 w-full overflow-auto rounded-xl border border-slate-800 bg-slate-900 shadow-xl"
+                role="listbox"
+              >
+                {items.map((s, i) => (
+                  <li
+                    key={`${s.symbol}-${i}`}
+                    role="option"
+                    aria-selected={i === highlight}
+                    onMouseDown={(e) => { e.preventDefault(); onSelect(s); }}
+                    onMouseEnter={() => setHighlight(i)}
+                    className={`cursor-pointer px-4 py-2 ${i === highlight ? "bg-slate-800/70" : ""}`}
+                  >
+                    <div className="flex items-center justify-between">
+                      <div className="font-medium">{s.symbol}</div>
+                      <div className="text-xs text-slate-400">{s.exchange ?? s.type ?? ""}</div>
+                    </div>
+                    <div className="text-sm text-slate-300/90 truncate">{s.name ?? ""}</div>
+                  </li>
+                ))}
+              </ul>
+            )}
           </div>
+
           <button
             onClick={() => lookup()}
             disabled={!q || loading}
@@ -365,13 +472,20 @@ function Badge({
 
 function SourceChip({ src }: { src: string }) {
   const label = src.replace(/^price:/, "price · ").replace(/^sec:/, "sec · ");
-
-  // Highlight des sources “riches”
   const variant =
     /fin-html/.test(src) ? "ok" :
     /yahoo:html|yahoo:v7|yahoo:summary/.test(src) ? "default" :
     /wikipedia/.test(src) ? "muted" :
     "default";
-
   return <Badge variant={variant as any}>{label}</Badge>;
+}
+
+/* ---------------- Small hooks ---------------- */
+function useDebouncedValue<T>(value: T, delay = 200) {
+  const [v, setV] = useState(value);
+  useEffect(() => {
+    const id = setTimeout(() => setV(value), delay);
+    return () => clearTimeout(id);
+  }, [value, delay]);
+  return v;
 }
