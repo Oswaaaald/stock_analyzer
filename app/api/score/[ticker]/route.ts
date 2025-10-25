@@ -148,21 +148,29 @@ export async function GET(req: Request, { params }: { params: { ticker: string }
   if (!isDebug && hit && hit.expires > now) return NextResponse.json(hit.data);
 
   try {
-    // 1) Prix & momentum (v8, sans cookies)
+    // 1) Prix & momentum (v8)
     const priceFeed = await fetchYahooChartAndEnrich(t);
 
-    // 2) Session + v10 (fundamentaux & historiques annuels pour ratios)
+    // 2) Session + v10 (fundamentaux & annuels)
     const sess = await getYahooSession();
     const v10 = await fetchYahooV10(t, sess, /*retryOnce*/ true);
 
-    // 3) Extraire fondamentaux + ratios
+    // 3) Fondamentaux + ratios
     const fundamentals = computeFundamentalsFromV10(v10);
     const sources_used = ["price:yahoo(v8)", "yahoo:v10"];
 
     const bundle: DataBundle = { ticker: t, fundamentals, prices: priceFeed, sources_used };
     const { subscores, maxes } = computeScore(bundle);
 
-    /* ===== Fiabilité (UI) par pilier avec règles plus strictes & caps ===== */
+    /* ===== Fiabilité (couverture) — pondérée par présence des métriques =====
+       Idée: on mesure la part des briques vraiment disponibles, avec des poids par "importance".
+       Poids (somme = 11):
+         - Qualité: op_margin (2), ROE/ROA (1 au total), ROIC (1)
+         - Sécurité: current_ratio (1), net_cash (1)
+         - Valorisation: fcf_yield (1), earnings_yield (1)
+         - Momentum: 200DMA (2), ret_20d (0.5), ret_60d (0.5)
+       Puis on applique des facteurs de fraîcheur (points & récence).
+    */
     const pts = priceFeed.meta?.points ?? 0;
     const recency = priceFeed.meta?.recency_days ?? 999;
 
@@ -181,68 +189,43 @@ export async function GET(req: Request, { params }: { params: { ticker: string }
     const has200  = typeof priceFeed.px_vs_200dma.value === "number" && pts >= 200;
     const hasR20  = priceFeed.ret_20d.value != null;
     const hasR60  = priceFeed.ret_60d.value != null;
-    const hasShortRet = hasR20 || hasR60;
 
-    // ---------- Qualité (35) ----------
-    // Noyau = op_margin (indispensable), + ROE/ROA (un des deux), + ROIC bonus
-    // Si op_margin manquant OU aucun ROE/ROA, cap à 70% du pilier.
-    let q_w = 0;
-    if (hasOp) q_w += 0.6;
-    if (hasROE || hasROA) q_w += 0.3;
-    if (hasROIC) q_w += 0.1;
-    let covQuality = q_w * 35;
-    if (!(hasOp && (hasROE || hasROA))) {
-      covQuality *= 0.7; // cap si noyau incomplet
-    }
+    // Poids couverts
+    let covered = 0;
+    const totalWeight = 11;
 
-    // ---------- Sécurité (25) ----------
-    // current_ratio (0.7) + net_cash (0.3). Un seul présent => cap 70% du pilier.
-    let s_w = 0;
-    if (hasCR) s_w += 0.7;
-    if (hasNC) s_w += 0.3;
-    let covSafety = s_w * 25;
-    if ((hasCR ? 1 : 0) + (hasNC ? 1 : 0) === 1) {
-      covSafety *= 0.7; // cap si 1 seul signal sur 2
-    }
+    // Qualité
+    if (hasOp) covered += 2;
+    if (hasROE || hasROA) covered += 1;      // un des deux suffit pour 1 point
+    if (hasROIC) covered += 1;
 
-    // ---------- Valorisation (25) ----------
-    // fcf_yield (0.7) + earnings_yield (0.3). Seulement EY => cap 70%.
-    let v_w = 0;
-    if (hasFCFY) v_w += 0.7;
-    if (hasEY)   v_w += 0.3;
-    let covVal = v_w * 25;
-    if (!hasFCFY && hasEY) {
-      covVal *= 0.7; // cap si pas de FCFY
-    }
+    // Sécurité
+    if (hasCR) covered += 1;
+    if (hasNC) covered += 1;
 
-    // ---------- Momentum (15) ----------
-    // 200DMA (0.6) + ret_20d (0.2) + ret_60d (0.2)
-    // Si pas de 200DMA OU pas de ret courts => cap 75%. Si aucun ret court => cap 80%.
-    let m_w = 0;
-    if (has200) m_w += 0.6;
-    if (hasR20) m_w += 0.2;
-    if (hasR60) m_w += 0.2;
-    let covMom = m_w * 15;
-    if (!has200 || !hasShortRet) {
-      covMom *= 0.75;
-    }
-    if (!hasR20 && !hasR60) {
-      covMom *= 0.8; // un cran de plus si zéro retour court
-    }
+    // Valorisation
+    if (hasFCFY) covered += 1;
+    if (hasEY)   covered += 1;
 
-    // Somme brute (avant pénalités globales)
-    let coverage_display = Math.round(covQuality + covSafety + covVal + covMom);
+    // Momentum
+    if (has200) covered += 2;
+    if (hasR20) covered += 0.5;
+    if (hasR60) covered += 0.5;
 
-    // ---------- Pénalités globales (fraîcheur & densité) ----------
-    // Densité (points prix)
-    if (pts < 120)      coverage_display -= 10;
-    else if (pts < 240) coverage_display -= 5;
+    // Facteur "densité" (points)
+    let pointsFactor = 1.0;
+    if (pts < 120) pointsFactor = 0.80;
+    else if (pts < 250) pointsFactor = 0.90;
+    else if (pts < 400) pointsFactor = 0.95;
 
-    // Fraîcheur
-    if (recency > 14)      coverage_display -= 10;
-    else if (recency > 7)  coverage_display -= 5;
+    // Facteur "fraîcheur"
+    let recencyFactor = 1.0;
+    if (recency > 14) recencyFactor = 0.80;
+    else if (recency > 7) recencyFactor = 0.90;
+    else if (recency > 3) recencyFactor = 0.95;
 
-    // Bornes finales
+    // Couverture affichée (0..100) + bornes
+    let coverage_display = Math.round((covered / totalWeight) * 100 * pointsFactor * recencyFactor);
     coverage_display = Math.max(5, Math.min(100, coverage_display));
 
     /* ===== Score brut & ajusté ===== */
@@ -254,14 +237,13 @@ export async function GET(req: Request, { params }: { params: { ticker: string }
 
     const total = subscores.quality + subscores.safety + subscores.valuation + subscores.momentum;
     const raw = Math.max(0, Math.min(100, Math.round(total)));
-    const score_adj = Math.round((total / denom) * 100); // normalisation → 0..100
+    const score_adj = Math.round((total / denom) * 100); // normalisé → 0..100
 
     // Couleur & verdict basés sur le score affiché (shown)
     const shown = score_adj ?? raw;
     const color: ScorePayload["color"] = shown >= 65 ? "green" : shown >= 50 ? "orange" : "red";
 
-    // Momentum “présent” uniquement si la 200DMA est vraiment calculable (≥200 points)
-    const momentumPresent = typeof priceFeed.px_vs_200dma.value === "number";
+    const momentumPresent = has200; // signal momentum "fiable" seulement si on a la 200DMA
 
     const { verdict, reason } = makeVerdict({
       coverage: coverage_display,
@@ -282,12 +264,12 @@ export async function GET(req: Request, { params }: { params: { ticker: string }
       reasons_positive: reasons.slice(0, 3),
       red_flags: [],
       subscores,
-      coverage: coverage_display, // UI
+      coverage: coverage_display,
       proof: {
         price_source: priceFeed.meta?.source_primary,
         price_points: priceFeed.meta?.points,
-        price_has_200dma: priceFeed.px_vs_200dma.value !== null,
-        price_recency_days: priceFeed.meta?.recency_days ?? null,
+        price_has_200dma: has200,
+        price_recency_days: recency,
         valuation_used: (fundamentals.fcf_yield.value ?? fundamentals.earnings_yield.value) != null,
         sources_used,
       },
