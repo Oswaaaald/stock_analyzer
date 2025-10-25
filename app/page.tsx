@@ -175,7 +175,6 @@ export default function Page() {
   const onEnter = (e: React.KeyboardEvent<HTMLInputElement>) => {
     if (e.key === "Enter") {
       setShowSug(false);
-      // si pas choisi depuis la liste, on reset le "selected" pour éviter anciens noms
       lookup(undefined, { symbol: q });
       inputRef.current?.blur();
     }
@@ -347,8 +346,9 @@ export default function Page() {
           {/* Left: Score & pillars */}
           <div className="lg:col-span-2">
             <div className="rounded-3xl border border-slate-800 bg-gradient-to-b from-slate-900/60 to-slate-900/30 p-6 md:p-7">
-              {/* Header line: ticker (gros) + nom en dessous + chips */}
+              {/* Header: gauche = titre/nom; droite = score */}
               <div className="flex items-start gap-4">
+                {/* LEFT */}
                 <div className="flex-1">
                   <div className="flex items-center gap-3 flex-wrap">
                     <h2 className="text-2xl font-semibold tracking-tight">
@@ -359,36 +359,30 @@ export default function Page() {
                       Couverture des données&nbsp;: {data.coverage}%
                     </span>
                   </div>
-
-                  {/* NOM COMPLET — PLACE (revenu “comme avant”) */}
                   {selected?.name && (
                     <div className="mt-1 text-sm text-slate-400">
                       {selected.name}
                       {selected.exchange ? ` — ${selected.exchange.toUpperCase()}` : ""}
                     </div>
                   )}
+                </div>
 
-                  {/* Score line */}
-                  <div className="mt-3 flex items-end gap-4 flex-wrap">
-                    <div>
-                      <div className="text-4xl font-extrabold tabular-nums">
-                        {data.score_adj ?? data.score}
-                        <span className="text-lg text-slate-400">/100</span>
-                      </div>
-                      <div className="mt-1 text-sm text-slate-300">{interpretation}</div>
-                      <div className="mt-1 text-xs text-slate-500">
-                        Note brute&nbsp;: {data.score}/100
-                      </div>
-                    </div>
-                    <div className="flex-1 min-w-[220px]">
-                      <div className="h-2 rounded-full bg-slate-800 overflow-hidden">
-                        <div
-                          className={`h-full ${barColor(data.score_adj ?? data.score)}`}
-                          style={{ width: `${Math.min(100, data.score_adj ?? data.score)}%` }}
-                        />
-                      </div>
-                    </div>
+                {/* RIGHT = SCORE EN HAUT À DROITE */}
+                <div className="w-48 md:w-56 shrink-0 text-right">
+                  <div className="text-4xl font-extrabold tabular-nums">
+                    {data.score_adj ?? data.score}
+                    <span className="text-lg text-slate-400">/100</span>
                   </div>
+                  <div className="mt-1 text-xs text-slate-500">
+                    Note brute&nbsp;: {data.score}/100
+                  </div>
+                  <div className="mt-2 h-2 rounded-full bg-slate-800 overflow-hidden">
+                    <div
+                      className={`h-full ${barColor(data.score_adj ?? data.score)}`}
+                      style={{ width: `${Math.min(100, data.score_adj ?? data.score)}%` }}
+                    />
+                  </div>
+                  <div className="mt-1 text-sm text-slate-300">{interpretation}</div>
                 </div>
               </div>
 
@@ -397,15 +391,14 @@ export default function Page() {
                 <h3 className="text-sm uppercase tracking-wide text-slate-400">Piliers de performance</h3>
                 <div className="mt-3 grid grid-cols-1 sm:grid-cols-2 gap-3">
                   {Object.entries(data.subscores || {}).map(([k, v]) => {
-                    const PILLAR_MAX: Record<string, number> = { quality: 35, safety: 25, valuation: 25, momentum: 15 };
+                    const max = PILLAR_MAX[k] ?? 10;
+                    const pct = Math.max(0, Math.min(100, (v / max) * 100));
                     const PILLAR_LABEL: Record<string, string> = {
                       quality: "Qualité opérationnelle",
                       safety: "Solidité financière",
                       valuation: "Valorisation",
                       momentum: "Momentum / Tendance",
                     };
-                    const max = PILLAR_MAX[k] ?? 10;
-                    const pct = Math.max(0, Math.min(100, (v / max) * 100));
                     return (
                       <div key={k} className="p-4 rounded-2xl bg-slate-900/40 border border-slate-800">
                         <div className="flex items-center justify-between">
