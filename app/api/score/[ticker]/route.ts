@@ -162,31 +162,39 @@ export async function GET(req: Request, { params }: { params: { ticker: string }
     const bundle: DataBundle = { ticker: t, fundamentals, prices: priceFeed, sources_used };
     const { subscores, maxes } = computeScore(bundle);
 
-    // ===== Fiabilité (UI) basée sur les *maxes* réellement disponibles =====
-    // Chaque pilier est ramené à son plafond interne (8/6/10/15) puis mappé sur (35/25/25/15).
-    const covQuality = Math.min(1, (maxes.quality || 0) / 8) * 35;   // 0..35
-    const covSafety  = Math.min(1, (maxes.safety  || 0) / 6) * 25;   // 0..25
-    const covVal     = Math.min(1, (maxes.valuation|| 0) / 10) * 25; // 0..25
-    const covMom     = Math.min(1, (maxes.momentum || 0) / 15) * 15; // 0..15
-    const coverage_display = Math.round(covQuality + covSafety + covVal + covMom); // 0..100
+    // ===== Fiabilité (UI) : par présence des PILIERS =====
+    const qualityPresent =
+      typeof fundamentals.op_margin.value === "number";
+    const safetyPresent =
+      typeof fundamentals.current_ratio.value === "number" ||
+      typeof fundamentals.net_cash.value === "number";
+    const valuationPresent =
+      typeof fundamentals.fcf_yield.value === "number" ||
+      typeof fundamentals.earnings_yield.value === "number";
+    // Momentum “présent” seulement si la 200DMA est calculable (≥200 points)
+    const momentumPresent =
+      typeof priceFeed.px_vs_200dma.value === "number";
+
+    const coverage_display =
+      (qualityPresent ? 35 : 0) +
+      (safetyPresent ? 25 : 0) +
+      (valuationPresent ? 25 : 0) +
+      (momentumPresent ? 15 : 0); // 0..100
 
     // ===== Couverture pour la normalisation du score (dénominateur) =====
-    // Somme des maxes effectivement disponibles (0..39)
     const denom = Math.max(
       1,
       Math.round(maxes.quality + maxes.safety + maxes.valuation + maxes.momentum)
     );
 
+    // ===== Scores =====
     const total = subscores.quality + subscores.safety + subscores.valuation + subscores.momentum;
     const raw = Math.max(0, Math.min(100, Math.round(total)));
-    const score_adj = Math.round((total / denom) * 100); // normalisation → 0..100
+    const score_adj = Math.round((total / denom) * 100); // normalisé sur ce qui est réellement disponible
 
     // Couleur & verdict basés sur le score affiché (shown)
     const shown = score_adj ?? raw;
     const color: ScorePayload["color"] = shown >= 65 ? "green" : shown >= 50 ? "orange" : "red";
-
-    // Momentum “présent” uniquement si la 200DMA est vraiment calculable (≥200 points)
-    const momentumPresent = typeof priceFeed.px_vs_200dma.value === "number";
 
     const { verdict, reason } = makeVerdict({
       coverage: coverage_display,
@@ -207,7 +215,7 @@ export async function GET(req: Request, { params }: { params: { ticker: string }
       reasons_positive: reasons.slice(0, 3),
       red_flags: [],
       subscores,
-      coverage: coverage_display, // UI
+      coverage: coverage_display, // pour l’UI
       proof: {
         price_source: priceFeed.meta?.source_primary,
         price_points: priceFeed.meta?.points,
