@@ -173,45 +173,58 @@ export async function GET(req: Request, { params }: { params: { ticker: string }
     const raw = Math.max(0, Math.min(100, Math.round(total)));
     const score_adj = Math.round((total / denom) * 100); // 0..100 (normalisé sur "dispo")
 
-    // ===== Fiabilité (UI) =====
-    // Base = proportion de briques réellement disponibles (denom/39), puis pénalités “richesse” douces.
-    let coverage_display = Math.round((denom / 39) * 100); // 0..100
+    // ===== Fiabilité (UI) par pilier avec poids internes =====
+    // Qualité: op_margin (0.5), ROE (0.25), ROA (0.15), ROIC (0.10)
+    const q_w =
+      (typeof fundamentals.op_margin.value === "number" ? 0.5 : 0) +
+      (fundamentals.roe?.value != null ? 0.25 : 0) +
+      (fundamentals.roa?.value != null ? 0.15 : 0) +
+      (fundamentals.roic?.value != null ? 0.10 : 0);
+    const covQuality = Math.min(1, q_w) * 35;
 
-    // Pénalités de richesse/fraîcheur (n’affecte pas le score, juste la fiabilité affichée)
-    let penalty = 0;
+    // Sécurité: current_ratio (0.7), net_cash (0.3)
+    const s_w =
+      (fundamentals.current_ratio.value != null ? 0.7 : 0) +
+      (fundamentals.net_cash.value != null ? 0.3 : 0);
+    const covSafety = Math.min(1, s_w) * 25;
 
-    // Prix pas assez dense / pas assez frais
+    // Valorisation: fcf_yield (0.7), earnings_yield (0.3)
+    const v_w =
+      (fundamentals.fcf_yield.value != null ? 0.7 : 0) +
+      (fundamentals.earnings_yield.value != null ? 0.3 : 0);
+    const covVal = Math.min(1, v_w) * 25;
+
+    // Momentum: px_vs_200dma (0.6 si >=200 pts), ret_20d (0.2), ret_60d (0.2)
     const pts = priceFeed.meta?.points ?? 0;
+    const has200 = typeof priceFeed.px_vs_200dma.value === "number" && pts >= 200;
+    const m_w =
+      (has200 ? 0.6 : 0) +
+      (priceFeed.ret_20d.value != null ? 0.2 : 0) +
+      (priceFeed.ret_60d.value != null ? 0.2 : 0);
+    const covMom = Math.min(1, m_w) * 15;
+
+    let coverage_display = Math.round(covQuality + covSafety + covVal + covMom); // 0..100
+
+    // ===== Pénalités (fraîcheur & densité de prix) =====
     const recency = priceFeed.meta?.recency_days ?? 999;
-    if (pts < 240) penalty += 8;                // pas ~1 an de données “pleines”
-    if (recency > 7) penalty += 8;              // données trop anciennes (> 7 j)
 
-    // Valorisation basée uniquement sur EY (pas de FCFY)
-    const hasFCFY = fundamentals.fcf_yield.value != null;
-    const hasEY   = fundamentals.earnings_yield.value != null;
-    if (!hasFCFY && hasEY) penalty += 7;
+    // densité
+    if (pts < 120) coverage_display -= 10;
+    else if (pts < 240) coverage_display -= 5;
 
-    // Sécurité basée uniquement sur "net_cash" (pas de current ratio)
-    const hasCR = fundamentals.current_ratio.value != null;
-    const hasNC = fundamentals.net_cash.value != null;
-    if (!hasCR && hasNC) penalty += 5;
+    // fraîcheur
+    if (recency > 14) coverage_display -= 10;
+    else if (recency > 7) coverage_display -= 5;
 
-    // Ratios avancés manquants → chaque absence retire un peu de confiance
-    const missingRatios =
-      (fundamentals.roe?.value == null ? 1 : 0) +
-      (fundamentals.roa?.value == null ? 1 : 0) +
-      (fundamentals.roic?.value == null ? 1 : 0) +
-      (fundamentals.fcf_over_netincome?.value == null ? 1 : 0);
-    penalty += missingRatios * 3; // max -12
-
-    coverage_display = Math.round(Math.max(5, Math.min(100, coverage_display - penalty)));
+    // borne finale
+    coverage_display = Math.max(5, Math.min(100, coverage_display));
 
     // Couleur & verdict basés sur le score affiché (shown)
     const shown = score_adj ?? raw;
     const color: ScorePayload["color"] = shown >= 65 ? "green" : shown >= 50 ? "orange" : "red";
 
-    // Momentum considéré “présent” si la 200DMA est calculable
-    const momentumPresent = typeof priceFeed.px_vs_200dma.value === "number";
+    // Momentum “présent” si la 200DMA est calculable
+    const momentumPresent = has200;
 
     const { verdict, reason } = makeVerdict({
       coverage: coverage_display,
