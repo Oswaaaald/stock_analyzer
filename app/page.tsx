@@ -175,6 +175,7 @@ export default function Page() {
   const onEnter = (e: React.KeyboardEvent<HTMLInputElement>) => {
     if (e.key === "Enter") {
       setShowSug(false);
+      // si pas choisi depuis la liste, on reset le "selected" pour éviter anciens noms
       lookup(undefined, { symbol: q });
       inputRef.current?.blur();
     }
@@ -359,11 +360,17 @@ export default function Page() {
                       Couverture des données&nbsp;: {data.coverage}%
                     </span>
                   </div>
+
                   {selected?.name && (
                     <div className="mt-1 text-sm text-slate-400">
                       {selected.name}
                       {selected.exchange ? ` — ${selected.exchange.toUpperCase()}` : ""}
                     </div>
+                  )}
+
+                  {/* >>> INTERPRÉTATION À GAUCHE */}
+                  {interpretation && (
+                    <div className="mt-2 text-sm text-slate-300">{interpretation}</div>
                   )}
                 </div>
 
@@ -382,7 +389,6 @@ export default function Page() {
                       style={{ width: `${Math.min(100, data.score_adj ?? data.score)}%` }}
                     />
                   </div>
-                  <div className="mt-1 text-sm text-slate-300">{interpretation}</div>
                 </div>
               </div>
 
@@ -393,12 +399,6 @@ export default function Page() {
                   {Object.entries(data.subscores || {}).map(([k, v]) => {
                     const max = PILLAR_MAX[k] ?? 10;
                     const pct = Math.max(0, Math.min(100, (v / max) * 100));
-                    const PILLAR_LABEL: Record<string, string> = {
-                      quality: "Qualité opérationnelle",
-                      safety: "Solidité financière",
-                      valuation: "Valorisation",
-                      momentum: "Momentum / Tendance",
-                    };
                     return (
                       <div key={k} className="p-4 rounded-2xl bg-slate-900/40 border border-slate-800">
                         <div className="flex items-center justify-between">
