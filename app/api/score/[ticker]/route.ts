@@ -34,7 +34,7 @@ type Prices = {
   pct_52w: number | null;       // position entre plus bas/plus haut 52 semaines (0..1)
   max_dd_1y: number | null;     // max drawdown sur 1 an (négatif)
   ret_20d: number | null;       // performance 20 jours
-  ret_60d: number | null;       // performance 60 jours (nouveau)
+  ret_60d: number | null;       // performance 60 jours
   rs_6m_vs_sector_percentile: number | null; // placeholder
   eps_revisions_3m: number | null;           // placeholder
 
@@ -203,6 +203,17 @@ async function fetchYahooChart(ticker: string): Promise<OHLCFeed | null> {
     if (arr.length) return { dates: ts.slice(-arr.length), closes: arr, source: "yahoo" };
   }
   return null;
+}
+
+// --- Helper JSON safe (AJOUTÉ) ---
+async function fetchJsonSafe(url: string, headers: Record<string, string>) {
+  try {
+    const r = await fetch(url, { headers });
+    if (!r.ok) return null;
+    return await r.json();
+  } catch {
+    return null;
+  }
 }
 
 // Stooq (CSV -> dates + closes)
@@ -505,7 +516,7 @@ async function fetchFromSEC_US_IfPossible(ticker: string, lastPrice: number | nu
   const sharesSeries = pickBestUnit(sharesUnits as FactUnits | undefined, false);
   if (sharesSeries && sharesSeries.length >= 2) {
     const last = sharesSeries.at(-1)!.val;
-    // approx. 3y en arrière (12 trimestres si séries trimestrielles, sinon 2-4 annuels)
+    // approx. 3y en arrière
     const idx = Math.max(0, sharesSeries.length - 13);
     const prev = sharesSeries[idx]?.val;
     if (typeof last === "number" && typeof prev === "number" && prev > 0) {
@@ -533,10 +544,9 @@ async function fetchFromSEC_US_IfPossible(ticker: string, lastPrice: number | nu
   const cfoSeries = pickBestUnit(cfoCandidates.find(Boolean) as FactUnits | undefined);
   const capSeries = pickBestUnit(capexCandidates.find(Boolean) as FactUnits | undefined);
 
-  // fcf_positive_last4 (quarterly si possible)
+  // fcf_positive_last4
   if (cfoSeries && capSeries) {
     let countPos = 0;
-    // prendre 4 dernières périodes alignées si possible, sinon on vérifie juste les 4 dernières valeurs disponibles
     const cN = Math.min(4, cfoSeries.length);
     const kN = Math.min(4, capSeries.length);
     const n = Math.min(cN, kN);
