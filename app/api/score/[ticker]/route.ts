@@ -23,7 +23,10 @@ type Prices = {
   pct_52w: number | null;       // position entre plus bas/plus haut 52 semaines (0..1)
   max_dd_1y: number | null;     // max drawdown sur 1 an (négatif)
   ret_20d: number | null;       // performance 20 jours
+  rs_6m_vs_sector_percentile: number | null; // placeholder
+  eps_revisions_3m: number | null;           // placeholder
 };
+
 type DataBundle = { ticker: string; fundamentals: Fundamentals; prices: Prices };
 
 type ScorePayload = {
