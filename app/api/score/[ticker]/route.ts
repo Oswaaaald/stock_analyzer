@@ -831,12 +831,12 @@ async function fetchYahooKeyStatsHtml(ticker: string) {
 type FtsOut = { fundamentals: Partial<Fundamentals>; used: boolean; debug_keys?: string[] };
 
 async function fetchYahooFTS(ticker: string, lastPrice: number | null): Promise<FtsOut> {
-  const sess = await getYahooSession();
-  const crumbQS = sess?.crumb ? `&crumb=${encodeURIComponent(sess.crumb)}` : "";
+  // Pas de crumb ici — ça casse certains edges
+  const sess = await getYahooSession(); // cookies OK, mais optionnels
   const base = (host: string, types: string) =>
     `https://${host}/ws/fundamentals-timeseries/v1/finance/timeseries/${encodeURIComponent(
       ticker
-    )}?types=${types}&padTimeSeries=true&lang=en-US&region=US&corsDomain=finance.yahoo.com${crumbQS}`;
+    )}?types=${types}&padTimeSeries=true&lang=en-US&region=US&corsDomain=finance.yahoo.com`;
 
   const headers: Record<string, string> = {
     "User-Agent": UA,
@@ -847,6 +847,7 @@ async function fetchYahooFTS(ticker: string, lastPrice: number | null): Promise<
     ...(sess?.cookie ? { Cookie: sess.cookie } : {}),
   };
 
+  // On découpe en groupes pour limiter les 404/partial
   const groups = [
     "trailingPeTTM,priceToBook",
     "priceToFreeCashFlowTTM,freeCashFlowTTM",
@@ -861,13 +862,16 @@ async function fetchYahooFTS(ticker: string, lastPrice: number | null): Promise<
       const res = js?.timeseries?.result;
       if (Array.isArray(res)) {
         for (const obj of res) {
-          for (const k of Object.keys(obj || {})) {
-            if (k !== "meta" && Array.isArray((obj as any)[k])) {
-              bag[k] = (obj as any)[k];
+          if (!obj || typeof obj !== "object") continue;
+          for (const k of Object.keys(obj)) {
+            if (k === "meta") continue;
+            const arr = (obj as any)[k];
+            if (Array.isArray(arr) && arr.length) {
+              bag[k] = arr; // remplace si doublon : on veut la plus récente série non vide
             }
           }
         }
-        break;
+        break; // on arrête au premier host qui répond
       }
     }
   }
@@ -876,14 +880,21 @@ async function fetchYahooFTS(ticker: string, lastPrice: number | null): Promise<
   const out: Partial<Fundamentals> = {};
   let used = false;
 
-  const lastRaw = (series?: any[]) => {
-    if (!Array.isArray(series)) return null;
+  // Extracteur robuste (accepté: reportedValue.raw | reportedValue.fmt | raw | value)
+  const lastRaw = (series?: any[]): number | null => {
+    if (!Array.isArray(series) || !series.length) return null;
     for (let i = series.length - 1; i >= 0; i--) {
-      const rv = series[i]?.reportedValue;
-      const raw = typeof rv?.raw === "number" && Number.isFinite(rv.raw) ? rv.raw : null;
-      if (raw !== null) return raw;
-      const fmt = typeof rv?.fmt === "string" ? parseFloat(rv.fmt.replace(/[^\d.-]/g, "")) : NaN;
-      if (Number.isFinite(fmt)) return fmt;
+      const it = series[i] ?? {};
+      const rv = it.reportedValue ?? {};
+      const candidates = [
+        rv.raw,
+        typeof rv.fmt === "string" ? parseFloat(rv.fmt.replace(/[^\d.-]/g, "")) : undefined,
+        it.raw,
+        it.value,
+      ];
+      for (const c of candidates) {
+        if (typeof c === "number" && Number.isFinite(c)) return c;
+      }
     }
     return null;
   };
@@ -895,7 +906,7 @@ async function fetchYahooFTS(ticker: string, lastPrice: number | null): Promise<
     used = true;
   }
 
-  // FCF-Related
+  // FCF Yield depuis P/FCF, sinon fallback FCF / (Price * Shares)
   const pToFcf = lastRaw(bag["priceToFreeCashFlowTTM"]);
   if (pToFcf && pToFcf > 0) {
     const y = Math.max(-0.05, Math.min(0.08, 1 / pToFcf));
@@ -914,7 +925,7 @@ async function fetchYahooFTS(ticker: string, lastPrice: number | null): Promise<
     }
   }
 
-  // Net cash proxy (P/B faible)
+  // Proxy net_cash: P/B faible
   const pb = lastRaw(bag["priceToBook"]);
   if (typeof pb === "number" && pb > 0 && pb < 1.2) {
     out.net_cash = { value: 1, confidence: 0.2, source: "yahoo-fts" };
