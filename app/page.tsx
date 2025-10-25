@@ -5,15 +5,15 @@ import { useEffect, useMemo, useRef, useState } from "react";
 /* ====================== Types ====================== */
 type ScoreResponse = {
   ticker: string;
-  score: number;
-  score_adj?: number;
+  score: number;          // brut 0..100
+  score_adj?: number;     // normalisé 0..100 (affiché)
   color: "green" | "orange" | "red";
   verdict: "sain" | "a_surveiller" | "fragile";
   verdict_reason: string;
   reasons_positive: string[];
   red_flags: string[];
-  subscores: Record<string, number>;
-  coverage: number;
+  subscores: Record<string, number>; // { quality:0..35, safety:0..25, valuation:0..25, momentum:0..15 }
+  coverage: number;       // "Couverture des données" (0..100)
   proof?: {
     price_source?: string;
     price_points?: number;
@@ -40,6 +40,8 @@ type SuggestItem = {
   score?: number;
 };
 
+type SelectedMeta = { symbol: string; name?: string | null; exchange?: string | null };
+
 const SUGGESTIONS = ["AAPL", "MSFT", "NVDA", "TSLA", "RMS.PA", "MC.PA", "ASML.AS"];
 
 /* ====================== Page ====================== */
@@ -58,9 +60,8 @@ export default function Page() {
   const sugRef = useRef<HTMLDivElement | null>(null);
   const suppressSuggestRef = useRef<boolean>(false);
 
-  // meta pour affichage "Nom — EXCHANGE"
-  const [fullName, setFullName] = useState<string | null>(null);
-  const [exchange, setExchange] = useState<string | null>(null);
+  // sélection courante (pour afficher nom complet + place)
+  const [selected, setSelected] = useState<SelectedMeta | null>(null);
 
   /* ========= URL param -> auto lookup ========= */
   useEffect(() => {
@@ -70,20 +71,19 @@ export default function Page() {
       suppressSuggestRef.current = true;
       setQ(t);
       setShowSug(false);
+      setSelected({ symbol: t }); // pas de nom si chargé via URL
       void lookup(t);
     }
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
   /* ========= Fetch score ========= */
-  async function lookup(ticker?: string) {
+  async function lookup(ticker?: string, meta?: SelectedMeta | null) {
     const sym = (ticker ?? q).trim();
     if (!sym) return;
     setLoading(true);
     setError(null);
     setData(null);
-    setFullName(null);
-    setExchange(null);
     try {
       const res = await fetch(`/api/score/${encodeURIComponent(sym)}`, { cache: "no-store" });
       if (!res.ok) {
@@ -93,39 +93,20 @@ export default function Page() {
       const json: ScoreResponse = await res.json();
       setData(json);
 
-      // update URL
+      // URL
       const url = new URL(location.href);
       url.searchParams.set("ticker", sym);
       history.replaceState(null, "", url.toString());
 
-      // Résoudre le nom complet + exchange via suggest
-      void resolveMeta(sym);
+      // méta affichage si fourni
+      if (meta) setSelected(meta);
+      else setSelected((prev) => ({ symbol: sym, name: prev?.name, exchange: prev?.exchange }));
     } catch (e: any) {
       setError(e?.message || "Erreur inconnue");
     } finally {
       setLoading(false);
       setShowSug(false);
       inputRef.current?.blur();
-    }
-  }
-
-  async function resolveMeta(sym: string) {
-    try {
-      const r = await fetch(`/api/suggest?q=${encodeURIComponent(sym)}`, { cache: "no-store" });
-      if (!r.ok) return;
-      const j = (await r.json()) as { suggestions?: SuggestItem[] };
-      const list = j?.suggestions || [];
-      if (!list.length) return;
-
-      // Cherche correspondance exacte par symbole (case-insensitive), sinon premier résultat
-      const exact =
-        list.find((it) => it.symbol?.toUpperCase() === sym.toUpperCase()) ??
-        list[0];
-
-      setFullName(exact?.name || null);
-      setExchange(exact?.exchange || null);
-    } catch {
-      // silencieux
     }
   }
 
@@ -194,7 +175,8 @@ export default function Page() {
   const onEnter = (e: React.KeyboardEvent<HTMLInputElement>) => {
     if (e.key === "Enter") {
       setShowSug(false);
-      lookup();
+      // si pas choisi depuis la liste, on reset le "selected" pour éviter anciens noms
+      lookup(undefined, { symbol: q });
       inputRef.current?.blur();
     }
   };
@@ -202,35 +184,40 @@ export default function Page() {
   const verdictBadge = useMemo(() => {
     if (!data) return null;
     const map = {
-      sain: { label: "SAIN", classes: "bg-emerald-500/10 text-emerald-300 border-emerald-600/50" },
-      a_surveiller: { label: "À SURVEILLER", classes: "bg-amber-500/10 text-amber-300 border-amber-600/50" },
-      fragile: { label: "FRAGILE", classes: "bg-rose-500/10 text-rose-300 border-rose-600/50" },
+      sain: { label: "ENTREPRISE SOLIDE", classes: "bg-emerald-500/10 text-emerald-300 border-emerald-600/50" },
+      a_surveiller: { label: "ENTREPRISE À SURVEILLER", classes: "bg-amber-500/10 text-amber-300 border-amber-600/50" },
+      fragile: { label: "ENTREPRISE FRAGILE", classes: "bg-rose-500/10 text-rose-300 border-rose-600/50" },
     } as const;
     const v = map[data.verdict];
     return <span className={`px-2.5 py-1 rounded-full text-xs border ${v.classes}`}>{v.label}</span>;
   }, [data]);
-
-  function verdictPillColor(score: number) {
-    if (score >= 70) return "bg-emerald-500/15 text-emerald-300 border-emerald-700/40";
-    if (score >= 50) return "bg-amber-500/15 text-amber-300 border-amber-700/40";
-    return "bg-rose-500/15 text-rose-300 border-rose-700/40";
-  }
 
   function barColor(score: number) {
     if (score >= 70) return "bg-emerald-500";
     if (score >= 50) return "bg-amber-500";
     return "bg-rose-500";
   }
-
   function fmtPct(x?: number | null) {
     return typeof x === "number" ? `${(x * 100).toFixed(1)}%` : "—";
   }
 
-  const headerSubtitle = useMemo(() => {
-    if (!fullName && !exchange) return null;
-    const right = [fullName, exchange ? exchange.toUpperCase() : null].filter(Boolean).join(" — ");
-    return right || null;
-  }, [fullName, exchange]);
+  // libellés piliers + dénominateurs
+  const PILLAR_MAX: Record<string, number> = { quality: 35, safety: 25, valuation: 25, momentum: 15 };
+  const PILLAR_LABEL: Record<string, string> = {
+    quality: "Qualité opérationnelle",
+    safety: "Solidité financière",
+    valuation: "Valorisation",
+    momentum: "Momentum / Tendance",
+  };
+
+  // texte d’interprétation sous la note
+  const interpretation = useMemo(() => {
+    if (!data) return "";
+    const shown = data.score_adj ?? data.score;
+    if (shown >= 70) return "Profil globalement solide sur les piliers clés.";
+    if (shown >= 50) return "Profil correct avec des points à surveiller.";
+    return "Profil fragile ou données partielles.";
+  }, [data]);
 
   /* ====================== Render ====================== */
   return (
@@ -291,10 +278,12 @@ export default function Page() {
                     key={`${it.symbol}-${i}`}
                     role="option"
                     onClick={() => {
+                      const meta: SelectedMeta = { symbol: it.symbol, name: it.name, exchange: it.exchange };
                       suppressSuggestRef.current = true;
                       setQ(it.symbol);
                       setShowSug(false);
-                      void lookup(it.symbol);
+                      setSelected(meta);
+                      void lookup(it.symbol, meta);
                       inputRef.current?.blur();
                     }}
                     className="w-full text-left px-4 py-3 hover:bg-slate-800/70 flex items-center gap-3"
@@ -314,7 +303,7 @@ export default function Page() {
             onClick={() => {
               suppressSuggestRef.current = true;
               setShowSug(false);
-              lookup();
+              lookup(undefined, { symbol: q });
               inputRef.current?.blur();
             }}
             disabled={!q || loading}
@@ -333,7 +322,8 @@ export default function Page() {
                 suppressSuggestRef.current = true;
                 setQ(t);
                 setShowSug(false);
-                void lookup(t);
+                setSelected({ symbol: t });
+                void lookup(t, { symbol: t });
                 inputRef.current?.blur();
               }}
               className="text-xs px-2.5 py-1.5 rounded-full border border-slate-800 bg-slate-900/30 hover:bg-slate-800/50 text-slate-300"
@@ -354,107 +344,118 @@ export default function Page() {
       {/* Result */}
       {data && (
         <section className="max-w-6xl mx-auto px-5 py-8 grid lg:grid-cols-3 gap-6">
-          {/* Left: Score & reasons */}
+          {/* Left: Score & pillars */}
           <div className="lg:col-span-2">
-            <div className="overflow-hidden rounded-3xl border border-slate-800 bg-gradient-to-b from-slate-900/60 to-slate-900/30">
-              <div className="p-6 md:p-7">
-                <div className="flex items-start gap-4">
-                  <div className="flex-1">
-                    {/* Header titre + verdict pill */}
-                    <div className="flex flex-wrap items-center gap-3">
-                      <h2 className="text-2xl font-semibold tracking-tight">{data.ticker.toUpperCase()}</h2>
-                      {/* Verdict-colored pill (remplace le ruban) */}
-                      <span
-                        className={`px-2.5 py-1 rounded-full text-xs border ${verdictPillColor(
-                          data.score_adj ?? data.score
-                        )}`}
-                      >
-                        {data.verdict.toUpperCase()}
-                      </span>
-                      {/* Badge couverture */}
-                      <span className="text-xs px-2 py-0.5 rounded-full border border-slate-700 text-slate-300">
-                        Fiabilité {data.coverage}%
-                      </span>
-                    </div>
-                    {/* Sous-titre: Nom — EXCHANGE */}
-                    {headerSubtitle && (
-                      <div className="mt-0.5 text-slate-400 text-sm">{headerSubtitle}</div>
-                    )}
-                    {/* Raison */}
-                    <p className="mt-2 text-slate-400">{data.verdict_reason}</p>
+            <div className="rounded-3xl border border-slate-800 bg-gradient-to-b from-slate-900/60 to-slate-900/30 p-6 md:p-7">
+              {/* Header line: name + chips */}
+              <div className="flex items-start gap-4">
+                <div className="flex-1">
+                  <div className="flex items-center gap-3 flex-wrap">
+                    <h2 className="text-2xl font-semibold tracking-tight">
+                      {selected?.name
+                        ? `${selected.name}${selected.exchange ? " — " + selected.exchange?.toUpperCase() : ""}`
+                        : data.ticker.toUpperCase()}
+                    </h2>
+                    {verdictBadge}
+                    <span className="text-xs px-2 py-0.5 rounded-full border border-slate-700 text-slate-300">
+                      Couverture des données&nbsp;: {data.coverage}%
+                    </span>
                   </div>
 
-                  {/* Score à droite */}
-                  <div className="w-40 shrink-0">
-                    <div className="text-4xl font-extrabold tabular-nums text-right">
-                      {data.score_adj ?? data.score}
-                      <span className="text-lg text-slate-400">/100</span>
+                  {/* Score line */}
+                  <div className="mt-3 flex items-end gap-4 flex-wrap">
+                    <div>
+                      <div className="text-4xl font-extrabold tabular-nums">
+                        {data.score_adj ?? data.score}
+                        <span className="text-lg text-slate-400">/100</span>
+                      </div>
+                      <div className="mt-1 text-sm text-slate-300">{interpretation}</div>
+                      <div className="mt-1 text-xs text-slate-500">
+                        Note brute&nbsp;: {data.score}/100
+                      </div>
                     </div>
-                    <div className="mt-2 h-2 rounded-full bg-slate-800 overflow-hidden">
-                      <div
-                        className={`h-full ${barColor(data.score_adj ?? data.score)}`}
-                        style={{ width: `${Math.min(100, data.score_adj ?? data.score)}%` }}
-                      />
+                    <div className="flex-1 min-w-[220px]">
+                      <div className="h-2 rounded-full bg-slate-800 overflow-hidden">
+                        <div
+                          className={`h-full ${barColor(data.score_adj ?? data.score)}`}
+                          style={{ width: `${Math.min(100, data.score_adj ?? data.score)}%` }}
+                        />
+                      </div>
                     </div>
-                    <div className="mt-1 text-right text-xs text-slate-400">Score (brut) : {data.score}/100</div>
                   </div>
                 </div>
+              </div>
 
-                {/* Reasons */}
-                <div className="mt-6 grid md:grid-cols-2 gap-5">
-                  <div className="p-4 rounded-2xl bg-slate-900/50 border border-slate-800">
-                    <h3 className="text-sm uppercase tracking-wide text-slate-400">Raisons principales</h3>
-                    <ul className="mt-2 space-y-1.5">
-                      {(data.reasons_positive || []).map((r, i) => (
+              {/* Pillars */}
+              <div className="mt-6">
+                <h3 className="text-sm uppercase tracking-wide text-slate-400">Piliers de performance</h3>
+                <div className="mt-3 grid grid-cols-1 sm:grid-cols-2 gap-3">
+                  {Object.entries(data.subscores || {}).map(([k, v]) => {
+                    const max = PILLAR_MAX[k] ?? 10;
+                    const pct = Math.max(0, Math.min(100, (v / max) * 100));
+                    return (
+                      <div key={k} className="p-4 rounded-2xl bg-slate-900/40 border border-slate-800">
+                        <div className="flex items-center justify-between">
+                          <div className="text-sm">{PILLAR_LABEL[k] || k}</div>
+                          <div className="text-sm font-semibold tabular-nums">{Math.round(v)} / {max}</div>
+                        </div>
+                        <div className="mt-2 h-2 rounded-full bg-slate-800 overflow-hidden">
+                          <div className="h-full bg-slate-300" style={{ width: `${pct}%` }} />
+                        </div>
+                        <div className="mt-1 text-xs text-slate-500">
+                          {k === "quality" && "Rentabilité & efficacité opérationnelle"}
+                          {k === "safety" && "Liquidité, levier & trésorerie"}
+                          {k === "valuation" && "Rendement FCF / bénéfices vs prix"}
+                          {k === "momentum" && "Prix vs 200j + performance récente"}
+                        </div>
+                      </div>
+                    );
+                  })}
+                </div>
+              </div>
+
+              {/* Strengths & Risks */}
+              <div className="mt-6 grid md:grid-cols-2 gap-5">
+                <div className="p-4 rounded-2xl bg-slate-900/50 border border-slate-800">
+                  <h3 className="text-sm uppercase tracking-wide text-slate-400">Points forts détectés</h3>
+                  <ul className="mt-2 space-y-1.5">
+                    {data.reasons_positive?.length ? (
+                      data.reasons_positive.map((r, i) => (
                         <li key={i} className="flex items-start gap-2">
                           <span className="mt-1 w-1.5 h-1.5 rounded-full bg-emerald-400/90" />
                           <span>{r}</span>
                         </li>
-                      ))}
-                    </ul>
-                  </div>
-                  <div className="p-4 rounded-2xl bg-slate-900/50 border border-slate-800">
-                    <h3 className="text-sm uppercase tracking-wide text-slate-400">Drapeaux rouges</h3>
-                    <ul className="mt-2 space-y-1.5">
-                      {data.red_flags?.length ? (
-                        data.red_flags.map((r, i) => (
-                          <li key={i} className="flex items-start gap-2">
-                            <span className="mt-1 w-1.5 h-1.5 rounded-full bg-rose-400/90" />
-                            <span>{r}</span>
-                          </li>
-                        ))
-                      ) : (
-                        <li className="flex items-start gap-2">
-                          <span className="mt-1 w-1.5 h-1.5 rounded-full bg-slate-500/80" />
-                          <span>Aucun majeur détecté</span>
+                      ))
+                    ) : (
+                      <li className="text-slate-400 text-sm">—</li>
+                    )}
+                  </ul>
+                </div>
+                <div className="p-4 rounded-2xl bg-slate-900/50 border border-slate-800">
+                  <h3 className="text-sm uppercase tracking-wide text-slate-400">Risques ou limites</h3>
+                  <ul className="mt-2 space-y-1.5">
+                    {data.red_flags?.length ? (
+                      data.red_flags.map((r, i) => (
+                        <li key={i} className="flex items-start gap-2">
+                          <span className="mt-1 w-1.5 h-1.5 rounded-full bg-rose-400/90" />
+                          <span>{r}</span>
                         </li>
-                      )}
-                    </ul>
-                  </div>
+                      ))
+                    ) : (
+                      <li className="text-slate-400 text-sm">Aucune limite majeure détectée</li>
+                    )}
+                  </ul>
                 </div>
+              </div>
 
-                {/* Subscores */}
-                <div className="mt-6">
-                  <h3 className="text-sm uppercase tracking-wide text-slate-400">Sous-scores</h3>
-                  <div className="mt-2 grid grid-cols-2 sm:grid-cols-4 gap-3">
-                    {Object.entries(data.subscores || {}).map(([k, v]) => (
-                      <div key={k} className="p-4 rounded-2xl bg-slate-900/40 border border-slate-800">
-                        <div className="text-xs text-slate-400 capitalize">{k}</div>
-                        <div className="text-2xl font-semibold tabular-nums">{Math.round(v)}</div>
-                      </div>
-                    ))}
-                  </div>
-                </div>
-
-                {/* Ratios */}
-                <div className="mt-6">
-                  <h3 className="text-sm uppercase tracking-wide text-slate-400">Ratios</h3>
-                  <div className="mt-2 grid grid-cols-2 sm:grid-cols-4 gap-3">
-                    <RatioCard label="ROE" value={fmtPct(data.ratios?.roe)} />
-                    <RatioCard label="ROA" value={fmtPct(data.ratios?.roa)} />
-                    <RatioCard label="FCF / RN" value={fmtPct(data.ratios?.fcf_over_netincome)} />
-                    <RatioCard label="ROIC (approx.)" value={fmtPct(data.ratios?.roic)} />
-                  </div>
+              {/* Ratios */}
+              <div className="mt-6">
+                <h3 className="text-sm uppercase tracking-wide text-slate-400">Ratios</h3>
+                <div className="mt-2 grid grid-cols-2 sm:grid-cols-4 gap-3">
+                  <RatioCard label="ROE" value={fmtPct(data.ratios?.roe)} />
+                  <RatioCard label="ROA" value={fmtPct(data.ratios?.roa)} />
+                  <RatioCard label="FCF / RN" value={fmtPct(data.ratios?.fcf_over_netincome)} />
+                  <RatioCard label="ROIC (approx.)" value={fmtPct(data.ratios?.roic)} />
                 </div>
               </div>
             </div>
@@ -466,7 +467,7 @@ export default function Page() {
           {/* Right: Proofs */}
           <aside className="lg:col-span-1">
             <div className="rounded-3xl border border-slate-800 bg-slate-900/40 p-5">
-              <h3 className="text-sm uppercase tracking-wide text-slate-400">Preuves (sources &amp; fraîcheur)</h3>
+              <h3 className="text-sm uppercase tracking-wide text-slate-400">Sources &amp; fraîcheur</h3>
 
               {/* Price block */}
               <div className="mt-3 p-3 rounded-2xl bg-slate-950/40 border border-slate-800">
@@ -533,7 +534,7 @@ function Badge({
 function SourceChip({ src }: { src: string }) {
   const label = src.replace(/^price:/, "price · ").replace(/^sec:/, "sec · ");
   const variant =
-    /fin-html/.test(src) ? "ok" : /yahoo:html|yahoo:v7|yahoo:summary/.test(src) ? "default" : /wikipedia/.test(src) ? "muted" : "default";
+    /fin-html/.test(src) ? "ok" : /yahoo:html|yahoo:v7|yahoo:v10|yahoo:summary/.test(src) ? "default" : /wikipedia/.test(src) ? "muted" : "default";
   return <Badge variant={variant as any}>{label}</Badge>;
 }
 
