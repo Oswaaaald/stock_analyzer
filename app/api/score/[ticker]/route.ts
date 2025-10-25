@@ -3,24 +3,25 @@ export const runtime = "nodejs";
 
 import { NextResponse } from "next/server";
 
-/* ============================== Cache mémoire ============================== */
+/* ========================== Cache mémoire ========================== */
 const MEM: Record<string, { expires: number; data: any }> = {};
-const TTL_MS = 30 * 60 * 1000; // 30 min
+const TTL_MS = 30 * 60 * 1000;
 
-/* ============================== Types ============================== */
+/* ========================== Types ========================== */
 type Metric = { value: number | null; confidence: number; source?: string };
 
 type Fundamentals = {
-  op_margin: Metric;          // financialData.operatingMargins (si dispo)
+  // existants
+  op_margin: Metric;          // financialData.operatingMargins
   current_ratio: Metric;      // financialData.currentRatio
   fcf_yield: Metric;          // FCF / MarketCap
   earnings_yield: Metric;     // 1 / trailingPE
-  net_cash: Metric;           // proxy (cash>debt) si dispo, sinon via PB<1.2
-  // Ratios avancés (affichage)
-  roe?: Metric;
-  roa?: Metric;
-  fcf_over_netincome?: Metric;
-  roic?: Metric;
+  net_cash: Metric;           // proxy (cash>debt) sinon via PB<1.2
+  // nouveaux
+  roe: Metric;                // NI / Avg Equity  (fallback financialData.returnOnEquity)
+  roa: Metric;                // NI / Assets     (fallback financialData.returnOnAssets)
+  fcf_over_netincome: Metric; // FCF / Net Income
+  roic: Metric;               // NOPAT / (Debt + Equity - Cash)
 };
 
 type Prices = {
@@ -37,15 +38,15 @@ type DataBundle = { ticker: string; fundamentals: Fundamentals; prices: Prices; 
 
 type ScorePayload = {
   ticker: string;
-  score: number;
-  score_adj?: number;
+  score: number;            // brut
+  score_adj?: number;       // ajusté par couverture
   color: "green" | "orange" | "red";
   verdict: "sain" | "a_surveiller" | "fragile";
   verdict_reason: string;
   reasons_positive: string[];
   red_flags: string[];
   subscores: Record<string, number>;
-  coverage: number; // 0..100 (par piliers)
+  coverage: number;
   proof?: {
     price_source?: string;
     price_points?: number;
@@ -54,21 +55,16 @@ type ScorePayload = {
     valuation_used?: boolean;
     sources_used?: string[];
   };
-  ratios?: {
-    roe?: number | null;
-    roa?: number | null;
-    fcf_over_netincome?: number | null;
-    roic?: number | null;
-  };
 };
 
-/* ============================== UA & Session Yahoo ============================== */
+/* ========================== UA & Session Yahoo ========================== */
 const UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124 Safari/537.36";
 const AL = "en-US,en;q=0.9";
+
 type YSession = { cookie: string; crumb?: string; exp: number };
 let YSESSION: YSession | null = null;
 
-// Agrège Set-Cookie -> "k=v; k2=v2"
+// agrège Set-Cookie -> "k=v; k2=v2"
 function collectCookies(res: Response, prev = ""): string {
   // @ts-ignore next/undici compat
   const raw: string[] =
@@ -102,7 +98,7 @@ async function getYahooSession(): Promise<YSession> {
   const q = await fetch("https://finance.yahoo.com/quote/AAPL?guccounter=1", { headers: base, redirect: "manual" });
   cookie = collectCookies(q, cookie);
 
-  // 2) follow consent hops (si besoin)
+  // 2) follow possible consent hops
   let loc = q.headers.get("location") || "";
   for (let i = 0; i < 3 && loc && /guce|consent\.yahoo\.com/i.test(loc); i++) {
     const r = await fetch(loc, { headers: base, redirect: "manual" });
@@ -110,15 +106,15 @@ async function getYahooSession(): Promise<YSession> {
     loc = r.headers.get("location") || "";
   }
 
-  // 3) cookies communs
+  // 3) common cookies
   const fc = await fetch("https://fc.yahoo.com", { headers: base, redirect: "manual" });
   cookie = collectCookies(fc, cookie);
 
-  // 4) finance once more (A1/A3/GUC)
+  // 4) load finance again to ensure A1/A3/GUC
   const fin = await fetch("https://finance.yahoo.com/quote/AAPL", { headers: { ...base, Cookie: cookie }, redirect: "manual" });
   cookie = collectCookies(fin, cookie);
 
-  // 5) crumb (q2 -> q1)
+  // 5) crumb (q2 -> q1) with Origin/Referer
   const ch = { ...base, Cookie: cookie, Origin: "https://finance.yahoo.com", Referer: "https://finance.yahoo.com/" };
   let crumb = "";
   for (const host of ["query2", "query1"] as const) {
@@ -134,7 +130,7 @@ async function getYahooSession(): Promise<YSession> {
   return YSESSION;
 }
 
-/* ============================== Handler ============================== */
+/* ========================== Handler ========================== */
 export async function GET(req: Request, { params }: { params: { ticker: string } }) {
   const t = (params.ticker || "").toUpperCase().trim();
   if (!t) return NextResponse.json({ error: "Ticker requis" }, { status: 400 });
@@ -143,50 +139,34 @@ export async function GET(req: Request, { params }: { params: { ticker: string }
   const isDebug = url.searchParams.get("debug") === "1";
 
   const cacheKey = `score_${t}${isDebug ? ":dbg" : ""}`;
-  const now = Date.now();
   const hit = MEM[cacheKey];
+  const now = Date.now();
   if (!isDebug && hit && hit.expires > now) return NextResponse.json(hit.data);
 
   try {
-    // 1) Prix & momentum (v8, sans cookies)
+    // prix & momentum via v8 (pas de cookies)
     const priceFeed = await fetchYahooChartAndEnrich(t);
-
-    // 2) Session + v10 (fundamentaux & historiques annuels pour ratios)
+    // session + crumb pour v10
     const sess = await getYahooSession();
     const v10 = await fetchYahooV10(t, sess, /*retryOnce*/ true);
 
-    // 3) Extraire fondamentaux + ratios
     const fundamentals = computeFundamentalsFromV10(v10);
     const sources_used = ["price:yahoo(v8)", "yahoo:v10"];
 
     const bundle: DataBundle = { ticker: t, fundamentals, prices: priceFeed, sources_used };
-    const { subscores, maxes } = computeScore(bundle);
-
-    // Couverture par PILIERS (non plus par granularité intrapilier)
-    // - Qualité présente si op_margin est dispo -> +35
-    // - Sécurité présente si current_ratio OU net_cash -> +25
-    // - Valorisation présente si FCFY OU EY -> +25
-    // - Momentum présent si px_vs_200dma -> +15
-    const qualityPresent = typeof fundamentals.op_margin.value === "number";
-    const safetyPresent =
-      typeof fundamentals.current_ratio.value === "number" || typeof fundamentals.net_cash.value === "number";
-    const valuationPresent =
-      typeof fundamentals.fcf_yield.value === "number" || typeof fundamentals.earnings_yield.value === "number";
-    const momentumPresent = typeof priceFeed.px_vs_200dma.value === "number";
-
-    const coveragePoints =
-      (qualityPresent ? 35 : 0) +
-      (safetyPresent ? 25 : 0) +
-      (valuationPresent ? 25 : 0) +
-      (momentumPresent ? 15 : 0);
+    const { subscores, malus, maxes } = computeScore(bundle);
     const total = subscores.quality + subscores.safety + subscores.valuation + subscores.momentum;
-    const raw = Math.max(0, Math.min(100, Math.round(total)));
-
-    const coverage = coveragePoints; // déjà sur 100
+    const raw = Math.max(0, Math.min(100, Math.round(total) - malus));
+    const coverage = Math.max(0, Math.min(100, Math.round(maxes.quality + maxes.safety + maxes.valuation + maxes.momentum)));
     const score_adj = coverage > 0 ? Math.round((total / coverage) * 100) : 0;
 
-    const color: ScorePayload["color"] = raw >= 70 ? "green" : raw >= 50 ? "orange" : "red";
-    const { verdict, reason } = makeVerdict({ coverage, total, momentumPresent, score_adj });
+    // --- verdict sur "shown" (score affiché = score_adj prioritaire)
+    const shown = score_adj ?? raw;
+    const color: ScorePayload["color"] = shown >= 65 ? "green" : shown >= 50 ? "orange" : "red";
+    const momentumOk =
+      (typeof priceFeed.px_vs_200dma.value === "number" && priceFeed.px_vs_200dma.value >= 0) ||
+      (typeof priceFeed.ret_60d.value === "number" && priceFeed.ret_60d.value > 0);
+    const { verdict, reason } = makeVerdict({ coverage, momentumOk, shown });
 
     const reasons = buildReasons(bundle, subscores);
 
@@ -209,12 +189,6 @@ export async function GET(req: Request, { params }: { params: { ticker: string }
         valuation_used: (fundamentals.fcf_yield.value ?? fundamentals.earnings_yield.value) != null,
         sources_used,
       },
-      ratios: {
-        roe: fundamentals.roe?.value ?? null,
-        roa: fundamentals.roa?.value ?? null,
-        fcf_over_netincome: fundamentals.fcf_over_netincome?.value ?? null,
-        roic: fundamentals.roic?.value ?? null,
-      },
     };
 
     if (!isDebug) MEM[cacheKey] = { expires: now + TTL_MS, data: payload };
@@ -225,12 +199,12 @@ export async function GET(req: Request, { params }: { params: { ticker: string }
   }
 }
 
-/* ============================== Helpers généraux ============================== */
+/* ========================== Helpers généraux ========================== */
 const asMetric = (v: number | null, conf = 0, source?: string): Metric => ({ value: v, confidence: conf, source });
 const clip = (x: number, lo: number, hi: number) => Math.max(lo, Math.min(hi, x));
 const num = (x: any) => (typeof x === "number" && Number.isFinite(x) ? x : null);
 
-/* ============================== v8 chart (prix & momentum) ============================== */
+/* ========================== v8 chart (prix & momentum) ========================== */
 async function fetchYahooChartAndEnrich(ticker: string): Promise<Prices> {
   const urls = [
     `https://query1.finance.yahoo.com/v8/finance/chart/${encodeURIComponent(ticker)}?range=2y&interval=1d`,
@@ -275,40 +249,26 @@ function enrichCloses(closes: number[]) {
     if (avg > 0) px_vs_200dma = (last - avg) / avg;
   }
   const last252 = closes.slice(-252);
-  let pct_52w: number | null = null,
-    max_dd_1y: number | null = null;
+  let pct_52w: number | null = null, max_dd_1y: number | null = null;
   if (last252.length >= 30 && typeof last === "number") {
-    const hi = Math.max(...last252),
-      lo = Math.min(...last252);
+    const hi = Math.max(...last252), lo = Math.min(...last252);
     if (hi > lo) pct_52w = (last - lo) / (hi - lo);
-    let peak = last252[0];
-    let mdd = 0;
-    for (const c of last252) {
-      peak = Math.max(peak, c);
-      mdd = Math.min(mdd, (c - peak) / peak);
-    }
+    let peak = last252[0], mdd = 0;
+    for (const c of last252) { peak = Math.max(peak, c); mdd = Math.min(mdd, (c - peak) / peak); }
     max_dd_1y = mdd;
   }
-  let ret_20d: number | null = null,
-    ret_60d: number | null = null;
+  let ret_20d: number | null = null, ret_60d: number | null = null;
   if (closes.length >= 21 && typeof last === "number") {
-    const prev20 = closes[closes.length - 21];
-    if (prev20 > 0) ret_20d = last / prev20 - 1;
+    const prev20 = closes[closes.length - 21]; if (prev20 > 0) ret_20d = last / prev20 - 1;
   }
   if (closes.length >= 61 && typeof last === "number") {
-    const prev60 = closes[closes.length - 61];
-    if (prev60 > 0) ret_60d = last / prev60 - 1;
+    const prev60 = closes[closes.length - 61]; if (prev60 > 0) ret_60d = last / prev60 - 1;
   }
   return { px: last, px_vs_200dma, pct_52w, max_dd_1y, ret_20d, ret_60d };
 }
-function confFromPts(pts: number) {
-  if (pts >= 400) return 0.95;
-  if (pts >= 250) return 0.85;
-  if (pts >= 120) return 0.7;
-  return 0.4;
-}
+function confFromPts(pts: number) { if (pts >= 400) return 0.95; if (pts >= 250) return 0.85; if (pts >= 120) return 0.7; return 0.4; }
 
-/* ============================== v10 quoteSummary (fundamentaux+annuals) ============================== */
+/* ========================== v10 quoteSummary (fundamentaux) ========================== */
 async function fetchYahooV10(ticker: string, sess: YSession, retryOnce: boolean): Promise<any> {
   const base = {
     "User-Agent": UA,
@@ -319,26 +279,22 @@ async function fetchYahooV10(ticker: string, sess: YSession, retryOnce: boolean)
     ...(sess.cookie ? { Cookie: sess.cookie } as any : {}),
   };
   const crumbQS = sess.crumb ? `&crumb=${encodeURIComponent(sess.crumb)}` : "";
-  const modules =
-    "financialData,defaultKeyStatistics,price,summaryDetail,incomeStatementHistory,balanceSheetHistory";
+  const qs =
+    `modules=financialData,defaultKeyStatistics,price,summaryDetail,` +
+    `incomeStatementHistory,balanceSheetHistory`;
   const urls = [
-    `https://query2.finance.yahoo.com/v10/finance/quoteSummary/${encodeURIComponent(
-      ticker
-    )}?modules=${modules}${crumbQS}`,
-    `https://query1.finance.yahoo.com/v10/finance/quoteSummary/${encodeURIComponent(
-      ticker
-    )}?modules=${modules}${crumbQS}`,
+    `https://query2.finance.yahoo.com/v10/finance/quoteSummary/${encodeURIComponent(ticker)}?${qs}${crumbQS}`,
+    `https://query1.finance.yahoo.com/v10/finance/quoteSummary/${encodeURIComponent(ticker)}?${qs}${crumbQS}`,
   ];
   for (const u of urls) {
     const res = await fetch(u, { headers: base });
     if (res.status === 401 && retryOnce) {
-      const s2 = await getYahooSession();
+      const s2 = await getYahooSession(); // regen crumb/cookies
       return fetchYahooV10(ticker, s2, /*retryOnce*/ false);
     }
     if (res.ok) {
       const js = await res.json();
-      const r = js?.quoteSummary?.result?.[0];
-      if (r) return r;
+      if (js?.quoteSummary?.result?.[0]) return js.quoteSummary.result[0];
     }
   }
   throw new Error("QuoteSummary indisponible");
@@ -357,10 +313,12 @@ function computeFundamentalsFromV10(r: any): Fundamentals {
   const debt = num(r?.financialData?.totalDebt?.raw ?? r?.financialData?.totalDebt);
 
   // --- nouveaux (annual) ---
-  const ishs: any[] = r?.incomeStatementHistory?.incomeStatementHistory || [];
-  const bsh: any[] = r?.balanceSheetHistory?.balanceSheetStatements || [];
+  const ishs = r?.incomeStatementHistory?.incomeStatementHistory
+            || r?.incomeStatementHistory?.incomeStatementHistory?.incomeStatementHistory;
+  const bsh  = r?.balanceSheetHistory?.balanceSheetStatements;
 
   const ni0 = num(ishs?.[0]?.netIncome?.raw ?? ishs?.[0]?.netIncome);
+  const ni1 = num(ishs?.[1]?.netIncome?.raw ?? ishs?.[1]?.netIncome);
   const opInc0 = num(ishs?.[0]?.operatingIncome?.raw ?? ishs?.[0]?.operatingIncome);
   const taxExp0 = num(ishs?.[0]?.incomeTaxExpense?.raw ?? ishs?.[0]?.incomeTaxExpense);
   const preTax0 = num(ishs?.[0]?.incomeBeforeTax?.raw ?? ishs?.[0]?.incomeBeforeTax);
@@ -379,109 +337,70 @@ function computeFundamentalsFromV10(r: any): Fundamentals {
   if (cash != null && debt != null) netCash = cash - debt > 0 ? 1 : 0;
   else if (priceToBook && priceToBook > 0) netCash = priceToBook < 1.2 ? 1 : 0;
 
-  // ROE (direct si dispo, sinon calc NI / avg equity)
+  // ROE: best-effort (moyenne equity) ou financialData
   const roe_direct = num(r?.financialData?.returnOnEquity?.raw ?? r?.financialData?.returnOnEquity);
-  const avgEq = eq0 != null && eq1 != null ? (eq0 + eq1) / 2 : eq0 ?? null;
-  const roe_calc = ni0 != null && avgEq ? (avgEq !== 0 ? ni0 / avgEq : null) : null;
+  const avgEq = (eq0 != null && eq1 != null) ? (eq0 + eq1) / 2 : eq0 ?? null;
+  const roe_calc = (ni0 != null && avgEq && avgEq !== 0) ? (ni0 / avgEq) : null;
   const roe = roe_direct ?? roe_calc;
 
-  // ROA (direct si dispo, sinon NI / Assets)
+  // ROA
   const roa_direct = num(r?.financialData?.returnOnAssets?.raw ?? r?.financialData?.returnOnAssets);
-  const roa = roa_direct ?? (ni0 != null && assets0 ? (assets0 !== 0 ? ni0 / assets0 : null) : null);
+  const roa_calc = (ni0 != null && assets0) ? (ni0 / assets0) : null;
+  const roa = roa_direct ?? roa_calc;
 
   // FCF / Net Income
-  const fcf_over_ni = fcf != null && ni0 != null && ni0 !== 0 ? fcf / ni0 : null;
+  const fcf_over_ni = (fcf != null && ni0 != null && ni0 !== 0) ? (fcf / ni0) : null;
 
-  // ROIC ~ NOPAT / (Debt + Equity - Cash)
-  // - NOPAT ≈ operatingIncome * (1 - taxRate)
-  // - Fallback si operatingIncome manquant: NOPAT ≈ netIncome (proxy prudente)
-  const taxRate =
-    preTax0 && taxExp0 != null && preTax0 !== 0 ? Math.min(0.5, Math.max(0, taxExp0 / preTax0)) : 0.21;
-  const nopat =
-    opInc0 != null ? opInc0 * (1 - taxRate) : (ni0 != null ? ni0 : null);
-  const invested =
-    (debt ?? null) != null || (eq0 ?? null) != null ? ((debt ?? 0) + (eq0 ?? 0) - (cash ?? 0)) : null;
-  const roic = nopat != null && invested && invested !== 0 ? nopat / invested : null;
+  // ROIC (approx) : NOPAT / (Debt + Equity - Cash)
+  const taxRate = (preTax0 && taxExp0 != null && preTax0 !== 0) ? Math.min(0.5, Math.max(0, taxExp0 / preTax0)) : 0.21;
+  const nopat = (opInc0 != null) ? opInc0 * (1 - taxRate) : null;
+  const invested = (debt ?? null) != null || (eq0 ?? null) != null ? ((debt ?? 0) + (eq0 ?? 0) - (cash ?? 0)) : null;
+  const roic = (nopat != null && invested && invested !== 0) ? (nopat / invested) : null;
 
   return {
-    op_margin: asMetric(opm, opm != null ? 0.45 : 0, "yahoo-v10"),
-    current_ratio: asMetric(currentRatio, currentRatio != null ? 0.4 : 0, "yahoo-v10"),
-    fcf_yield: asMetric(fcfy != null ? clampFcfy(fcfy) : null, fcfy != null ? 0.45 : 0, "yahoo-v10"),
+    op_margin:      asMetric(opm, opm != null ? 0.45 : 0, "yahoo-v10"),
+    current_ratio:  asMetric(currentRatio, currentRatio != null ? 0.4 : 0, "yahoo-v10"),
+    fcf_yield:      asMetric(fcfy != null ? clampFcfy(fcfy) : null, fcfy != null ? 0.45 : 0, "yahoo-v10"),
     earnings_yield: asMetric(ey, ey != null ? 0.45 : 0, "yahoo-v10"),
-    net_cash: asMetric(netCash, netCash != null ? 0.35 : 0, "yahoo-v10"),
+    net_cash:       asMetric(netCash, netCash != null ? 0.35 : 0, "yahoo-v10"),
 
-    roe: asMetric(roe ?? null, roe != null ? 0.45 : 0, roe_direct != null ? "yahoo-v10" : "calc"),
-    roa: asMetric(roa ?? null, roa != null ? 0.4 : 0, roa_direct != null ? "yahoo-v10" : "calc"),
+    roe:                asMetric(roe ?? null, roe != null ? 0.45 : 0, roe_direct != null ? "yahoo-v10" : "calc"),
+    roa:                asMetric(roa ?? null, roa != null ? 0.4  : 0, roa_direct != null ? "yahoo-v10" : "calc"),
     fcf_over_netincome: asMetric(fcf_over_ni, fcf_over_ni != null ? 0.35 : 0, "calc"),
-    roic: asMetric(roic, roic != null ? 0.3 : 0, "calc"),
+    roic:               asMetric(roic, roic != null ? 0.3 : 0, "calc"),
   };
 }
 const clampFcfy = (y: number) => Math.max(-0.05, Math.min(0.08, y));
 
-/* ============================== Scoring ============================== */
+/* ========================== Scoring ========================== */
 function computeScore(d: DataBundle) {
-  const f = d.fundamentals,
-    p = d.prices;
+  const f = d.fundamentals, p = d.prices;
 
   // Qualité (35)
-  let q = 0,
-    qMax = 0;
-  if (typeof f.op_margin.value === "number") {
-    qMax += 8;
-    q += f.op_margin.value >= 0.25 ? 8 : f.op_margin.value >= 0.15 ? 6 : f.op_margin.value >= 0.05 ? 3 : 0;
-  }
+  let q = 0, qMax = 0;
+  if (typeof f.op_margin.value === "number") { qMax += 8; q += f.op_margin.value >= 0.25 ? 8 : f.op_margin.value >= 0.15 ? 6 : f.op_margin.value >= 0.05 ? 3 : 0; }
 
   // Sécurité (25)
-  let s = 0,
-    sMax = 0;
-  if (typeof f.current_ratio.value === "number") {
-    sMax += 4;
-    s += f.current_ratio.value > 1.5 ? 4 : f.current_ratio.value >= 1 ? 2 : 0;
-  }
-  if (typeof f.net_cash.value === "number") {
-    sMax += 2;
-    s += f.net_cash.value > 0 ? 2 : 0;
-  }
+  let s = 0, sMax = 0;
+  if (typeof f.current_ratio.value === "number") { sMax += 4; s += f.current_ratio.value > 1.5 ? 4 : f.current_ratio.value >= 1 ? 2 : 0; }
+  if (typeof f.net_cash.value === "number")     { sMax += 2; s += f.net_cash.value > 0 ? 2 : 0; }
 
   // Valorisation (25)
-  let v = 0,
-    vMax = 0;
-  if (typeof f.fcf_yield.value === "number") {
-    vMax += 10;
-    const y = f.fcf_yield.value;
-    v += y > 0.06 ? 10 : y >= 0.04 ? 7 : y >= 0.02 ? 4 : 1;
-  } else if (typeof f.earnings_yield.value === "number") {
-    vMax += 10;
-    const y = f.earnings_yield.value;
-    v += y > 0.07 ? 9 : y >= 0.05 ? 6 : y >= 0.03 ? 3 : 1;
-  }
+  let v = 0, vMax = 0;
+  if (typeof f.fcf_yield.value === "number") { vMax += 10; const y = f.fcf_yield.value; v += y > 0.06 ? 10 : y >= 0.04 ? 7 : y >= 0.02 ? 4 : 1; }
+  else if (typeof f.earnings_yield.value === "number") { vMax += 10; const y = f.earnings_yield.value; v += y > 0.07 ? 9 : y >= 0.05 ? 6 : y >= 0.03 ? 3 : 1; }
 
   // Momentum (15)
-  let m = 0,
-    mMax = 0;
-  if (typeof p.px_vs_200dma.value === "number") {
-    mMax = 10;
-    m += p.px_vs_200dma.value >= 0.05 ? 10 : p.px_vs_200dma.value > -0.05 ? 6 : 2;
-  }
-  if (typeof p.ret_20d.value === "number") {
-    mMax += 3;
-    m += p.ret_20d.value > 0.03 ? 3 : p.ret_20d.value > 0 ? 2 : 0;
-  }
-  if (typeof p.ret_60d.value === "number") {
-    mMax += 2;
-    m += p.ret_60d.value > 0.06 ? 2 : p.ret_60d.value > 0 ? 1 : 0;
-  }
-  m = Math.min(m, 15);
-  mMax = 15;
+  let m = 0, mMax = 0;
+  if (typeof p.px_vs_200dma.value === "number") { mMax = 10; m += p.px_vs_200dma.value >= 0.05 ? 10 : p.px_vs_200dma.value > -0.05 ? 6 : 2; }
+  if (typeof p.ret_20d.value === "number")      { mMax += 3; m += p.ret_20d.value > 0.03 ? 3 : p.ret_20d.value > 0 ? 2 : 0; }
+  if (typeof p.ret_60d.value === "number")      { mMax += 2; m += p.ret_60d.value > 0.06 ? 2 : p.ret_60d.value > 0 ? 1 : 0; }
+  m = Math.min(m, 15); mMax = 15;
 
-  const subscores = {
-    quality: clip(q, 0, 35),
-    safety: clip(s, 0, 25),
-    valuation: clip(v, 0, 25),
-    momentum: clip(m, 0, 15),
-  };
+  const subscores = { quality: clip(q, 0, 35), safety: clip(s, 0, 25), valuation: clip(v, 0, 25), momentum: clip(m, 0, 15) };
   const maxes = { quality: qMax, safety: sMax, valuation: vMax, momentum: mMax };
-  return { subscores, maxes };
+  const malus = 0;
+  return { subscores, malus, maxes };
 }
 
 function buildReasons(_d: DataBundle, subs: Record<string, number>) {
@@ -494,21 +413,39 @@ function buildReasons(_d: DataBundle, subs: Record<string, number>) {
   return out;
 }
 
-function makeVerdict(args: { coverage: number; total: number; momentumPresent: boolean; score_adj: number }) {
-  const { coverage, momentumPresent, score_adj } = args;
-  const coverageOk = coverage >= 60; // seuil assoupli via couverture par piliers
-  if (score_adj >= 70 && coverageOk && momentumPresent) return { verdict: "sain" as const, reason: "Score élevé et couverture suffisante" };
-  if (score_adj >= 40 || momentumPresent) return { verdict: "a_surveiller" as const, reason: "Signal positif mais incomplet" + (coverageOk ? "" : " (couverture limitée)") };
-  return { verdict: "fragile" as const, reason: "Signal faible et données limitées" };
+function makeVerdict({
+  coverage,
+  momentumOk,
+  shown,
+}: {
+  coverage: number;
+  momentumOk: boolean;
+  shown: number; // score affiché (score_adj)
+}) {
+  const coverageOk = coverage >= 40;
+
+  if (shown >= 70 && coverageOk && momentumOk) {
+    return { verdict: "sain" as const, reason: "Score élevé et couverture suffisante" };
+  }
+
+  if (shown >= 50 || momentumOk) {
+    return {
+      verdict: "a_surveiller" as const,
+      reason: "Signal positif mais incomplet" + (coverageOk ? "" : " (couverture limitée)"),
+    };
+  }
+
+  return {
+    verdict: "fragile" as const,
+    reason: "Signal faible" + (coverageOk ? "" : " (données partielles)"),
+  };
 }
 
-/* ============================== Fetch util ============================== */
+/* ========================== Fetch utils ========================== */
 async function fetchJsonSafe(url: string, headers?: Record<string, string>) {
   try {
     const r = await fetch(url, { headers });
     if (!r.ok) return null;
     return await r.json();
-  } catch {
-    return null;
-  }
+  } catch { return null; }
 }
