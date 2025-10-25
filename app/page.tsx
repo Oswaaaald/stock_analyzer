@@ -17,18 +17,25 @@ type ScoreResponse = {
     price_points?: number;
     price_has_200dma: boolean;
     price_recency_days?: number | null;
-    sec_used?: string[];
-    sec_note?: string | null;
     valuation_used?: boolean;
     sources_used?: string[];
   };
+  ratios?: {
+    roe?: number | null;
+    roa?: number | null;
+    fcf_over_netincome?: number | null;
+    roic?: number | null;
+  };
 };
 
-type Suggestion = {
+type SuggestItem = {
   symbol: string;
   name: string;
   exchange?: string | null;
   type?: string | null;
+  score?: number | null;
+  region?: string | null;
+  currency?: string | null;
 };
 
 const SUGGESTIONS = ["AAPL", "MSFT", "NVDA", "TSLA", "RMS.PA", "MC.PA", "ASML.AS"];
@@ -39,12 +46,12 @@ export default function Page() {
   const [data, setData] = useState<ScoreResponse | null>(null);
   const [error, setError] = useState<string | null>(null);
 
-  // autosuggest state
-  const [items, setItems] = useState<Suggestion[]>([]);
+  // searchbox
   const [open, setOpen] = useState(false);
+  const [opts, setOpts] = useState<SuggestItem[]>([]);
   const [highlight, setHighlight] = useState(0);
-  const abortRef = useRef<AbortController | null>(null);
-  const containerRef = useRef<HTMLDivElement | null>(null);
+  const wrapRef = useRef<HTMLDivElement>(null);
+  const inputRef = useRef<HTMLInputElement>(null);
 
   // Pré-remplir depuis URL ?ticker=...
   useEffect(() => {
@@ -57,16 +64,14 @@ export default function Page() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
-  // Click-away: fermer le dropdown si clic hors du conteneur
+  // outside click + blur -> fermer la liste
   useEffect(() => {
-    const onDown = (e: PointerEvent) => {
-      if (!containerRef.current) return;
-      if (!containerRef.current.contains(e.target as Node)) {
-        setOpen(false);
-      }
-    };
-    window.addEventListener("pointerdown", onDown, { capture: true });
-    return () => window.removeEventListener("pointerdown", onDown, { capture: true } as any);
+    function onDocClick(e: MouseEvent) {
+      if (!wrapRef.current) return;
+      if (!wrapRef.current.contains(e.target as Node)) setOpen(false);
+    }
+    document.addEventListener("mousedown", onDocClick);
+    return () => document.removeEventListener("mousedown", onDocClick);
   }, []);
 
   async function lookup(ticker?: string) {
@@ -75,6 +80,7 @@ export default function Page() {
     setLoading(true);
     setError(null);
     setData(null);
+    setOpen(false);
     try {
       const res = await fetch(`/api/score/${encodeURIComponent(sym)}`, { cache: "no-store" });
       if (!res.ok) {
@@ -93,68 +99,49 @@ export default function Page() {
     }
   }
 
-  // Fetch suggestions (debounced-ish via AbortController)
-  useEffect(() => {
-    const term = q.trim();
-    if (term.length < 2) {
-      setItems([]);
-      setOpen(false);
+  async function fetchSuggest(query: string) {
+    const q = query.trim();
+    if (!q) { setOpts([]); return; }
+    try {
+      const r = await fetch(`/api/suggest?q=${encodeURIComponent(q)}`, { cache: "no-store" });
+      if (!r.ok) { setOpts([]); return; }
+      const js = await r.json();
+      const arr: SuggestItem[] = (js?.suggestions || []).slice(0, 8);
+      setOpts(arr);
+      setOpen(arr.length > 0);
       setHighlight(0);
-      return;
+    } catch {
+      setOpts([]);
+      setOpen(false);
     }
-    abortRef.current?.abort();
-    const ac = new AbortController();
-    abortRef.current = ac;
+  }
 
-    const run = async () => {
-      try {
-        const res = await fetch(`/api/suggest?q=${encodeURIComponent(term)}`, {
-          cache: "no-store",
-          signal: ac.signal,
-        });
-        if (!res.ok) throw new Error("suggest failed");
-        const json = await res.json();
-        const arr = (json?.suggestions || []) as Suggestion[];
-        setItems(arr.slice(0, 8));
-        setOpen(arr.length > 0);
-        setHighlight(0);
-      } catch {
-        if (!ac.signal.aborted) {
-          setItems([]);
-          setOpen(false);
-        }
-      }
-    };
-    // petite latence pour taper
-    const id = setTimeout(run, 120);
-    return () => {
-      clearTimeout(id);
-      ac.abort();
-    };
-  }, [q]);
-
-  const onSelect = (s: Suggestion) => {
-    setQ(s.symbol);
-    setOpen(false);
-    setItems([]);
-    setHighlight(0);
-    void lookup(s.symbol);
+  // open dropdown when typing
+  const onChange = (v: string) => {
+    setQ(v);
+    setOpen(true);
+    void fetchSuggest(v);
   };
 
-  const onEnter = (e: React.KeyboardEvent<HTMLInputElement>) => {
-    if (e.key === "Enter") {
-      if (open && items.length > 0) {
-        onSelect(items[highlight]);
+  const onKeyDown = (e: React.KeyboardEvent<HTMLInputElement>) => {
+    if (e.key === "ArrowDown") {
+      e.preventDefault();
+      setHighlight((h) => Math.min(h + 1, Math.max(0, opts.length - 1)));
+    } else if (e.key === "ArrowUp") {
+      e.preventDefault();
+      setHighlight((h) => Math.max(0, h - 1));
+    } else if (e.key === "Enter") {
+      e.preventDefault();
+      if (open && opts.length) {
+        const pick = opts[Math.min(highlight, opts.length - 1)];
+        if (pick) {
+          setQ(pick.symbol);
+          setOpen(false);
+          void lookup(pick.symbol);
+        }
       } else {
-        setOpen(false);
-        lookup();
+        void lookup();
       }
-    } else if (e.key === "ArrowDown" && open && items.length > 0) {
-      e.preventDefault();
-      setHighlight((h) => Math.min(h + 1, items.length - 1));
-    } else if (e.key === "ArrowUp" && open && items.length > 0) {
-      e.preventDefault();
-      setHighlight((h) => Math.max(h - 1, 0));
     } else if (e.key === "Escape") {
       setOpen(false);
     }
@@ -168,7 +155,11 @@ export default function Page() {
       fragile: { label: "FRAGILE", classes: "bg-rose-500/10 text-rose-300 border-rose-600/50" },
     } as const;
     const v = map[data.verdict];
-    return <span className={`px-2.5 py-1 rounded-full text-xs border ${v.classes}`}>{v.label}</span>;
+    return (
+      <span className={`px-2.5 py-1 rounded-full text-xs border ${v.classes}`}>
+        {v.label}
+      </span>
+    );
   }, [data]);
 
   function barColor(score: number) {
@@ -176,6 +167,9 @@ export default function Page() {
     if (score >= 50) return "bg-amber-500";
     return "bg-rose-500";
   }
+
+  const fmtPct = (x?: number | null, digits = 1) =>
+    typeof x === "number" ? `${(x * 100).toFixed(digits)}%` : "—";
 
   return (
     <main className="min-h-screen bg-slate-950 text-slate-100">
@@ -190,7 +184,7 @@ export default function Page() {
           <div className="ml-auto hidden md:flex items-center gap-2 text-xs text-slate-400">
             <span className="hidden sm:inline">Gratuit · sans API key</span>
             <span className="opacity-40">|</span>
-            <span>200DMA, SEC/IFRS, Yahoo</span>
+            <span>200DMA, Yahoo v10</span>
           </div>
         </div>
       </header>
@@ -198,72 +192,52 @@ export default function Page() {
       {/* Search */}
       <section className="max-w-6xl mx-auto px-5 pt-8">
         <div className="grid gap-4 md:grid-cols-[1fr_auto]">
-          {/* Input + dropdown */}
-          <div
-            ref={containerRef}
-            className="relative flex rounded-2xl border border-slate-800 bg-slate-900/40 focus-within:ring-2 focus-within:ring-sky-500"
-          >
-            <input
-              value={q}
-              onChange={(e) => {
-                setQ(e.target.value);
-                if (!e.target.value) setOpen(false);
-              }}
-              onKeyDown={onEnter}
-              onFocus={() => items.length && setOpen(true)}
-              onBlur={() => {
-                // petite latence pour laisser un clic sur un item se propager
-                setTimeout(() => setOpen(false), 80);
-              }}
-              placeholder="Tapez un ticker… (AAPL, TSLA, RMS.PA, ASML.AS)"
-              className="flex-1 px-4 py-3.5 bg-transparent outline-none placeholder:text-slate-500"
-              aria-autocomplete="list"
-              aria-expanded={open}
-              aria-controls="suggest-list"
-            />
+          <div ref={wrapRef} className="relative">
+            <div className="flex rounded-2xl border border-slate-800 bg-slate-900/40 focus-within:ring-2 focus-within:ring-sky-500">
+              <input
+                ref={inputRef}
+                value={q}
+                onChange={(e) => onChange(e.target.value)}
+                onKeyDown={onKeyDown}
+                onBlur={() => setTimeout(() => setOpen(false), 120)}
+                placeholder="Tapez un ticker… (AAPL, TSLA, RMS.PA, ASML.AS)"
+                className="flex-1 px-4 py-3.5 bg-transparent outline-none placeholder:text-slate-500"
+              />
+            </div>
 
-            {/* Dropdown */}
-            {open && items.length > 0 && (
-              <ul
-                id="suggest-list"
-                role="listbox"
-                className="absolute left-0 right-0 top-full mt-1 z-40 rounded-xl border border-slate-800 bg-slate-900/95 backdrop-blur max-h-72 overflow-auto shadow-xl"
-              >
-                {items.map((s, i) => (
-                  <li
-                    key={`${s.symbol}-${i}`}
-                    role="option"
-                    aria-selected={i === highlight}
-                    onMouseDown={(e) => {
-                      e.preventDefault(); // empêche blur immédiat
-                      setOpen(false);
-                      onSelect(s);
-                    }}
-                    onMouseEnter={() => setHighlight(i)}
-                    className={`cursor-pointer px-4 py-2 border-b border-slate-800/50 last:border-0 ${
-                      i === highlight ? "bg-slate-800/70" : "hover:bg-slate-800/40"
-                    }`}
-                  >
-                    <div className="flex items-center gap-2">
-                      <span className="font-mono text-sm text-sky-300">{s.symbol}</span>
-                      <span className="text-sm text-slate-200 truncate">{s.name}</span>
-                    </div>
-                    {(s.exchange || s.type) && (
-                      <div className="text-[11px] text-slate-400 mt-0.5">
-                        {s.exchange || "—"} {s.type ? `· ${s.type}` : ""}
+            {/* dropdown */}
+            {open && opts.length > 0 && (
+              <div className="absolute z-40 mt-2 w-full rounded-2xl border border-slate-800 bg-slate-900/95 shadow-xl overflow-hidden">
+                {opts.map((o, i) => {
+                  const active = i === highlight;
+                  return (
+                    <button
+                      key={`${o.symbol}-${i}`}
+                      onMouseEnter={() => setHighlight(i)}
+                      onMouseDown={(e) => {
+                        e.preventDefault();
+                        setQ(o.symbol);
+                        setOpen(false);
+                        void lookup(o.symbol);
+                      }}
+                      className={`w-full text-left px-4 py-2.5 border-b border-slate-800/60 last:border-0 ${
+                        active ? "bg-slate-800/70" : "bg-transparent"
+                      }`}
+                    >
+                      <div className="flex items-center justify-between">
+                        <div className="font-medium">{o.symbol}</div>
+                        <div className="text-xs text-slate-400">{o.exchange || ""}</div>
                       </div>
-                    )}
-                  </li>
-                ))}
-              </ul>
+                      <div className="text-sm text-slate-300">{o.name}</div>
+                    </button>
+                  );
+                })}
+              </div>
             )}
           </div>
 
           <button
-            onClick={() => {
-              setOpen(false);
-              lookup();
-            }}
+            onClick={() => lookup()}
             disabled={!q || loading}
             className="px-6 py-3.5 rounded-2xl bg-sky-600 hover:bg-sky-500 disabled:opacity-50 font-medium"
           >
@@ -276,10 +250,7 @@ export default function Page() {
           {SUGGESTIONS.map((t) => (
             <button
               key={t}
-              onClick={() => {
-                setOpen(false);
-                lookup(t);
-              }}
+              onClick={() => lookup(t)}
               className="text-xs px-2.5 py-1.5 rounded-full border border-slate-800 bg-slate-900/30 hover:bg-slate-800/50 text-slate-300"
             >
               {t}
@@ -325,7 +296,9 @@ export default function Page() {
                       </span>
                     </div>
 
-                    <p className="mt-1 text-slate-400">{data.verdict_reason}</p>
+                    <p className="mt-1 text-slate-400">
+                      {data.verdict_reason}
+                    </p>
                   </div>
 
                   <div className="w-36 shrink-0">
@@ -335,7 +308,9 @@ export default function Page() {
                     </div>
                     <div className="mt-2 h-2 rounded-full bg-slate-800 overflow-hidden">
                       <div
-                        className={`h-full ${barColor(data.score_adj ?? data.score)}`}
+                        className={`h-full ${barColor(
+                          data.score_adj ?? data.score
+                        )}`}
                         style={{ width: `${Math.min(100, data.score_adj ?? data.score)}%` }}
                       />
                     </div>
@@ -348,7 +323,9 @@ export default function Page() {
                 {/* Reasons */}
                 <div className="mt-6 grid md:grid-cols-2 gap-5">
                   <div className="p-4 rounded-2xl bg-slate-900/50 border border-slate-800">
-                    <h3 className="text-sm uppercase tracking-wide text-slate-400">Raisons principales</h3>
+                    <h3 className="text-sm uppercase tracking-wide text-slate-400">
+                      Raisons principales
+                    </h3>
                     <ul className="mt-2 space-y-1.5">
                       {(data.reasons_positive || []).map((r, i) => (
                         <li key={i} className="flex items-start gap-2">
@@ -359,7 +336,9 @@ export default function Page() {
                     </ul>
                   </div>
                   <div className="p-4 rounded-2xl bg-slate-900/50 border border-slate-800">
-                    <h3 className="text-sm uppercase tracking-wide text-slate-400">Drapeaux rouges</h3>
+                    <h3 className="text-sm uppercase tracking-wide text-slate-400">
+                      Drapeaux rouges
+                    </h3>
                     <ul className="mt-2 space-y-1.5">
                       {data.red_flags?.length ? (
                         data.red_flags.map((r, i) => (
@@ -380,27 +359,51 @@ export default function Page() {
 
                 {/* Subscores */}
                 <div className="mt-6">
-                  <h3 className="text-sm uppercase tracking-wide text-slate-400">Sous-scores</h3>
+                  <h3 className="text-sm uppercase tracking-wide text-slate-400">
+                    Sous-scores
+                  </h3>
                   <div className="mt-2 grid grid-cols-2 sm:grid-cols-4 gap-3">
                     {Object.entries(data.subscores || {}).map(([k, v]) => (
-                      <div key={k} className="p-4 rounded-2xl bg-slate-900/40 border border-slate-800">
-                        <div className="text-xs text-slate-400 capitalize">{k}</div>
-                        <div className="text-2xl font-semibold tabular-nums">{Math.round(v)}</div>
+                      <div
+                        key={k}
+                        className="p-4 rounded-2xl bg-slate-900/40 border border-slate-800"
+                      >
+                        <div className="text-xs text-slate-400 capitalize">
+                          {k}
+                        </div>
+                        <div className="text-2xl font-semibold tabular-nums">
+                          {Math.round(v)}
+                        </div>
                       </div>
                     ))}
+                  </div>
+                </div>
+
+                {/* Ratios additionnels */}
+                <div className="mt-6">
+                  <h3 className="text-sm uppercase tracking-wide text-slate-400">Ratios</h3>
+                  <div className="mt-2 grid grid-cols-2 sm:grid-cols-4 gap-3">
+                    <RatioCard label="ROE" value={fmtPct(data.ratios?.roe)} />
+                    <RatioCard label="ROA" value={fmtPct(data.ratios?.roa)} />
+                    <RatioCard label="FCF / RN" value={fmtPct(data.ratios?.fcf_over_netincome)} />
+                    <RatioCard label="ROIC (approx.)" value={fmtPct(data.ratios?.roic)} />
                   </div>
                 </div>
               </div>
             </div>
 
             {/* Disclaimer */}
-            <p className="mt-3 text-xs text-slate-500">Pas un conseil en investissement. Sources publiques, sans clé.</p>
+            <p className="mt-3 text-xs text-slate-500">
+              Pas un conseil en investissement. Sources publiques, sans clé.
+            </p>
           </div>
 
           {/* Right: Proofs */}
           <aside className="lg:col-span-1">
             <div className="rounded-3xl border border-slate-800 bg-slate-900/40 p-5">
-              <h3 className="text-sm uppercase tracking-wide text-slate-400">Preuves (sources &amp; fraîcheur)</h3>
+              <h3 className="text-sm uppercase tracking-wide text-slate-400">
+                Preuves (sources &amp; fraîcheur)
+              </h3>
 
               {/* Price block */}
               <div className="mt-3 p-3 rounded-2xl bg-slate-950/40 border border-slate-800">
@@ -411,25 +414,14 @@ export default function Page() {
                   </span>
                 </div>
                 <div className="mt-2 flex flex-wrap gap-2 text-xs">
-                  {typeof data.proof?.price_points === "number" && <Badge>Points : {data.proof?.price_points}</Badge>}
+                  {typeof data.proof?.price_points === "number" && (
+                    <Badge>Points : {data.proof?.price_points}</Badge>
+                  )}
                   {data.proof?.price_has_200dma && <Badge variant="ok">200DMA OK</Badge>}
                   {typeof data.proof?.price_recency_days === "number" && (
                     <Badge>Fraîcheur : {data.proof?.price_recency_days} j</Badge>
                   )}
                 </div>
-              </div>
-
-              {/* SEC block */}
-              <div className="mt-3 p-3 rounded-2xl bg-slate-950/40 border border-slate-800">
-                <div className="text-xs text-slate-400">Compta (SEC)</div>
-                <div className="mt-2 flex flex-wrap gap-2 text-xs">
-                  {data.proof?.sec_used?.length ? (
-                    data.proof?.sec_used?.map((s) => <Badge key={s}>{s}</Badge>)
-                  ) : (
-                    <Badge variant="muted">—</Badge>
-                  )}
-                </div>
-                {data.proof?.sec_note && <div className="mt-1 text-xs text-slate-400">{data.proof.sec_note}</div>}
               </div>
 
               {/* Valuation */}
@@ -474,15 +466,23 @@ function Badge({
     warn: "border-amber-700/50 bg-amber-500/10 text-amber-300",
     muted: "border-slate-800 bg-slate-900/40 text-slate-400",
   };
-  return <span className={`text-xs px-2 py-0.5 rounded-full border ${map[variant]}`}>{children}</span>;
+  return (
+    <span className={`text-xs px-2 py-0.5 rounded-full border ${map[variant]}`}>
+      {children}
+    </span>
+  );
 }
 
 function SourceChip({ src }: { src: string }) {
-  const label = src.replace(/^price:/, "price · ").replace(/^sec:/, "sec · ");
-  const variant =
-    /fin-html/.test(src) ? "ok" :
-    /yahoo:html|yahoo:v7|yahoo:summary/.test(src) ? "default" :
-    /wikipedia/.test(src) ? "muted" :
-    "default";
-  return <Badge variant={variant as any}>{label}</Badge>;
+  const label = src.replace(/^price:/, "price · ");
+  return <Badge>{label}</Badge>;
+}
+
+function RatioCard({ label, value }: { label: string; value: string }) {
+  return (
+    <div className="p-4 rounded-2xl bg-slate-900/40 border border-slate-800">
+      <div className="text-xs text-slate-400">{label}</div>
+      <div className="text-xl font-semibold tabular-nums mt-0.5">{value}</div>
+    </div>
+  );
 }

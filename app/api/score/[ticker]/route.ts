@@ -1,5 +1,6 @@
 // app/api/score/[ticker]/route.ts
 export const runtime = "nodejs";
+
 import { NextResponse } from "next/server";
 
 /* ========================== Cache mémoire ========================== */
@@ -14,6 +15,12 @@ type Fundamentals = {
   fcf_yield: Metric;          // FCF / MarketCap
   earnings_yield: Metric;     // 1 / trailingPE
   net_cash: Metric;           // proxy (cash>debt) si dispo, sinon via PB<1.2
+
+  // nouveaux ratios
+  roe: Metric;                // Return on Equity (annual)
+  roa: Metric;                // Return on Assets (annual)
+  fcf_over_netincome: Metric; // Free Cash Flow / Net Income (qualité cash)
+  roic: Metric;               // approx: NOPAT / Invested Capital
 };
 type Prices = {
   px: Metric;
@@ -43,6 +50,13 @@ type ScorePayload = {
     price_recency_days?: number | null;
     valuation_used?: boolean;
     sources_used?: string[];
+  };
+  // on expose les ratios pour le front (facultatif côté UI)
+  ratios?: {
+    roe?: number | null;
+    roa?: number | null;
+    fcf_over_netincome?: number | null;
+    roic?: number | null;
   };
 };
 
@@ -168,6 +182,12 @@ export async function GET(req: Request, { params }: { params: { ticker: string }
         valuation_used: (fundamentals.fcf_yield.value ?? fundamentals.earnings_yield.value) != null,
         sources_used,
       },
+      ratios: {
+        roe: fundamentals.roe.value,
+        roa: fundamentals.roa.value,
+        fcf_over_netincome: fundamentals.fcf_over_netincome.value,
+        roic: fundamentals.roic.value,
+      },
     };
 
     if (!isDebug) MEM[cacheKey] = { expires: now + TTL_MS, data: payload };
@@ -258,15 +278,17 @@ async function fetchYahooV10(ticker: string, sess: YSession, retryOnce: boolean)
     ...(sess.cookie ? { Cookie: sess.cookie } as any : {}),
   };
   const crumbQS = sess.crumb ? `&crumb=${encodeURIComponent(sess.crumb)}` : "";
+  const modules = "financialData,defaultKeyStatistics,price,summaryDetail,incomeStatementHistory,balanceSheetHistory";
+
   const urls = [
-    `https://query2.finance.yahoo.com/v10/finance/quoteSummary/${encodeURIComponent(ticker)}?modules=financialData,defaultKeyStatistics,price,summaryDetail${crumbQS}`,
-    `https://query1.finance.yahoo.com/v10/finance/quoteSummary/${encodeURIComponent(ticker)}?modules=financialData,defaultKeyStatistics,price,summaryDetail${crumbQS}`,
+    `https://query2.finance.yahoo.com/v10/finance/quoteSummary/${encodeURIComponent(ticker)}?modules=${modules}${crumbQS}`,
+    `https://query1.finance.yahoo.com/v10/finance/quoteSummary/${encodeURIComponent(ticker)}?modules=${modules}${crumbQS}`,
   ];
   for (const u of urls) {
     const res = await fetch(u, { headers: base });
     if (res.status === 401 && retryOnce) {
       // regen crumb 1x
-      const s2 = await getYahooSession(); // refresh uses same function
+      const s2 = await getYahooSession(); // refresh
       return fetchYahooV10(ticker, s2, /*retryOnce*/ false);
     }
     if (res.ok) {
@@ -278,29 +300,34 @@ async function fetchYahooV10(ticker: string, sess: YSession, retryOnce: boolean)
 }
 
 function computeFundamentalsFromV10(r: any): Fundamentals {
-  // Sources:
-  // price: r.price.regularMarketPrice.raw
-  // shares: r.defaultKeyStatistics.sharesOutstanding.raw
-  // trailingPE: r.summaryDetail.trailingPE.raw (fallback r.defaultKeyStatistics.trailingPE?.raw)
-  // priceToBook: r.defaultKeyStatistics.priceToBook.raw
-  // currentRatio: r.financialData.currentRatio.raw
-  // OCF TTM: r.financialData.operatingCashflow.raw
-  // FCF TTM: r.financialData.freeCashflow.raw
-  // optional op margin: r.financialData.operatingMargins
+  // --- existants ---
   const price = num(r?.price?.regularMarketPrice?.raw ?? r?.price?.regularMarketPrice);
   const shares = num(r?.defaultKeyStatistics?.sharesOutstanding?.raw ?? r?.defaultKeyStatistics?.sharesOutstanding);
   const trailingPE = num(r?.summaryDetail?.trailingPE?.raw ?? r?.defaultKeyStatistics?.trailingPE?.raw);
   const priceToBook = num(r?.defaultKeyStatistics?.priceToBook?.raw ?? r?.defaultKeyStatistics?.priceToBook);
   const currentRatio = num(r?.financialData?.currentRatio?.raw ?? r?.financialData?.currentRatio);
-  const ocf = num(r?.financialData?.operatingCashflow?.raw ?? r?.financialData?.operatingCashflow);
   const fcf = num(r?.financialData?.freeCashflow?.raw ?? r?.financialData?.freeCashflow);
   const opm = num(r?.financialData?.operatingMargins?.raw ?? r?.financialData?.operatingMargins);
   const cash = num(r?.financialData?.totalCash?.raw ?? r?.financialData?.totalCash);
   const debt = num(r?.financialData?.totalDebt?.raw ?? r?.financialData?.totalDebt);
 
-  // EY
+  // --- nouveaux (annual, via modules ajoutés) ---
+  const ishs = r?.incomeStatementHistory?.incomeStatementHistory
+    || r?.incomeStatementHistory?.incomeStatementHistory?.incomeStatementHistory; // (formats Yahoo varient parfois)
+  const bsh  = r?.balanceSheetHistory?.balanceSheetStatements;
+
+  const ni0 = num(ishs?.[0]?.netIncome?.raw ?? ishs?.[0]?.netIncome);
+  const ni1 = num(ishs?.[1]?.netIncome?.raw ?? ishs?.[1]?.netIncome);
+  const opInc0 = num(ishs?.[0]?.operatingIncome?.raw ?? ishs?.[0]?.operatingIncome);
+  const taxExp0 = num(ishs?.[0]?.incomeTaxExpense?.raw ?? ishs?.[0]?.incomeTaxExpense);
+  const preTax0 = num(ishs?.[0]?.incomeBeforeTax?.raw ?? ishs?.[0]?.incomeBeforeTax);
+
+  const eq0 = num(bsh?.[0]?.totalStockholderEquity?.raw ?? bsh?.[0]?.totalStockholderEquity);
+  const eq1 = num(bsh?.[1]?.totalStockholderEquity?.raw ?? bsh?.[1]?.totalStockholderEquity);
+  const assets0 = num(bsh?.[0]?.totalAssets?.raw ?? bsh?.[0]?.totalAssets);
+
+  // EY & FCFY
   const ey = trailingPE && trailingPE > 0 ? 1 / trailingPE : null;
-  // FCFY
   const mc = price && shares ? price * shares : null;
   const fcfy = mc && fcf != null ? fcf / mc : null;
 
@@ -309,12 +336,37 @@ function computeFundamentalsFromV10(r: any): Fundamentals {
   if (cash != null && debt != null) netCash = cash - debt > 0 ? 1 : 0;
   else if (priceToBook && priceToBook > 0) netCash = priceToBook < 1.2 ? 1 : 0;
 
+  // ROE: best-effort (moyenne equity si dispo) ou financialData.returnOnEquity si présent
+  const roe_direct = num(r?.financialData?.returnOnEquity?.raw ?? r?.financialData?.returnOnEquity);
+  const avgEq = (eq0 != null && eq1 != null) ? (eq0 + eq1) / 2 : eq0 ?? null;
+  const roe_calc = (ni0 != null && avgEq && avgEq !== 0) ? (ni0 / avgEq) : null;
+  const roe = roe_direct ?? roe_calc;
+
+  // ROA: via financialData ou NI / Assets
+  const roa_direct = num(r?.financialData?.returnOnAssets?.raw ?? r?.financialData?.returnOnAssets);
+  const roa_calc = (ni0 != null && assets0) ? (ni0 / assets0) : null;
+  const roa = roa_direct ?? roa_calc;
+
+  // FCF / Net Income (qualité cash) — on accepte mismatch TTM vs annual
+  const fcf_over_ni = (fcf != null && ni0 != null && ni0 !== 0) ? (fcf / ni0) : null;
+
+  // ROIC (approx): NOPAT / (Debt + Equity - Cash)
+  const taxRate = (preTax0 && taxExp0 != null && preTax0 !== 0) ? Math.min(0.5, Math.max(0, taxExp0 / preTax0)) : 0.21;
+  const nopat = (opInc0 != null) ? opInc0 * (1 - taxRate) : null;
+  const invested = (debt ?? null) != null || (eq0 ?? null) != null ? ((debt ?? 0) + (eq0 ?? 0) - (cash ?? 0)) : null;
+  const roic = (nopat != null && invested && invested !== 0) ? (nopat / invested) : null;
+
   return {
-    op_margin: asMetric(opm, opm != null ? 0.45 : 0, "yahoo-v10"),
-    current_ratio: asMetric(currentRatio, currentRatio != null ? 0.4 : 0, "yahoo-v10"),
-    fcf_yield: asMetric(fcfy != null ? clampFcfy(fcfy) : null, fcfy != null ? 0.45 : 0, "yahoo-v10"),
+    op_margin:      asMetric(opm, opm != null ? 0.45 : 0, "yahoo-v10"),
+    current_ratio:  asMetric(currentRatio, currentRatio != null ? 0.4 : 0, "yahoo-v10"),
+    fcf_yield:      asMetric(fcfy != null ? clampFcfy(fcfy) : null, fcfy != null ? 0.45 : 0, "yahoo-v10"),
     earnings_yield: asMetric(ey, ey != null ? 0.45 : 0, "yahoo-v10"),
-    net_cash: asMetric(netCash, netCash != null ? 0.35 : 0, "yahoo-v10"),
+    net_cash:       asMetric(netCash, netCash != null ? 0.35 : 0, "yahoo-v10"),
+
+    roe:                asMetric(roe ?? null, roe != null ? 0.45 : 0, roe_direct != null ? "yahoo-v10" : "calc"),
+    roa:                asMetric(roa ?? null, roa != null ? 0.4  : 0, roa_direct != null ? "yahoo-v10" : "calc"),
+    fcf_over_netincome: asMetric(fcf_over_ni, fcf_over_ni != null ? 0.35 : 0, "calc"),
+    roic:               asMetric(roic, roic != null ? 0.3 : 0, "calc"),
   };
 }
 const clampFcfy = (y: number) => Math.max(-0.05, Math.min(0.08, y));
