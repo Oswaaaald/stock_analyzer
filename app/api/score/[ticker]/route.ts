@@ -226,11 +226,6 @@ export async function GET(req: Request, { params }: { params: { ticker: string }
 const asMetric = (v: number | null, conf = 0, source?: string): Metric => ({ value: v, confidence: conf, source });
 const clip = (x: number, lo: number, hi: number) => Math.max(lo, Math.min(hi, x));
 const num = (x: any) => (typeof x === "number" && Number.isFinite(x) ? x : null);
-// clamp “neutre” qui accepte null et borne les nombres
-const clampN = (v: number | null, lo: number, hi: number): number | null => {
-  if (v === null || typeof v !== "number" || !Number.isFinite(v)) return null;
-  return Math.max(lo, Math.min(hi, v));
-};
 
 /* ============================== v8 chart (prix & momentum) ============================== */
 async function fetchYahooChartAndEnrich(ticker: string): Promise<Prices> {
@@ -389,8 +384,8 @@ function computeFundamentalsFromV10(r: any): Fundamentals {
   if (ni0 != null && avgEq != null && avgEq > 0) {
     roe_calc = ni0 / avgEq;
   }
-  // Borne large pour éviter les explosions hors norme — mais pas trop agressive
-  const roe = clampN((roe_direct ?? roe_calc) ?? null, -2, 2);
+  // Yahoo renvoie déjà des ratios en décimal (0.33 = 33%). On se contente d’une borne large.
+  const roe = clamp( (roe_direct ?? roe_calc) ?? null, -2, 2 );
 
   // ========== ROA ==========
   const roa_direct = num(r?.financialData?.returnOnAssets?.raw ?? r?.financialData?.returnOnAssets);
@@ -398,7 +393,7 @@ function computeFundamentalsFromV10(r: any): Fundamentals {
   if (ni0 != null && assets0 != null && assets0 > 0) {
     roa_calc = ni0 / assets0;
   }
-  const roa = clampN((roa_direct ?? roa_calc) ?? null, -2, 2);
+  const roa = clamp( (roa_direct ?? roa_calc) ?? null, -2, 2 );
 
   // ========== FCF / Net Income ==========
   const fcf_over_ni = (fcf != null && ni0 != null && ni0 !== 0) ? fcf / ni0 : null;
@@ -408,7 +403,7 @@ function computeFundamentalsFromV10(r: any): Fundamentals {
     preTax0 && taxExp0 != null && preTax0 !== 0 ? Math.min(0.5, Math.max(0, taxExp0 / preTax0)) : 0.21;
   const nopat = (opInc0 != null ? opInc0 * (1 - taxRate) : (ni0 ?? null));
   const invested = (debt ?? null) != null || (eq0 ?? null) != null ? ((debt ?? 0) + (eq0 ?? 0) - (cash ?? 0)) : null;
-  const roic = (nopat != null && invested != null && invested > 0) ? clampN(nopat / invested, -1, 1) : null;
+  const roic = (nopat != null && invested != null && invested > 0) ? clamp(nopat / invested, -1, 1) : null;
 
   return {
     op_margin:      asMetric(opm, opm != null ? 0.45 : 0, "yahoo-v10"),
