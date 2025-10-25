@@ -4,7 +4,7 @@ export const runtime = "nodejs";
 import { NextResponse } from "next/server";
 
 /* ======================================================================================
- *  CACHE SIMPLE (mémoire proces)
+ *  CACHE SIMPLE (mémoire process)
  * ====================================================================================*/
 const MEM: Record<string, { expires: number; data: any }> = {};
 const TTL_MS = 30 * 60 * 1000; // 30 min
@@ -26,8 +26,8 @@ type Fundamentals = {
   dilution_3y: Metric;          // variation actions 3 ans
   fcf_positive_last4: Metric;   // 0..4
   fcf_yield: Metric;            // FCF / MarketCap
-  earnings_yield: Metric;       // 1 / (Trailing P/E)
-  net_cash: Metric;             // cash - debt (positif => 1, sinon 0, conservateur)
+  earnings_yield: Metric;       // 1 / (Trailing P/E) ou EPS_TTM / Price
+  net_cash: Metric;             // cash - debt (positif => 1, sinon 0)
 };
 
 type Prices = {
@@ -77,7 +77,6 @@ export async function GET(req: Request, { params }: { params: { ticker: string }
   const t = (params.ticker || "").toUpperCase().trim();
   if (!t) return NextResponse.json({ error: "Ticker requis" }, { status: 400 });
 
-  // flag debug
   const url = new URL(req.url);
   const isDebug = url.searchParams.get("debug") === "1";
 
@@ -90,16 +89,18 @@ export async function GET(req: Request, { params }: { params: { ticker: string }
     // Prix (Yahoo → Stooq)
     const priceFeed = await fetchPricesBestOf(t);
 
-    // Fondamentaux (multi-sources)
+    // Fondamentaux (toutes les sources)
     const sec  = await fetchFromSEC_US_IfPossible(t, priceFeed.px.value);
     const fmp  = await fetchFmpRatiosIfPossible(t);
     const ySum = await fetchYahooSummaryIfPossible(t);
     const yV7  = await fetchYahooQuoteV7(t);
     const yHtml= await fetchYahooKeyStatsHtml(t);
-    const yFin = await fetchYahooFinancialsHtml(t); // ← NEW
     const wiki = await fetchWikipediaOpMargin(t);
 
-    // --- MODE DEBUG : snapshot de chaque fetcher
+    // >>> [NEW] Fallback valuation via SEC (EPS_TTM & FCF_TTM)
+    const secVal = await secValuationFallback(t, priceFeed.px.value);
+    // <<< [END]
+
     if (isDebug) {
       return NextResponse.json({
         ticker: t,
@@ -134,11 +135,8 @@ export async function GET(req: Request, { params }: { params: { ticker: string }
           fcf_yield: (yHtml.fundamentals as any)?.fcf_yield?.value ?? null,
           net_cash: (yHtml.fundamentals as any)?.net_cash?.value ?? null,
         },
-        yahoo_fin_html: { // ← NEW
-          used: yFin.used,
-          current_ratio: (yFin.fundamentals as any)?.current_ratio?.value ?? null,
-          fcf_yield: (yFin.fundamentals as any)?.fcf_yield?.value ?? null,
-          earnings_yield: (yFin.fundamentals as any)?.earnings_yield?.value ?? null,
+        yahoo_fin_html: {
+          used: false, // si tu as un fetcher root.App.main, remonte-le ici
         },
         wikipedia: {
           used: wiki.used,
@@ -155,6 +153,11 @@ export async function GET(req: Request, { params }: { params: { ticker: string }
           earnings_yield: sec.fundamentals.earnings_yield.value,
           net_cash: sec.fundamentals.net_cash.value,
         },
+        sec_valuation_fallback: {
+          used: Boolean(secVal.fundamentals.earnings_yield?.value != null || secVal.fundamentals.fcf_yield?.value != null),
+          earnings_yield: secVal.fundamentals.earnings_yield?.value ?? null,
+          fcf_yield: secVal.fundamentals.fcf_yield?.value ?? null,
+        },
         fmp_demo: {
           used: fmp.used,
           op_margin: (fmp.fundamentals as any)?.op_margin?.value ?? null,
@@ -167,34 +170,40 @@ export async function GET(req: Request, { params }: { params: { ticker: string }
       });
     }
 
-    // --- MODE NORMAL : merge pondéré
+    // Merge (pondéré), puis injection du fallback SEC si valuation absente
     let fundamentals = mergeFundamentalsWeighted({
       sec: sec.fundamentals,
       fmp: fmp.fundamentals,
       ysum: ySum,
       yhtml: yHtml,
       wiki: wiki,
-      yv7: yV7,
+      yv7:  yV7,
     });
 
-    // Injecte les champs récupérés via Yahoo Financials HTML (si manquants)
-    const mergeIf = (a?: any, b?: any) => (b && b.value != null ? b : a);
-    fundamentals.current_ratio   = mergeIf(fundamentals.current_ratio,  (yFin.fundamentals as any).current_ratio);
-    fundamentals.fcf_yield       = mergeIf(fundamentals.fcf_yield,      (yFin.fundamentals as any).fcf_yield);
-    fundamentals.earnings_yield  = mergeIf(fundamentals.earnings_yield, (yFin.fundamentals as any).earnings_yield);
+    if ((fundamentals.earnings_yield.value == null) && (secVal.fundamentals.earnings_yield?.value != null)) {
+      fundamentals.earnings_yield = secVal.fundamentals.earnings_yield!;
+    }
+    if ((fundamentals.fcf_yield.value == null) && (secVal.fundamentals.fcf_yield?.value != null)) {
+      fundamentals.fcf_yield = secVal.fundamentals.fcf_yield!;
+    }
 
-    const sources_used: string[] = [
-      priceFeed.meta?.source_primary ? `price:${priceFeed.meta.source_primary}` : "price:unknown",
-      ...(sec.used?.length ? sec.used.map((x: string) => `sec:${x}`) : []),
-      ...(fmp.used ? ["fmp:ratios"] : []),
-      ...(ySum.used ? ["yahoo:summary"] : []),
-      ...(yV7.used ? ["yahoo:v7"] : []),
-      ...(yHtml.used ? ["yahoo:html"] : []),
-      ...(yFin.used ? ["yahoo:fin-html"] : []), // ← NEW
-      ...(wiki.used ? ["wikipedia"] : []),
-    ];
+    const usedSecVal = Boolean(secVal.fundamentals.earnings_yield?.value != null || secVal.fundamentals.fcf_yield?.value != null);
 
-    const bundle: DataBundle = { ticker: t, fundamentals, prices: priceFeed, sources_used };
+    const bundle: DataBundle = {
+      ticker: t,
+      fundamentals,
+      prices: priceFeed,
+      sources_used: [
+        priceFeed.meta?.source_primary ? `price:${priceFeed.meta.source_primary}` : "price:unknown",
+        ...(sec.used?.length ? sec.used.map((x: string) => `sec:${x}`) : []),
+        ...(usedSecVal ? ["sec:valuation"] : []),
+        ...(fmp.used ? ["fmp:ratios"] : []),
+        ...(ySum.used ? ["yahoo:summary"] : []),
+        ...(yV7.used ? ["yahoo:v7"] : []),
+        ...(yHtml.used ? ["yahoo:html"] : []),
+        ...(wiki.used ? ["wikipedia"] : []),
+      ],
+    };
 
     const { subscores, malus, maxes } = computeScore(bundle);
     const total = subscores.quality + subscores.safety + subscores.valuation + subscores.momentum;
@@ -225,7 +234,16 @@ export async function GET(req: Request, { params }: { params: { ticker: string }
         sec_used: sec.used,
         sec_note: sec.note || null,
         valuation_used: !!(fundamentals.fcf_yield.value ?? fundamentals.earnings_yield.value),
-        sources_used,
+        sources_used: [
+          priceFeed.meta?.source_primary ? `price:${priceFeed.meta.source_primary}` : "price:unknown",
+          ...(sec.used?.length ? sec.used.map((x: string) => `sec:${x}`) : []),
+          ...(usedSecVal ? ["sec:valuation"] : []),
+          ...(fmp.used ? ["fmp:ratios"] : []),
+          ...(ySum.used ? ["yahoo:summary"] : []),
+          ...(yV7.used ? ["yahoo:v7"] : []),
+          ...(yHtml.used ? ["yahoo:html"] : []),
+          ...(wiki.used ? ["wikipedia"] : []),
+        ],
       },
     };
 
@@ -372,7 +390,7 @@ function enrichCloses(closes: number[]) {
 }
 
 /* ======================================================================================
- *  SEC (US-GAAP + IFRS)
+ *  SEC (US-GAAP + IFRS) — principaux ratios
  * ====================================================================================*/
 let TICKER_MAP: Record<string, { cik_str: number; ticker: string; title: string }> = {};
 let TICKER_MAP_EXP = 0;
@@ -394,7 +412,7 @@ async function loadTickerMap(): Promise<typeof TICKER_MAP> {
 function pickBestUnit(units?: FactUnits, preferUSD = true): FactPoint[] | undefined {
   if (!units) return undefined;
   if (preferUSD && units.USD && units.USD.length) return sortByEnd(units.USD);
-  let best: FactPoint[] | undefined = undefined;
+  let best: FactPoint[] | undefined;
   for (const arr of Object.values(units)) {
     const valid = Array.isArray(arr) ? arr.filter(p => typeof p?.val === "number") : [];
     if (!valid.length) continue;
@@ -454,15 +472,10 @@ async function fetchFromSEC_US_IfPossible(ticker: string, lastPrice: number | nu
   } catch { return { fundamentals: fund, used, note }; }
 
   // Rev & OpInc → op_margin
-  // ÉLARGI pour couvrir TSLA et autres : SalesRevenueNet, IncludingAssessedTax, etc.
   const revUnits =
     usgaap.RevenueFromContractWithCustomerExcludingAssessedTax?.units ||
-    usgaap.Revenues?.units ||
-    usgaap.SalesRevenueNet?.units ||                                    // ← NEW
-    usgaap.RevenueFromContractWithCustomerIncludingAssessedTax?.units ||// ← NEW
-    (ifrs as any).Revenue?.units ||
+    usgaap.Revenues?.units || (ifrs as any).Revenue?.units ||
     (ifrs as any).RevenueFromContractsWithCustomersExcludingAssessedTax?.units;
-
   const opUnits =
     usgaap.OperatingIncomeLoss?.units ||
     (ifrs as any).OperatingProfitLoss?.units ||
@@ -501,7 +514,7 @@ async function fetchFromSEC_US_IfPossible(ticker: string, lastPrice: number | nu
     }
   }
 
-  // CFO & Capex → fcf_positive_last4 + fcf_yield
+  // CFO & Capex → fcf_positive_last4
   const cfoUnits =
     usgaap.NetCashProvidedByUsedInOperatingActivities?.units ||
     usgaap.NetCashProvidedByUsedInOperatingActivitiesContinuingOperations?.units ||
@@ -530,25 +543,103 @@ async function fetchFromSEC_US_IfPossible(ticker: string, lastPrice: number | nu
     fund.fcf_positive_last4 = asMetric(countPos, 0.7, "sec");
   }
 
-  const isUS = used.includes("us-gaap");
-  const cfoTTM = sumLastNQuarterly(cfoSeries, 4) ?? lastAnnual(cfoSeries);
-  const capTTM = sumLastNQuarterly(capSeries, 4) ?? lastAnnual(capSeries);
-  if (isUS && typeof lastPrice === "number" && typeof cfoTTM === "number" && typeof capTTM === "number") {
-    const shLast = lastVal(shSeries);
-    if (typeof shLast === "number" && shLast > 0) {
-      const mcap = lastPrice * shLast;
+  return { fundamentals: fund, used, note };
+}
+
+/* ======================================================================================
+ *  [NEW] SEC valuation fallback (EPS_TTM & FCF_TTM)
+ * ====================================================================================*/
+async function secValuationFallback(ticker: string, lastPrice: number | null) {
+  const out: Partial<Fundamentals> = {};
+  let used = false;
+
+  if (!(typeof lastPrice === "number" && lastPrice > 0)) {
+    return { fundamentals: out, used };
+  }
+
+  let cik: string | null = null;
+  try {
+    const map = await loadTickerMap();
+    const hit = map[ticker.toUpperCase()];
+    if (hit?.cik_str) cik = String(hit.cik_str).padStart(10, "0");
+  } catch {}
+
+  if (!cik) return { fundamentals: out, used };
+
+  try {
+    const factsUrl = `https://data.sec.gov/api/xbrl/companyfacts/CIK${cik}.json`;
+    const factsDoc = await fetchJsonSafe(factsUrl, {
+      "User-Agent": `StockAnalyzer/1.0 (${CONTACT_EMAIL})`,
+      "Accept": "application/json",
+    });
+    const facts = factsDoc?.facts?.["us-gaap"];
+    if (!facts) return { fundamentals: out, used };
+
+    const takeLastNQuarterlySum = (arr?: any[], n = 4): number | null => {
+      if (!arr || !Array.isArray(arr)) return null;
+      const q = arr.filter(v => (v?.fp || "").toUpperCase().startsWith("Q"))
+                   .sort((a,b) => (a.end || "").localeCompare(b.end || ""));
+      if (q.length < n) return null;
+      let s = 0;
+      for (let i = q.length - n; i < q.length; i++) {
+        const v = +q[i].val;
+        if (!Number.isFinite(v)) return null;
+        s += v;
+      }
+      return s;
+    };
+    const lastShares = (arr?: any[]): number | null => {
+      if (!arr || !Array.isArray(arr) || !arr.length) return null;
+      const sorted = [...arr].sort((a,b) => (a.end || "").localeCompare(b.end || ""));
+      const v = +sorted[sorted.length - 1].val;
+      return Number.isFinite(v) ? v : null;
+    };
+
+    // EPS diluted TTM (USD/shares)
+    const epsArr = facts?.EarningsPerShareDiluted?.units?.["USD/shares"];
+    const epsTTM = takeLastNQuarterlySum(epsArr, 4);
+    if (typeof epsTTM === "number" && lastPrice > 0) {
+      const y = epsTTM / lastPrice;
+      if (Number.isFinite(y) && y > 0) {
+        out.earnings_yield = { value: y, confidence: 0.75, source: "sec" };
+        used = true;
+      }
+    }
+
+    // CFO & Capex TTM → FCF yield
+    const cfoArr =
+      facts?.NetCashProvidedByUsedInOperatingActivities?.units?.USD ||
+      facts?.NetCashProvidedByUsedInOperatingActivitiesContinuingOperations?.units?.USD || [];
+    const capexArr =
+      facts?.PaymentsToAcquireProductiveAssets?.units?.USD ||
+      facts?.PurchasesOfPropertyPlantAndEquipment?.units?.USD ||
+      facts?.PurchaseOfPropertyPlantAndEquipment?.units?.USD || [];
+
+    const cfoTTM = takeLastNQuarterlySum(cfoArr, 4);
+    const capTTM = takeLastNQuarterlySum(capexArr, 4);
+
+    const shArr =
+      facts?.EntityCommonStockSharesOutstanding?.units?.shares ||
+      facts?.CommonStockSharesOutstanding?.units?.shares || [];
+    const shares = lastShares(shArr);
+
+    if (typeof cfoTTM === "number" && typeof capTTM === "number" && typeof shares === "number" && shares > 0) {
+      const fcf = cfoTTM - Math.abs(capTTM);
+      const mcap = lastPrice * shares;
       if (mcap > 0) {
-        const fcf = cfoTTM - Math.abs(capTTM);
         let y = fcf / mcap;
-        y = Math.max(-0.05, Math.min(0.08, y));
-        if (typeof fund.fcf_positive_last4.value === "number" && fund.fcf_positive_last4.value >= 2) {
-          fund.fcf_yield = asMetric(y, 0.7, "sec");
+        y = Math.max(-0.05, Math.min(0.08, y)); // clamp conservateur
+        if (Number.isFinite(y) && y > 0) {
+          out.fcf_yield = { value: y, confidence: 0.70, source: "sec" };
+          used = true;
         }
       }
     }
-  }
 
-  return { fundamentals: fund, used, note };
+    return { fundamentals: out, used };
+  } catch {
+    return { fundamentals: out, used };
+  }
 }
 
 /* ======================================================================================
@@ -614,7 +705,6 @@ async function fetchYahooSummaryIfPossible(ticker: string) {
     const cr = safeNum(r?.financialData?.currentRatio);
     if (cr !== null) out.current_ratio = asMetric(cr, 0.4, "yahoo");
 
-    // FCF approx
     const ocf = safeNum(r?.financialData?.operatingCashflow);
     const capex = safeNum(r?.financialData?.capitalExpenditures);
     const price = safeNum(r?.price?.regularMarketPrice ?? r?.price?.postMarketPrice);
@@ -631,7 +721,6 @@ async function fetchYahooSummaryIfPossible(ticker: string) {
     const pe = safeNum(r?.defaultKeyStatistics?.trailingPE ?? r?.summaryDetail?.trailingPE);
     if (pe && pe > 0) out.earnings_yield = asMetric(1 / pe, 0.35, "yahoo");
 
-    // Net cash via totalCash - totalDebt si exposé
     const cash = safeNum(r?.financialData?.totalCash);
     const debt = safeNum(r?.financialData?.totalDebt);
     if (cash !== null && debt !== null) out.net_cash = asMetric(cash - debt > 0 ? 1 : 0, 0.35, "yahoo");
@@ -660,11 +749,9 @@ async function fetchYahooQuoteV7(ticker: string) {
     if (!r) return { fundamentals: out, used: false };
     used = true;
 
-    // Valo proxy : Earnings Yield = 1/PE si PE > 0
     const pe = typeof r.trailingPE === "number" ? r.trailingPE : (typeof r.peRatio === "number" ? r.peRatio : null);
     if (pe && pe > 0) out.earnings_yield = { value: 1 / pe, confidence: 0.45, source: "yahoo-v7" };
 
-    // Sécurité proxy (faible poids) : Price/Book bas → petit bonus sécurité (approx)
     if (typeof r.priceToBook === "number" && r.priceToBook > 0) {
       out.net_cash = { value: r.priceToBook < 1.2 ? 1 : 0, confidence: 0.25, source: "yahoo-v7" };
     }
@@ -673,7 +760,7 @@ async function fetchYahooQuoteV7(ticker: string) {
 }
 
 /* ======================================================================================
- *  Yahoo HTML Key Statistics (scrape permissif) — +Trailing P/E, Cash/Debt
+ *  Yahoo HTML Key Statistics (scrape permissif)
  * ====================================================================================*/
 async function fetchYahooKeyStatsHtml(ticker: string) {
   const url = `https://finance.yahoo.com/quote/${encodeURIComponent(ticker)}/key-statistics`;
@@ -686,7 +773,6 @@ async function fetchYahooKeyStatsHtml(ticker: string) {
   }
   used = true;
 
-  // Operating Margin (ttm)
   const opmREs = [
     /Operating\s*Margin\s*\(ttm\)[^%]*?([\d.,\-]+)%/i,
     /Op(?:erating)?\s*Margin[^%]*?([\d.,\-]+)%/i
@@ -699,7 +785,6 @@ async function fetchYahooKeyStatsHtml(ticker: string) {
     }
   }
 
-  // Current Ratio
   const crREs = [
     /Current\s*Ratio\s*\(mrq\)[^<]*?<\/span>[^<]*?([\d.,\-]+)/i,
     /Current\s*Ratio[^<]*?<\/span>[^<]*?([\d.,\-]+)/i
@@ -712,7 +797,6 @@ async function fetchYahooKeyStatsHtml(ticker: string) {
     }
   }
 
-  // Trailing P/E → earnings_yield
   const peREs = [
     /Trailing\s*P\/E[^<]*?<\/span>[^<]*?([\d.,\-]+)/i,
     /Trailing\s*PE[^<]*?<\/span>[^<]*?([\d.,\-]+)/i
@@ -725,7 +809,6 @@ async function fetchYahooKeyStatsHtml(ticker: string) {
     }
   }
 
-  // Price to Free Cash Flow → fcf_yield
   const pfcfREs = [
     /Price\s*to\s*Free\s*Cash\s*Flow[^<]*?<\/span>[^<]*?([\d.,\-]+)/i,
     /P\/FCF[^<]*?<\/span>[^<]*?([\d.,\-]+)/i
@@ -738,7 +821,6 @@ async function fetchYahooKeyStatsHtml(ticker: string) {
     }
   }
 
-  // Total Cash & Total Debt → net_cash booléen
   const cashRe = /Total\s*Cash\s*\(mrq\)[^<]*?<\/span>[^<]*?([\d.,\-]+)\s*[MBT]?/i;
   const debtRe = /Total\s*Debt\s*\(mrq\)[^<]*?<\/span>[^<]*?([\d.,\-]+)\s*[MBT]?/i;
   const cm = html.match(cashRe);
@@ -755,102 +837,7 @@ async function fetchYahooKeyStatsHtml(ticker: string) {
 }
 
 /* ======================================================================================
- *  Yahoo Financials HTML (Balance Sheet + Cash Flow) — NEW
- * ====================================================================================*/
-async function fetchYahooFinancialsHtml(ticker: string) {
-  const base = `https://finance.yahoo.com/quote/${encodeURIComponent(ticker)}`;
-  const pages = {
-    summary:       `${base}`,
-    balance_sheet: `${base}/balance-sheet?p=${encodeURIComponent(ticker)}`,
-    cash_flow:     `${base}/cash-flow?p=${encodeURIComponent(ticker)}`
-  };
-  const out: Partial<Fundamentals> = {};
-  let used = false;
-
-  const get = async (u: string) => await fetchTextSafe(u, "text/html");
-  const num = (s: string) => parseFloat(s.replace(/[^\d.-]/g, ""));
-
-  // Summary → Trailing P/E → earnings_yield
-  try {
-    const html = await get(pages.summary);
-    if (html && !html.includes("Rate Limited")) {
-      used = true;
-      const m = html.match(/Trailing\s*P\/E[^<]*?<\/span>[^<]*?([\d.,\-]+)/i) ||
-                html.match(/PE\s*\(TTM\)[^<]*?<\/span>[^<]*?([\d.,\-]+)/i);
-      if (m) {
-        const pe = num(m[1]);
-        if (Number.isFinite(pe) && pe > 0) {
-          out.earnings_yield = { value: 1 / pe, confidence: 0.28, source: "yahoo-fin-html" };
-        }
-      }
-    }
-  } catch {}
-
-  // Balance Sheet → Current Ratio (mrq)
-  try {
-    const html = await get(pages.balance_sheet);
-    if (html && !html.includes("Rate Limited")) {
-      used = true;
-      const reList = [
-        /Current\s*Ratio\s*\(mrq\)[^<]*?<\/span>[^<]*?([\d.,\-]+)/i,
-        /Current\s*Ratio[^<]*?<\/span>[^<]*?([\d.,\-]+)/i,
-        /Current\s*ratio[^<]*?<\/span>[^<]*?([\d.,\-]+)/i
-      ];
-      for (const re of reList) {
-        const m = html.match(re);
-        if (m) {
-          const v = num(m[1]);
-          if (Number.isFinite(v)) { out.current_ratio = { value: v, confidence: 0.30, source: "yahoo-fin-html" }; break; }
-        }
-      }
-    }
-  } catch {}
-
-  // Cash Flow → OCF & CapEx (ttm) → FCF yield
-  try {
-    const html = await get(pages.cash_flow);
-    if (html && !html.includes("Rate Limited")) {
-      used = true;
-      const findNum = (res: RegExp[]) => {
-        for (const re of res) {
-          const m = html.match(re);
-          if (m) {
-            const v = num(m[1]);
-            if (Number.isFinite(v)) return v;
-          }
-        }
-        return null;
-      };
-      const ocf = findNum([
-        /Operating\s*Cash\s*Flow\s*\(ttm\)[^<]*?<\/span>[^<]*?([\d.,\-]+)/i,
-        /Total\s*Cash\s*From\s*Operating\s*Activities[^<]*?<\/span>[^<]*?([\d.,\-]+)/i
-      ]);
-      const cap = findNum([
-        /Capital\s*Expenditures\s*\(ttm\)[^<]*?<\/span>[^<]*?([\d.,\-]+)/i,
-        /Capital\s*Expenditures[^<]*?<\/span>[^<]*?([\d.,\-]+)/i
-      ]);
-
-      // prix / actions depuis JSON embarqué (quand dispo)
-      const price = findNum([/"regularMarketPrice":\s*([\d.]+)/i]);
-      const shares = findNum([/"sharesOutstanding":\s*([\d.]+)/i]);
-
-      if (typeof price === "number" && typeof shares === "number" && shares > 0 &&
-          typeof ocf === "number" && typeof cap === "number") {
-        const mcap = price * shares;
-        if (mcap > 0) {
-          let y = (ocf - Math.abs(cap)) / mcap;
-          y = Math.max(-0.05, Math.min(0.08, y));
-          out.fcf_yield = { value: y, confidence: 0.30, source: "yahoo-fin-html" };
-        }
-      }
-    }
-  } catch {}
-
-  return { fundamentals: out, used };
-}
-
-/* ======================================================================================
- *  Wikipedia (EN → FR) : op_margin via revenue & operating income
+ *  Wikipedia (EN/FR) : op_margin via revenue & operating income
  * ====================================================================================*/
 async function fetchWikipediaOpMargin(ticker: string) {
   const search = await fetchJsonSafe(`https://query2.finance.yahoo.com/v1/finance/search?q=${encodeURIComponent(ticker)}`);
@@ -988,7 +975,6 @@ function computeScore(d: DataBundle) {
   if (typeof f.fcf_positive_last4.value === "number") {
     sMax += 4; s += f.fcf_positive_last4.value >= 3 ? 4 : 0;
   }
-  // Net cash (booléen 0/1)
   if (typeof f.net_cash.value === "number") {
     sMax += 2; s += f.net_cash.value > 0 ? 2 : 0;
   }
