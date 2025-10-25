@@ -556,89 +556,157 @@ async function fetchYahooSummaryIfPossible(ticker: string) {
 }
 
 /* ======================================================================================
- *  Yahoo HTML Key Statistics (scrape léger)
+ *  Yahoo HTML Key Statistics (scrape léger, plus permissif)
  * ====================================================================================*/
 async function fetchYahooKeyStatsHtml(ticker: string) {
   const url = `https://finance.yahoo.com/quote/${encodeURIComponent(ticker)}/key-statistics`;
   const html = await fetchTextSafe(url, "text/html");
   const out: Partial<Fundamentals> = {};
   let used = false;
-  if (!html || html.includes('Rate Limited') || html.includes('error-title')) {
+
+  if (!html || html.includes("Rate Limited") || html.includes("error-title")) {
     return { fundamentals: out, used };
   }
   used = true;
 
+  // On tolère des variations de casse/espaces et des libellés proches
   // Operating Margin
-  const m = html.match(/Operating\s+Margin\s*\(ttm\)\s*<\/span>.*?([\d.,\-]+)%/i);
-  if (m) {
-    const v = parseFloat(m[1].replace(/[^\d.-]/g, "")) / 100;
-    if (Number.isFinite(v)) out.op_margin = asMetric(v, 0.35, "yahoo-html");
+  const opmREs = [
+    /Operating\s*Margin\s*\(ttm\)[^%]*?([\d.,\-]+)%/i,
+    /Op(?:erating)?\s*Margin[^%]*?([\d.,\-]+)%/i
+  ];
+  for (const re of opmREs) {
+    const m = html.match(re);
+    if (m) {
+      const v = parseFloat(m[1].replace(/[^\d.-]/g, "")) / 100;
+      if (Number.isFinite(v)) { out.op_margin = asMetric(v, 0.35, "yahoo-html"); break; }
+    }
   }
 
   // Current Ratio
-  const c = html.match(/Current\s+Ratio\s*\(mrq\)\s*<\/span>.*?([\d.,\-]+)/i);
-  if (c) {
-    const v = parseFloat(c[1].replace(/[^\d.-]/g, ""));
-    if (Number.isFinite(v)) out.current_ratio = asMetric(v, 0.3, "yahoo-html");
+  const crREs = [
+    /Current\s*Ratio\s*\(mrq\)[^<]*?<\/span>[^<]*?([\d.,\-]+)/i,
+    /Current\s*Ratio[^<]*?<\/span>[^<]*?([\d.,\-]+)/i
+  ];
+  for (const re of crREs) {
+    const c = html.match(re);
+    if (c) {
+      const v = parseFloat(c[1].replace(/[^\d.-]/g, ""));
+      if (Number.isFinite(v)) { out.current_ratio = asMetric(v, 0.3, "yahoo-html"); break; }
+    }
   }
 
   // Price to Free Cash Flow → approx fcf_yield
-  const pfcf = html.match(/Price\s*to\s*Free\s*Cash\s*Flow.*?([\d.,\-]+)/i);
-  if (pfcf) {
-    const ratio = parseFloat(pfcf[1].replace(/[^\d.-]/g, ""));
-    if (Number.isFinite(ratio) && ratio > 0) out.fcf_yield = asMetric(Math.max(-0.05, Math.min(0.08, 1 / ratio)), 0.3, "yahoo-html");
+  const pfcfREs = [
+    /Price\s*to\s*Free\s*Cash\s*Flow[^<]*?<\/span>[^<]*?([\d.,\-]+)/i,
+    /P\/FCF[^<]*?<\/span>[^<]*?([\d.,\-]+)/i
+  ];
+  for (const re of pfcfREs) {
+    const p = html.match(re);
+    if (p) {
+      const ratio = parseFloat(p[1].replace(/[^\d.-]/g, ""));
+      if (Number.isFinite(ratio) && ratio > 0) { out.fcf_yield = asMetric(Math.max(-0.05, Math.min(0.08, 1 / ratio)), 0.3, "yahoo-html"); break; }
+    }
   }
 
   return { fundamentals: out, used };
 }
 
 /* ======================================================================================
- *  Wikipedia infobox (op_margin via revenue & operating income)
+ *  Wikipedia (EN → FR fallback) : op_margin via revenue & operating income
  * ====================================================================================*/
 async function fetchWikipediaOpMargin(ticker: string) {
-  // Utilise l'autocomplete Yahoo pour récupérer le nom de la société
+  // On récupère un nom de société via l’API search Yahoo
   const search = await fetchJsonSafe(`https://query2.finance.yahoo.com/v1/finance/search?q=${encodeURIComponent(ticker)}`);
-  const name: string | null =
-    search?.quotes?.[0]?.shortname || search?.quotes?.[0]?.longname || null;
+  const companyName: string | null =
+    search?.quotes?.[0]?.longname || search?.quotes?.[0]?.shortname || null;
 
-  if (!name) return { used: false, fundamentals: {} as Partial<Fundamentals> };
+  if (!companyName) return { used: false, fundamentals: {} as Partial<Fundamentals> };
 
-  // Page EN si possible
-  const page = encodeURIComponent(name);
-  const api = await fetchJsonSafe(`https://en.wikipedia.org/w/api.php?action=parse&page=${page}&prop=wikitext&format=json&redirects=1&origin=*`);
-  const wikitext: string | null = api?.parse?.wikitext?.["*"] || null;
-  const out: Partial<Fundamentals> = {};
-  let used = false;
+  // Essaie EN puis FR ; pour chaque langue, tente wikitext puis HTML
+  const langs = ["en", "fr"] as const;
+  for (const lang of langs) {
+    const pageTitle = encodeURIComponent(companyName);
+    // 1) WIKITEXT
+    const api = await fetchJsonSafe(`https://${lang}.wikipedia.org/w/api.php?action=parse&page=${pageTitle}&prop=wikitext&format=json&redirects=1&origin=*`);
+    const wikitext: string | null = api?.parse?.wikitext?.["*"] || null;
+    const fromWikitext = parseOpMarginFromWikiText(wikitext, lang);
+    if (fromWikitext) return { used: true, fundamentals: { op_margin: asMetric(fromWikitext, 0.25, "wikipedia") } };
 
-  if (!wikitext) return { used, fundamentals: out };
+    // 2) HTML (si wikitext insuffisant)
+    const htmlApi = await fetchJsonSafe(`https://${lang}.wikipedia.org/w/api.php?action=parse&page=${pageTitle}&prop=text&format=json&redirects=1&origin=*`);
+    const html: string | null = htmlApi?.parse?.text?.["*"] || null;
+    const fromHtml = parseOpMarginFromWikiHTML(html, lang);
+    if (fromHtml) return { used: true, fundamentals: { op_margin: asMetric(fromHtml, 0.22, "wikipedia") } };
+  }
 
-  // Cherche les lignes "revenue" et "operating_income" dans l’infobox
-  const revLine = wikitext.match(/\|\s*revenue\s*=\s*([^\n]+)/i);
-  const opLine = wikitext.match(/\|\s*operating_income\s*=\s*([^\n]+)/i);
+  return { used: false, fundamentals: {} as Partial<Fundamentals> };
 
-  function extractNumberUSD(s?: string | null): number | null {
-    if (!s) return null;
-    // simpliste : récupère un nombre en milliards/millions si présent
-    const bn = s.match(/([\d.,]+)\s*(billion|bn)/i);
-    if (bn) return parseFloat(bn[1].replace(/[^\d.]/g, "")) * 1e9;
-    const mn = s.match(/([\d.,]+)\s*(million|mn)/i);
-    if (mn) return parseFloat(mn[1].replace(/[^\d.]/g, "")) * 1e6;
-    // valeur brute
-    const raw = s.match(/([\d.,]+)/);
-    if (raw) return parseFloat(raw[1].replace(/[^\d.]/g, ""));
+  function parseOpMarginFromWikiText(wikitext: string | null, lang: "en" | "fr"): number | null {
+    if (!wikitext) return null;
+
+    // EN labels
+    const revLineEN = wikitext.match(/\|\s*revenue\s*=\s*([^\n]+)/i);
+    const opLineEN  = wikitext.match(/\|\s*operating_income\s*=\s*([^\n]+)/i);
+
+    // FR labels
+    const revLineFR = wikitext.match(/\|\s*chiffre d['’]affaires\s*=\s*([^\n]+)/i);
+    const opLineFR  = wikitext.match(/\|\s*résultat opérationnel\s*=\s*([^\n]+)/i);
+
+    const revLine = lang === "fr" ? (revLineFR?.[1] || revLineEN?.[1]) : (revLineEN?.[1] || revLineFR?.[1]);
+    const opLine  = lang === "fr" ? (opLineFR?.[1] || opLineEN?.[1])   : (opLineEN?.[1] || opLineFR?.[1]);
+
+    const rev = extractNumberGeneric(revLine);
+    const op  = extractNumberGeneric(opLine);
+    if (rev && op && rev !== 0) {
+      const margin = op / rev;
+      return clampMargin(margin);
+    }
     return null;
   }
 
-  const rev = extractNumberUSD(revLine?.[1]);
-  const op  = extractNumberUSD(opLine?.[1]);
+  function parseOpMarginFromWikiHTML(html: string | null, lang: "en" | "fr"): number | null {
+    if (!html) return null;
+    // Simpliste : on cherche dans l’infobox des <th> / <td>
+    // EN
+    const revEN = findValueAfterHeader(html, /(>|\b)Revenue(?!s)\b/i);
+    const opEN  = findValueAfterHeader(html, /(>|\b)Operating income\b/i);
+    // FR
+    const revFR = findValueAfterHeader(html, /(>|\b)Chiffre d[’']affaires\b/i);
+    const opFR  = findValueAfterHeader(html, /(>|\b)Résultat opérationnel\b/i);
 
-  if (rev && op && rev !== 0) {
-    used = true;
-    const margin = op / rev;
-    out.op_margin = asMetric(Math.max(-0.5, Math.min(0.6, margin)), 0.25, "wikipedia");
+    const rev = extractNumberGeneric(lang === "fr" ? (revFR || revEN) : (revEN || revFR));
+    const op  = extractNumberGeneric(lang === "fr" ? (opFR  || opEN) : (opEN  || opFR));
+    if (rev && op && rev !== 0) return clampMargin(op / rev);
+    return null;
+
+    function findValueAfterHeader(s: string, headerRe: RegExp) {
+      const m = s.match(new RegExp(`<th[^>]*>\\s*${headerRe.source}[^<]*</th>\\s*<td[^>]*>([\\s\\S]*?)</td>`, headerRe.flags));
+      return m ? stripHtml(m[1]) : null;
+    }
+    function stripHtml(x: string) {
+      return x.replace(/<[^>]+>/g, " ").replace(/\s+/g, " ").trim();
+    }
   }
 
-  return { used, fundamentals: out };
+  function extractNumberGeneric(s?: string | null): number | null {
+    if (!s) return null;
+    // milliards / millions (en/ fr)
+    const bn = s.match(/([\d.,]+)\s*(billion|bn|milliard)s?/i);
+    if (bn) return parseFloat(bn[1].replace(/[^\d.,-]/g, "").replace(",", ".")) * 1e9;
+    const mn = s.match(/([\d.,]+)\s*(million|mn|millions)/i);
+    if (mn) return parseFloat(mn[1].replace(/[^\d.,-]/g, "").replace(",", ".")) * 1e6;
+    // $xx,xxx,xxx etc.
+    const raw = s.match(/([\$€£]?\s*[\d.,]+(?:\s*\w+)?)/);
+    if (raw) {
+      const num = parseFloat(raw[0].replace(/[^\d.,-]/g, "").replace(",", "."));
+      return Number.isFinite(num) ? num : null;
+    }
+    return null;
+  }
+  function clampMargin(m: number) {
+    return Math.max(-0.5, Math.min(0.6, m));
+  }
 }
 
 /* ======================================================================================
