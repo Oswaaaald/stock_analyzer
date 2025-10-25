@@ -43,16 +43,22 @@ export async function GET(
 
   try {
     const bundle = await fetchAllNoKeyStooq(t);
-    const { subscores, malus } = computeScore(bundle);
-    const raw = Math.round(
-      0.35 * subscores.quality +
-      0.25 * subscores.safety +
-      0.25 * subscores.valuation +
-      0.15 * subscores.momentum
-    );
-    const final = Math.max(0, Math.min(100, raw - malus));
-    const color: ScorePayload["color"] =
-      final >= 70 ? "green" : final >= 50 ? "orange" : "red";
+const { subscores, malus } = computeScore(bundle);
+
+// ❌ avant (bug) : on re-pondérait des sous-scores déjà pondérés
+// const raw = Math.round(
+//   0.35*subscores.quality + 0.25*subscores.safety + 0.25*subscores.valuation + 0.15*subscores.momentum
+// );
+
+// ✅ après : on additionne (max = 35+25+25+15 = 100)
+const raw = Math.round(
+  subscores.quality + subscores.safety + subscores.valuation + subscores.momentum
+);
+
+const final = Math.max(0, Math.min(100, raw - malus));
+const color: ScorePayload["color"] =
+  final >= 70 ? "green" : final >= 50 ? "orange" : "red";
+
     const reasons = buildReasons(bundle, subscores);
     const flags = detectRedFlags(bundle);
 
