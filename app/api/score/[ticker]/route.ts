@@ -79,57 +79,66 @@ export async function GET(
 
 async function fetchAllNoKey(ticker: string): Promise<DataBundle> {
   const ua = {
-    "User-Agent":
-      "Mozilla/5.0 (compatible; StockAnalyzer/1.0; +https://example.com)",
+    "User-Agent": "Mozilla/5.0 (compatible; StockAnalyzer/1.0)",
     "Accept": "application/json, text/plain, */*",
   };
 
-  const [quote, summary, chart] = await Promise.all([
-    fetchJson(
-      `https://query1.finance.yahoo.com/v7/finance/quote?symbols=${encodeURIComponent(
-        ticker
-      )}`,
+  // 1) Toujours OK en général
+  const quote = await fetchJson(
+    `https://query1.finance.yahoo.com/v7/finance/quote?symbols=${encodeURIComponent(ticker)}`,
+    ua
+  );
+
+  // 2) Toujours OK en général
+  const chart = await fetchJson(
+    `https://query1.finance.yahoo.com/v8/finance/chart/${encodeURIComponent(ticker)}?range=2y&interval=1d`,
+    ua
+  );
+
+  // 3) Optionnel : on ESSAIE summary; si 401 on ignore
+  let summary: any = null;
+  try {
+    summary = await fetchJson(
+      `https://query1.finance.yahoo.com/v10/finance/quoteSummary/${encodeURIComponent(ticker)}?modules=summaryProfile,financialData`,
       ua
-    ),
-    fetchJson(
-      `https://query1.finance.yahoo.com/v10/finance/quoteSummary/${encodeURIComponent(
-        ticker
-      )}?modules=summaryProfile,price,defaultKeyStatistics,financialData`,
-      ua
-    ),
-    fetchJson(
-      `https://query1.finance.yahoo.com/v8/finance/chart/${encodeURIComponent(
-        ticker
-      )}?range=2y&interval=1d`,
-      ua
-    ),
-  ]);
+    );
+  } catch {
+    // fallback query2
+    try {
+      summary = await fetchJson(
+        `https://query2.finance.yahoo.com/v10/finance/quoteSummary/${encodeURIComponent(ticker)}?modules=summaryProfile,financialData`,
+        ua
+      );
+    } catch {
+      summary = null; // on vit sans (pas bloquant)
+    }
+  }
 
   const qRes = quote?.quoteResponse?.result?.[0] || {};
-  const sRes = summary?.quoteSummary?.result?.[0] || {};
   const cRes = chart?.chart?.result?.[0] || {};
+  const sRes = summary?.quoteSummary?.result?.[0] || {};
 
-  const price =
-    qRes.regularMarketPrice ?? qRes.previousClose ?? null;
+  const price = qRes.regularMarketPrice ?? qRes.previousClose ?? null;
 
   // 200DMA
   let px_vs_200dma: number | null = null;
   try {
-    const closes: number[] = (cRes?.indicators?.quote?.[0]?.close || []).filter(
-      (x: any) => typeof x === "number"
-    );
+    const closes: number[] = (cRes?.indicators?.quote?.[0]?.close || [])
+      .filter((x: any) => typeof x === "number");
     if (closes.length >= 200) {
       const last = closes.at(-1)!;
-      const avg =
-        closes.slice(-200).reduce((a: number, b: number) => a + b, 0) / 200;
+      const avg = closes.slice(-200).reduce((a: number, b: number) => a + b, 0) / 200;
       if (avg && typeof last === "number") {
         px_vs_200dma = (last - avg) / avg;
       }
     }
   } catch {}
 
-  const sector = sRes?.summaryProfile?.sector;
-  const industry = sRes?.summaryProfile?.industry;
+  // sector/industry sont optionnels (si summary a marché)
+  const sector = sRes?.summaryProfile?.sector ?? undefined;
+  const industry = sRes?.summaryProfile?.industry ?? undefined;
+
+  // marge op (si dispo), sinon null
   const opMargin = sRes?.financialData?.operatingMargins ?? null;
 
   return {
@@ -165,12 +174,11 @@ async function fetchAllNoKey(ticker: string): Promise<DataBundle> {
 }
 
 async function fetchJson(url: string, headers: Record<string, string>) {
-  const res = await fetch(url, { headers });
-  if (!res.ok) {
-    throw new Error(`HTTP ${res.status} on ${url}`);
-  }
-  return res.json();
+  const r = await fetch(url, { headers });
+  if (!r.ok) throw new Error(`HTTP ${r.status} on ${url}`);
+  return r.json();
 }
+
 
 // ------------------------------ Scoring minimal ------------------------------
 
