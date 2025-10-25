@@ -10,6 +10,8 @@ const TTL_MS = 30 * 60 * 1000; // 30 min
 // Email SEC (facultatif, recommandé). Ajoute CONTACT_EMAIL dans Vercel si tu veux.
 const CONTACT_EMAIL = process.env.CONTACT_EMAIL || "contact@example.com";
 
+/* ============================ Types ============================ */
+
 type Fundamentals = {
   op_margin: number | null;
   current_ratio: number | null;
@@ -17,6 +19,7 @@ type Fundamentals = {
   fcf_positive_last4: number | null;
   fcf_yield: number | null;
 };
+
 type Prices = {
   px: number | null;
   px_vs_200dma: number | null;
@@ -40,7 +43,10 @@ type ScorePayload = {
   coverage: number;              // points max effectivement disponibles (0..100)
   verdict: "sain" | "a_surveiller" | "fragile";
   verdict_reason: string;
+  debug?: Record<string, any>;
 };
+
+/* ============================ Handler ============================ */
 
 export async function GET(
   _req: Request,
@@ -78,7 +84,7 @@ export async function GET(
     const reasons = buildReasons(bundle, subscores);
     const flags = detectRedFlags(bundle);
 
-    // 4) Verdict simple (lisible en 2 secondes)
+    // 4) Verdict simple (lisible en 2 secondes) — basé sur score ajusté + couverture
     const { verdict, reason } = makeVerdict(bundle, subscores, coverage);
 
     const payload: ScorePayload = {
@@ -92,6 +98,13 @@ export async function GET(
       coverage: Math.max(0, Math.min(100, Math.round(coverage))),
       verdict,
       verdict_reason: reason,
+      // Décommente pour diagnostiquer
+      // debug: {
+      //   ...bundle.fundamentals,
+      //   px_vs_200dma: bundle.prices.px_vs_200dma,
+      //   ret_20d: bundle.prices.ret_20d,
+      //   pct_52w: bundle.prices.pct_52w,
+      // }
     };
 
     MEM[cacheKey] = { expires: now + TTL_MS, data: payload };
@@ -129,6 +142,19 @@ async function fetchPricesAny(ticker: string): Promise<Prices> {
 }
 
 function enrichCloses(closes: number[]): Prices {
+  // ✅ Garde-fou : besoin d'au moins ~6 mois de données pour juger le momentum
+  if (!Array.isArray(closes) || closes.filter(Number.isFinite).length < 120) {
+    return {
+      px: closes.at(-1) ?? null,
+      px_vs_200dma: null,
+      pct_52w: null,
+      max_dd_1y: null,
+      ret_20d: null,
+      rs_6m_vs_sector_percentile: null,
+      eps_revisions_3m: null,
+    };
+  }
+
   const px = closes.at(-1) ?? null;
 
   // 200DMA
@@ -161,7 +187,7 @@ function enrichCloses(closes: number[]): Prices {
   if (closes.length >= 21) {
     const prev = closes[closes.length - 21];
     if (typeof prev === "number" && prev > 0 && typeof px === "number") {
-      ret_20d = (px / prev) - 1;
+      ret_20d = px / prev - 1;
     }
   }
 
@@ -501,27 +527,29 @@ function detectRedFlags(_data: DataBundle) {
   return [] as string[];
 }
 
-/* ============================ Verdict lisible (binaire/ternaire) ============================ */
+/* ============================ Verdict (basé sur score ajusté + couverture) ============================ */
 
-function makeVerdict(d: DataBundle, subs: Record<string, number>, coverage: number) {
-  // Règles simples et transparentes
-  const hasQuality = typeof d.fundamentals.op_margin === "number";
-  const hasSafety1 = typeof d.fundamentals.current_ratio === "number";
-  const hasSafety2 = typeof d.fundamentals.fcf_positive_last4 === "number";
-  const momOK = typeof d.prices.px_vs_200dma === "number" && d.prices.px_vs_200dma > 0;
+function makeVerdict(
+  d: DataBundle,
+  subs: Record<string, number>,
+  coverage: number
+) {
+  // momentum ok si px > 200DMA ou ret_20d > 0
+  const momOK =
+    (typeof d.prices.px_vs_200dma === "number" && d.prices.px_vs_200dma >= 0) ||
+    (typeof d.prices.ret_20d === "number" && d.prices.ret_20d > 0);
 
-  const strongFund =
-    (hasQuality && d.fundamentals.op_margin! >= 0.15) &&
-    (hasSafety1 && d.fundamentals.current_ratio! >= 1.2) &&
-    (hasSafety2 && (d.fundamentals.fcf_positive_last4! ?? 0) >= 3);
+  // re-calcul local du score ajusté à partir des sous-scores et de la couverture effective
+  const total = subs.quality + subs.safety + subs.valuation + subs.momentum;
+  const score_adj = coverage > 0 ? Math.round((total / coverage) * 100) : 0;
+  const coverageOk = coverage >= 40; // mini pour dire "sain"
 
-  if (strongFund && momOK) {
-    return { verdict: "sain" as const, reason: "Bons fondamentaux + tendance haussière" };
+  if (score_adj >= 70 && coverageOk && momOK) {
+    return { verdict: "sain" as const, reason: "Score élevé et couverture suffisante" };
   }
-  if (momOK || (subs.safety >= 4) || (subs.quality >= 6)) {
-    // tendance OK ou signaux bilans/marge acceptables
+  if (score_adj >= 40 || momOK) {
     const covNote = coverage < 40 ? " (couverture limitée)" : "";
     return { verdict: "a_surveiller" as const, reason: "Signal positif mais incomplet" + covNote };
   }
-  return { verdict: "fragile" as const, reason: "Tendance faible et fondamentaux limités" };
+  return { verdict: "fragile" as const, reason: "Signal faible et données limitées" };
 }

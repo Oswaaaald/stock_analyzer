@@ -12,6 +12,7 @@ type ScoreResponse = {
   coverage?: number;
   verdict: "sain" | "a_surveiller" | "fragile";
   verdict_reason: string;
+  debug?: Record<string, any>;
 };
 
 type SuggestItem = { symbol: string; shortname: string; exchDisp: string };
@@ -171,6 +172,16 @@ export default function Page() {
                 ))}
               </div>
             </div>
+
+            {/* DEBUG optionnel */}
+            {"debug" in (data as any) && data.debug && (
+              <details className="mt-4 text-xs text-slate-400">
+                <summary className="cursor-pointer">Debug</summary>
+                <pre className="mt-2 whitespace-pre-wrap">
+{JSON.stringify((data as any).debug, null, 2)}
+                </pre>
+              </details>
+            )}
           </div>
 
           <div className="text-xs text-slate-400">Pas un conseil en investissement. Sources publiques, sans clé.</div>
