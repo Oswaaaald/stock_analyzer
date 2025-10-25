@@ -148,88 +148,28 @@ export async function GET(req: Request, { params }: { params: { ticker: string }
   if (!isDebug && hit && hit.expires > now) return NextResponse.json(hit.data);
 
   try {
-    // 1) Prix & momentum (v8)
+    // 1) Prix & momentum (v8, sans cookies)
     const priceFeed = await fetchYahooChartAndEnrich(t);
 
-    // 2) Session + v10 (fundamentaux & annuels)
+    // 2) Session + v10 (fundamentaux & historiques annuels pour ratios)
     const sess = await getYahooSession();
     const v10 = await fetchYahooV10(t, sess, /*retryOnce*/ true);
 
-    // 3) Fondamentaux + ratios
+    // 3) Extraire fondamentaux + ratios
     const fundamentals = computeFundamentalsFromV10(v10);
     const sources_used = ["price:yahoo(v8)", "yahoo:v10"];
 
     const bundle: DataBundle = { ticker: t, fundamentals, prices: priceFeed, sources_used };
     const { subscores, maxes } = computeScore(bundle);
 
-    /* ===== Fiabilité (couverture) — pondérée par présence des métriques =====
-       Idée: on mesure la part des briques vraiment disponibles, avec des poids par "importance".
-       Poids (somme = 11):
-         - Qualité: op_margin (2), ROE/ROA (1 au total), ROIC (1)
-         - Sécurité: current_ratio (1), net_cash (1)
-         - Valorisation: fcf_yield (1), earnings_yield (1)
-         - Momentum: 200DMA (2), ret_20d (0.5), ret_60d (0.5)
-       Puis on applique des facteurs de fraîcheur (points & récence).
-    */
-    const pts = priceFeed.meta?.points ?? 0;
-    const recency = priceFeed.meta?.recency_days ?? 999;
+    // ===== Fiabilité (UI) = par PILIERS réellement présents =====
+    const covQuality = Math.min(1, (maxes.quality || 0) / 8) * 35;   // 0..35
+    const covSafety  = Math.min(1, (maxes.safety  || 0) / 6) * 25;   // 0..25
+    const covVal     = Math.min(1, (maxes.valuation|| 0) / 10) * 25; // 0..25
+    const covMom     = Math.min(1, (maxes.momentum || 0) / 15) * 15; // 0..15
+    const coverage_display = Math.round(covQuality + covSafety + covVal + covMom); // 0..100
 
-    // Présence des briques
-    const hasOp   = typeof fundamentals.op_margin.value === "number";
-    const hasROE  = fundamentals.roe?.value != null;
-    const hasROA  = fundamentals.roa?.value != null;
-    const hasROIC = fundamentals.roic?.value != null;
-
-    const hasCR   = fundamentals.current_ratio.value != null;
-    const hasNC   = fundamentals.net_cash.value != null;
-
-    const hasFCFY = fundamentals.fcf_yield.value != null;
-    const hasEY   = fundamentals.earnings_yield.value != null;
-
-    const has200  = typeof priceFeed.px_vs_200dma.value === "number" && pts >= 200;
-    const hasR20  = priceFeed.ret_20d.value != null;
-    const hasR60  = priceFeed.ret_60d.value != null;
-
-    // Poids couverts
-    let covered = 0;
-    const totalWeight = 11;
-
-    // Qualité
-    if (hasOp) covered += 2;
-    if (hasROE || hasROA) covered += 1;      // un des deux suffit pour 1 point
-    if (hasROIC) covered += 1;
-
-    // Sécurité
-    if (hasCR) covered += 1;
-    if (hasNC) covered += 1;
-
-    // Valorisation
-    if (hasFCFY) covered += 1;
-    if (hasEY)   covered += 1;
-
-    // Momentum
-    if (has200) covered += 2;
-    if (hasR20) covered += 0.5;
-    if (hasR60) covered += 0.5;
-
-    // Facteur "densité" (points)
-    let pointsFactor = 1.0;
-    if (pts < 120) pointsFactor = 0.80;
-    else if (pts < 250) pointsFactor = 0.90;
-    else if (pts < 400) pointsFactor = 0.95;
-
-    // Facteur "fraîcheur"
-    let recencyFactor = 1.0;
-    if (recency > 14) recencyFactor = 0.80;
-    else if (recency > 7) recencyFactor = 0.90;
-    else if (recency > 3) recencyFactor = 0.95;
-
-    // Couverture affichée (0..100) + bornes
-    let coverage_display = Math.round((covered / totalWeight) * 100 * pointsFactor * recencyFactor);
-    coverage_display = Math.max(5, Math.min(100, coverage_display));
-
-    /* ===== Score brut & ajusté ===== */
-    // Dénominateur = somme des *maxes réellement disponibles* (0..39)
+    // ===== Dénominateur de normalisation (ce qui est *vraiment* dispo) =====
     const denom = Math.max(
       1,
       Math.round(maxes.quality + maxes.safety + maxes.valuation + maxes.momentum)
@@ -237,13 +177,14 @@ export async function GET(req: Request, { params }: { params: { ticker: string }
 
     const total = subscores.quality + subscores.safety + subscores.valuation + subscores.momentum;
     const raw = Math.max(0, Math.min(100, Math.round(total)));
-    const score_adj = Math.round((total / denom) * 100); // normalisé → 0..100
+    const score_adj = Math.round((total / denom) * 100);
 
     // Couleur & verdict basés sur le score affiché (shown)
     const shown = score_adj ?? raw;
     const color: ScorePayload["color"] = shown >= 65 ? "green" : shown >= 50 ? "orange" : "red";
 
-    const momentumPresent = has200; // signal momentum "fiable" seulement si on a la 200DMA
+    // Momentum présent si la 200DMA est réellement calculable (≥200 pts)
+    const momentumPresent = typeof priceFeed.px_vs_200dma.value === "number";
 
     const { verdict, reason } = makeVerdict({
       coverage: coverage_display,
@@ -253,6 +194,7 @@ export async function GET(req: Request, { params }: { params: { ticker: string }
     });
 
     const reasons = buildReasons(bundle, subscores);
+    const red_flags = buildRedFlags(bundle); // <<< NOUVEAU
 
     const payload: ScorePayload = {
       ticker: t,
@@ -262,14 +204,14 @@ export async function GET(req: Request, { params }: { params: { ticker: string }
       verdict,
       verdict_reason: reason,
       reasons_positive: reasons.slice(0, 3),
-      red_flags: [],
+      red_flags, // <<< NOUVEAU
       subscores,
-      coverage: coverage_display,
+      coverage: coverage_display, // UI
       proof: {
         price_source: priceFeed.meta?.source_primary,
         price_points: priceFeed.meta?.points,
-        price_has_200dma: has200,
-        price_recency_days: recency,
+        price_has_200dma: priceFeed.px_vs_200dma.value !== null,
+        price_recency_days: priceFeed.meta?.recency_days ?? null,
         valuation_used: (fundamentals.fcf_yield.value ?? fundamentals.earnings_yield.value) != null,
         sources_used,
       },
@@ -542,46 +484,55 @@ function computeScore(d: DataBundle) {
   return { subscores, maxes };
 }
 
-function buildReasons(d: DataBundle, subs: Record<string, number>) {
+/* ============================== Explications (forces/faiblesses) ============================== */
+function buildReasons(_d: DataBundle, subs: Record<string, number>) {
+  const out: string[] = [];
+  if (subs.quality >= 6) out.push("Marge opérationnelle décente");
+  if (subs.safety >= 4) out.push("Bilans plutôt sains");
+  if (subs.valuation >= 7) out.push("Valorisation potentiellement attractive");
+  if (subs.momentum >= 8) out.push("Cours au-dessus de la MM200 et dynamique récente positive");
+  if (!out.length) out.push("Données limitées : vérifiez les détails");
+  return out;
+}
+
+// NOUVEAU : risques/limites symétriques aux forces
+function buildRedFlags(d: DataBundle): string[] {
   const out: string[] = [];
   const f = d.fundamentals;
   const p = d.prices;
 
-  // --- Qualité (marge op) ---
-  if (typeof f.op_margin.value === "number") {
-    if (f.op_margin.value >= 0.15) out.push("Marge opérationnelle solide (≥ 15 %)");
-    else if (f.op_margin.value >= 0.05) out.push("Marge opérationnelle correcte (≥ 5 %)");
+  // --- Qualité ---
+  if (typeof f.op_margin.value === "number" && f.op_margin.value < 0.05) {
+    out.push("Marge opérationnelle faible (< 5 %)");
   }
 
-  // --- Sécurité (liquidité, net cash) ---
-  if (typeof f.current_ratio.value === "number" && f.current_ratio.value >= 1) {
-    out.push("Liquidité correcte (ratio courant ≥ 1)");
+  // --- Sécurité ---
+  if (typeof f.current_ratio.value === "number" && f.current_ratio.value < 1) {
+    out.push("Liquidité tendue (ratio courant < 1)");
   }
-  if (typeof f.net_cash.value === "number" && f.net_cash.value > 0) {
-    out.push("Trésorerie nette (cash supérieur à la dette)");
-  }
-
-  // --- Valorisation (FCF yield prioritaire, sinon earnings yield) ---
-  if (typeof f.fcf_yield.value === "number") {
-    if (f.fcf_yield.value >= 0.04) out.push("Rendement FCF intéressant (≥ 4 %)");
-    else if (f.fcf_yield.value >= 0.02) out.push("Rendement FCF correct (≥ 2 %)");
-  } else if (typeof f.earnings_yield.value === "number") {
-    if (f.earnings_yield.value >= 0.05) out.push("Rendement des bénéfices élevé (EY ≥ 5 %)");
-    else if (f.earnings_yield.value >= 0.03) out.push("Rendement des bénéfices correct (EY ≥ 3 %)");
+  if (typeof f.net_cash.value === "number" && f.net_cash.value <= 0) {
+    out.push("Endettement net (dette > trésorerie)");
   }
 
-  // --- Momentum (200DMA + returns récents) ---
-  if (typeof p.px_vs_200dma.value === "number" && p.px_vs_200dma.value >= 0) {
-    out.push("Cours au-dessus de la moyenne mobile 200 jours");
-  }
-  const pos20 = typeof p.ret_20d.value === "number" && p.ret_20d.value > 0;
-  const pos60 = typeof p.ret_60d.value === "number" && p.ret_60d.value > 0;
-  if (pos20 || pos60) {
-    out.push("Tendance récente positive (20–60 jours)");
+  // --- Valorisation ---
+  if (typeof f.fcf_yield.value === "number" && f.fcf_yield.value < 0.02) {
+    out.push("Rendement FCF faible (< 2 %)");
+  } else if (typeof f.earnings_yield.value === "number" && f.earnings_yield.value < 0.03) {
+    out.push("Rendement des bénéfices faible (< 3 %)");
   }
 
-  if (!out.length) out.push("Données limitées : vérifiez les détails");
-  return out.slice(0, 4); // limite à 4 bullets max (plus lisible)
+  // --- Momentum ---
+  if (typeof p.px_vs_200dma.value === "number" && p.px_vs_200dma.value < -0.05) {
+    out.push("Cours sous la moyenne mobile 200 jours");
+  }
+  const neg20 = typeof p.ret_20d.value === "number" && p.ret_20d.value < 0;
+  const neg60 = typeof p.ret_60d.value === "number" && p.ret_60d.value < 0;
+  if (neg20 && neg60) {
+    out.push("Tendance baissière courte (20–60 jours)");
+  }
+
+  if (!out.length) out.push("Aucune limite majeure détectée");
+  return out.slice(0, 4);
 }
 
 function makeVerdict(args: { coverage: number; total: number; momentumPresent: boolean; score_adj: number }) {
