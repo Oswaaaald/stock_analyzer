@@ -387,18 +387,19 @@ function parseEndDate(s?: string): number {
   return Number.isFinite(t) ? t : 0;
 }
 
-function pickBestUnit(units?: FactUnits, preferUSD = true): FactPoint[] | null {
-  if (!units) return null;
+function pickBestUnit(units?: FactUnits, preferUSD = true): FactPoint[] | undefined {
+  if (!units) return undefined;
   if (preferUSD && units.USD && units.USD.length) return sortByEnd(units.USD);
   // sinon choisir l’unité avec le plus de points numériques
-  let best: FactPoint[] | null = null;
-  for (const [u, arr] of Object.entries(units)) {
+  let best: FactPoint[] | undefined = undefined;
+  for (const arr of Object.values(units)) {
     const valid = Array.isArray(arr) ? arr.filter(p => typeof p?.val === "number") : [];
     if (!valid.length) continue;
     if (!best || valid.length > best.length) best = valid;
   }
-  return best ? sortByEnd(best) : null;
+  return best ? sortByEnd(best) : undefined;
 }
+
 
 function sortByEnd(arr: FactPoint[]): FactPoint[] {
   return [...arr].sort((a, b) => parseEndDate(a.end) - parseEndDate(b.end));
