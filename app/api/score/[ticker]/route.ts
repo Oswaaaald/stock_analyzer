@@ -7,25 +7,24 @@ import { NextResponse } from "next/server";
 const MEM: Record<string, { expires: number; data: any }> = {};
 const TTL_MS = 30 * 60 * 1000; // 30 min
 
-// Email SEC (exigé par la SEC dans le User-Agent). Tu peux configurer CONTACT_EMAIL sur Vercel (facultatif).
+// Email SEC (facultatif, recommandé). Ajoute CONTACT_EMAIL dans Vercel si tu veux.
 const CONTACT_EMAIL = process.env.CONTACT_EMAIL || "contact@example.com";
 
-type DataBundle = {
-  ticker: string;
-  fundamentals: {
-    op_margin: number | null;
-    current_ratio: number | null;
-    dilution_3y: number | null;
-    fcf_positive_last4: number | null;
-    fcf_yield: number | null;
-  };
-  prices: {
-    px: number | null;
-    px_vs_200dma: number | null;
-    rs_6m_vs_sector_percentile: number | null;
-    eps_revisions_3m: number | null;
-  };
+type Fundamentals = {
+  op_margin: number | null;
+  current_ratio: number | null;
+  dilution_3y: number | null;
+  fcf_positive_last4: number | null;
+  fcf_yield: number | null;
 };
+type Prices = {
+  px: number | null;
+  px_vs_200dma: number | null;
+  pct_52w: number | null;       // position entre plus bas/plus haut 52 semaines (0..1)
+  max_dd_1y: number | null;     // max drawdown sur 1 an (négatif)
+  ret_20d: number | null;       // performance 20 jours
+};
+type DataBundle = { ticker: string; fundamentals: Fundamentals; prices: Prices };
 
 type ScorePayload = {
   ticker: string;
@@ -36,6 +35,8 @@ type ScorePayload = {
   red_flags: string[];
   subscores: Record<string, number>;
   coverage: number;              // points max effectivement disponibles (0..100)
+  verdict: "sain" | "a_surveiller" | "fragile";
+  verdict_reason: string;
 };
 
 export async function GET(
@@ -46,48 +47,36 @@ export async function GET(
   if (!t) return NextResponse.json({ error: "Ticker requis" }, { status: 400 });
 
   const now = Date.now();
-  const key = `score_${t}`;
-  const hit = MEM[key];
+  const cacheKey = `score_${t}`;
+  const hit = MEM[cacheKey];
   if (hit && hit.expires > now) return NextResponse.json(hit.data);
 
   try {
-    // 1) Prix & 200DMA (Yahoo Chart -> Stooq .com -> Stooq .pl)
+    // 1) Prix (monde entier) → Yahoo Chart → Stooq .com → Stooq .pl
     const pricesAny = await fetchPricesAny(t);
 
-    // 2) Fundamentals via SEC (US + foreign filers IFRS), si possibles
+    // 2) Fondamentaux via SEC (US + foreign filers IFRS) si dispo
     const sec = await fetchFromSEC_US_IfPossible(t, pricesAny.px);
 
     const bundle: DataBundle = {
       ticker: t,
       fundamentals: sec.fundamentals,
-      prices: {
-        px: pricesAny.px,
-        px_vs_200dma: pricesAny.px_vs_200dma,
-        rs_6m_vs_sector_percentile: 0.5,
-        eps_revisions_3m: 0,
-      },
+      prices: pricesAny,
     };
 
-    // ----- Scoring (échelle officielle 0..100) -----
+    // 3) Score officiel + couverture
     const { subscores, malus, maxes } = computeScore(bundle);
-
-    const total =
-      subscores.quality +
-      subscores.safety +
-      subscores.valuation +
-      subscores.momentum;
-
-    const raw = Math.max(0, Math.min(100, Math.round(total) - malus)); // /100
-    const coverage =
-      maxes.quality + maxes.safety + maxes.valuation + maxes.momentum; // 0..100
-
+    const total = subscores.quality + subscores.safety + subscores.valuation + subscores.momentum;
+    const raw = Math.max(0, Math.min(100, Math.round(total) - malus));
+    const coverage = maxes.quality + maxes.safety + maxes.valuation + maxes.momentum; // 0..100
     const score_adj = coverage > 0 ? Math.round((total / coverage) * 100) : 0;
 
-    const color: ScorePayload["color"] =
-      raw >= 70 ? "green" : raw >= 50 ? "orange" : "red";
-
+    const color: ScorePayload["color"] = raw >= 70 ? "green" : raw >= 50 ? "orange" : "red";
     const reasons = buildReasons(bundle, subscores);
     const flags = detectRedFlags(bundle);
+
+    // 4) Verdict simple (lisible en 2 secondes)
+    const { verdict, reason } = makeVerdict(bundle, subscores, coverage);
 
     const payload: ScorePayload = {
       ticker: t,
@@ -98,9 +87,11 @@ export async function GET(
       red_flags: flags.slice(0, 2),
       subscores,
       coverage: Math.max(0, Math.min(100, Math.round(coverage))),
+      verdict,
+      verdict_reason: reason,
     };
 
-    MEM[key] = { expires: now + TTL_MS, data: payload };
+    MEM[cacheKey] = { expires: now + TTL_MS, data: payload };
     return NextResponse.json(payload, {
       headers: { "Cache-Control": "s-maxage=600, stale-while-revalidate=1200" },
     });
@@ -112,44 +103,82 @@ export async function GET(
 
 /* ============================ AGRÉGATEUR PRIX (monde entier) ============================ */
 
-async function fetchPricesAny(ticker: string): Promise<{ px: number | null; px_vs_200dma: number | null; }> {
-  // 1) Yahoo Chart (global, sans crumb)
+async function fetchPricesAny(ticker: string): Promise<Prices> {
+  // 1) Yahoo Chart
   try {
-    const y = await fetchYahooChartCloses(ticker);
-    if (y && y.length) return calcPxAnd200DMA(y);
+    const closes = await fetchYahooChartCloses(ticker);
+    if (closes && closes.length) return enrichCloses(closes);
   } catch {}
 
   // 2) Stooq (.com)
   try {
     const closes = await fetchStooqCloses(ticker, "https://stooq.com");
-    if (closes && closes.length) return calcPxAnd200DMA(closes);
+    if (closes && closes.length) return enrichCloses(closes);
   } catch {}
 
   // 3) Stooq (.pl)
   try {
     const closes = await fetchStooqCloses(ticker, "https://stooq.pl");
-    if (closes && closes.length) return calcPxAnd200DMA(closes);
+    if (closes && closes.length) return enrichCloses(closes);
   } catch {}
 
   throw new Error(`Aucune donnée de prix pour ${ticker} (Yahoo+Stooq échecs)`);
 }
 
-function calcPxAnd200DMA(closes: number[]) {
+function enrichCloses(closes: number[]): Prices {
   const px = closes.at(-1) ?? null;
+
+  // 200DMA
   let px_vs_200dma: number | null = null;
   if (closes.length >= 200 && typeof px === "number") {
     const avg = closes.slice(-200).reduce((a, b) => a + b, 0) / 200;
     if (avg) px_vs_200dma = (px - avg) / avg;
   }
-  return { px, px_vs_200dma };
+
+  // 52w stats
+  const last252 = closes.slice(-252); // ~252 séances = 1 an
+  let pct_52w: number | null = null;
+  let max_dd_1y: number | null = null;
+  if (last252.length >= 30 && typeof px === "number") {
+    const hi = Math.max(...last252);
+    const lo = Math.min(...last252);
+    if (hi > lo) pct_52w = (px - lo) / (hi - lo); // 0..1
+    // max drawdown
+    let peak = last252[0];
+    let mdd = 0;
+    for (const c of last252) {
+      peak = Math.max(peak, c);
+      mdd = Math.min(mdd, (c - peak) / peak);
+    }
+    max_dd_1y = mdd; // négatif
+  }
+
+  // 20d return
+  let ret_20d: number | null = null;
+  if (closes.length >= 21) {
+    const prev = closes[closes.length - 21];
+    if (typeof prev === "number" && prev > 0 && typeof px === "number") {
+      ret_20d = (px / prev) - 1;
+    }
+  }
+
+  return {
+    px,
+    px_vs_200dma,
+    pct_52w,
+    max_dd_1y,
+    ret_20d,
+    rs_6m_vs_sector_percentile: 0.5, // placeholder
+    eps_revisions_3m: 0,              // placeholder
+  };
 }
 
+// ---------- Yahoo Chart ----------
 async function fetchYahooChartCloses(ticker: string): Promise<number[] | null> {
   const headers = {
     "User-Agent": "Mozilla/5.0 (compatible; StockAnalyzer/1.0)",
     "Accept": "application/json, text/plain, */*",
   };
-
   let js = await fetchJsonSafe(
     `https://query1.finance.yahoo.com/v8/finance/chart/${encodeURIComponent(ticker)}?range=2y&interval=1d`,
     headers
@@ -161,7 +190,6 @@ async function fetchYahooChartCloses(ticker: string): Promise<number[] | null> {
     );
   }
   if (!js) return null;
-
   const res = js?.chart?.result?.[0];
   if (!res) return null;
   const closes: number[] = (res?.indicators?.quote?.[0]?.close || []) as number[];
@@ -169,17 +197,12 @@ async function fetchYahooChartCloses(ticker: string): Promise<number[] | null> {
   const arr = (closes?.filter(n => typeof n === "number")?.length ? closes : adj) || [];
   return arr.filter((n) => typeof n === "number" && Number.isFinite(n));
 }
-
 async function fetchJsonSafe(url: string, headers: Record<string, string>) {
-  try {
-    const r = await fetch(url, { headers });
-    if (!r.ok) return null;
-    return await r.json();
-  } catch {
-    return null;
-  }
+  try { const r = await fetch(url, { headers }); if (!r.ok) return null; return await r.json(); }
+  catch { return null; }
 }
 
+// ---------- Stooq ----------
 async function fetchStooqCloses(ticker: string, origin: "https://stooq.com" | "https://stooq.pl") {
   const candidates = makeStooqCandidates(ticker);
   for (const sym of candidates) {
@@ -195,18 +218,16 @@ async function fetchStooqCloses(ticker: string, origin: "https://stooq.com" | "h
   }
   return null;
 }
-
 function makeStooqCandidates(ticker: string): string[] {
   const t = ticker.toLowerCase();
   const out = new Set<string>();
-  out.add(t);                               // aapl
-  out.add(`${t}.us`);                       // aapl.us
-  out.add(t.replace(/\./g, "-"));           // brk-b
-  out.add(`${t.replace(/\./g, "-")}.us`);   // brk-b.us
-  if (/\.[a-z]{2,3}$/.test(t)) out.add(t);  // or.pa / 7203.t etc.
+  out.add(t);
+  out.add(`${t}.us`);
+  out.add(t.replace(/\./g, "-"));
+  out.add(`${t.replace(/\./g, "-")}.us`);
+  if (/\.[a-z]{2,3}$/.test(t)) out.add(t);
   return Array.from(out);
 }
-
 async function fetchCsvSafe(url: string): Promise<string | null> {
   try {
     const r = await fetch(url, {
@@ -218,12 +239,8 @@ async function fetchCsvSafe(url: string): Promise<string | null> {
     });
     if (!r.ok) return null;
     return await r.text();
-  } catch {
-    return null;
-  }
+  } catch { return null; }
 }
-
-// CSV “q/d/l/”: Date,Open,High,Low,Close,Volume
 function parseStooqCsv(csv: string): { dates: string[]; closes: number[] } {
   const lines = csv.trim().split(/\r?\n/);
   if (lines.length <= 1) return { dates: [], closes: [] };
@@ -240,8 +257,6 @@ function parseStooqCsv(csv: string): { dates: string[]; closes: number[] } {
   }
   return { dates, closes };
 }
-
-// CSV “q/l/ … &e=csv”: symbol,date,time,open,high,low,close,volume
 function parseStooqLiteCsv(csv: string): { dates: string[]; closes: number[] } {
   const lines = csv.trim().split(/\r?\n/);
   if (lines.length <= 1) return { dates: [], closes: [] };
@@ -297,12 +312,12 @@ function sumLastN(arr?: any[], n = 4) {
 }
 
 async function fetchFromSEC_US_IfPossible(ticker: string, lastPrice: number | null) {
-  const fund = {
-    op_margin: null as number | null,
-    current_ratio: null as number | null,
-    dilution_3y: null as number | null,
-    fcf_positive_last4: null as number | null,
-    fcf_yield: null as number | null,
+  const fund: Fundamentals = {
+    op_margin: null,
+    current_ratio: null,
+    dilution_3y: null,
+    fcf_positive_last4: null,
+    fcf_yield: null,
   };
 
   let cik: string | null = null;
@@ -324,9 +339,7 @@ async function fetchFromSEC_US_IfPossible(ticker: string, lastPrice: number | nu
     const facts = await r.json();
     usgaap = (facts?.facts?.["us-gaap"] as Taxo) || {};
     ifrs   = (facts?.facts?.["ifrs-full"] as Taxo) || {};
-  } catch {
-    return { fundamentals: fund };
-  }
+  } catch { return { fundamentals: fund }; }
 
   // Operating margin (TTM si possible)
   const revUSD  = usgaap.RevenueFromContractWithCustomerExcludingAssessedTax?.units?.USD
@@ -344,45 +357,37 @@ async function fetchFromSEC_US_IfPossible(ticker: string, lastPrice: number | nu
 
   const rev = (typeof revTTM === "number" ? revTTM : revLast);
   const op  = (typeof opTTM  === "number" ? opTTM  : opLast);
-
-  if (typeof rev === "number" && rev !== 0 && typeof op === "number") {
-    fund.op_margin = op / rev;
-  }
+  if (typeof rev === "number" && rev !== 0 && typeof op === "number") fund.op_margin = op / rev;
 
   // Current ratio
   const caUSD = usgaap.AssetsCurrent?.units?.USD;
   const clUSD = usgaap.LiabilitiesCurrent?.units?.USD;
   const caIFR = ifrs.CurrentAssets?.units?.USD;
   const clIFR = ifrs.CurrentLiabilities?.units?.USD;
-
   const ca = lastNum(caUSD) ?? lastNum(caIFR);
   const cl = lastNum(clUSD) ?? lastNum(clIFR);
-  if (typeof ca === "number" && typeof cl === "number" && cl !== 0) {
-    fund.current_ratio = ca / cl;
-  }
+  if (typeof ca === "number" && typeof cl === "number" && cl !== 0) fund.current_ratio = ca / cl;
 
   // Dilution 3 ans
   const shUSD = usgaap.CommonStockSharesOutstanding?.units?.shares
              || usgaap.EntityCommonStockSharesOutstanding?.units?.shares;
   const shIFR = ifrs.NumberOfSharesOutstanding?.units?.shares
              || ifrs.WeightedAverageNumberOfOrdinarySharesOutstandingDiluted?.units?.shares;
-
   const sharesArr = shUSD || shIFR;
   if (Array.isArray(sharesArr) && sharesArr.length >= 2) {
     const last = sharesArr.at(-1)?.val;
-    const i0   = Math.max(0, sharesArr.length - 13); // ~3 ans (trimestriel)
+    const i0 = Math.max(0, sharesArr.length - 13);
     const prev = sharesArr[i0]?.val;
     if (typeof last === "number" && typeof prev === "number" && prev > 0) {
       fund.dilution_3y = (last - prev) / prev;
     }
   }
 
-  // FCF (CFO - CapEx) + FCF positif & FCF yield
+  // FCF + FCF yield
   const cfoUSD = usgaap.NetCashProvidedByUsedInOperatingActivities?.units?.USD
               || usgaap.NetCashProvidedByUsedInOperatingActivitiesContinuingOperations?.units?.USD;
   const cfoIFR = ifrs.CashFlowsFromUsedInOperatingActivities?.units?.USD
               || ifrs.CashFlowsFromUsedInOperations?.units?.USD;
-
   const capexUSD = usgaap.PaymentsToAcquireProductiveAssets?.units?.USD
                 || usgaap.PurchasesOfPropertyPlantAndEquipment?.units?.USD;
   const capexIFR = ifrs.PurchaseOfPropertyPlantAndEquipment?.units?.USD
@@ -405,7 +410,6 @@ async function fetchFromSEC_US_IfPossible(ticker: string, lastPrice: number | nu
     fund.fcf_positive_last4 = countPos;
   }
 
-  // FCF yield ≈ (dernier CFO - |dernier CapEx|) / MarketCap (price × shares)
   const lastCFO = lastNum(cfoArr);
   const lastCap = lastNum(capArr);
   const shLast  = Array.isArray(sharesArr) && sharesArr.length ? sharesArr.at(-1)?.val : null;
@@ -492,4 +496,29 @@ function buildReasons(_data: DataBundle, subs: Record<string, number>) {
 
 function detectRedFlags(_data: DataBundle) {
   return [] as string[];
+}
+
+/* ============================ Verdict lisible (binaire/ternaire) ============================ */
+
+function makeVerdict(d: DataBundle, subs: Record<string, number>, coverage: number) {
+  // Règles simples et transparentes
+  const hasQuality = typeof d.fundamentals.op_margin === "number";
+  const hasSafety1 = typeof d.fundamentals.current_ratio === "number";
+  const hasSafety2 = typeof d.fundamentals.fcf_positive_last4 === "number";
+  const momOK = typeof d.prices.px_vs_200dma === "number" && d.prices.px_vs_200dma > 0;
+
+  const strongFund =
+    (hasQuality && d.fundamentals.op_margin! >= 0.15) &&
+    (hasSafety1 && d.fundamentals.current_ratio! >= 1.2) &&
+    (hasSafety2 && (d.fundamentals.fcf_positive_last4! ?? 0) >= 3);
+
+  if (strongFund && momOK) {
+    return { verdict: "sain" as const, reason: "Bons fondamentaux + tendance haussière" };
+  }
+  if (momOK || (subs.safety >= 4) || (subs.quality >= 6)) {
+    // tendance OK ou signaux bilans/marge acceptables
+    const covNote = coverage < 40 ? " (couverture limitée)" : "";
+    return { verdict: "a_surveiller" as const, reason: "Signal positif mais incomplet" + covNote };
+  }
+  return { verdict: "fragile" as const, reason: "Tendance faible et fondamentaux limités" };
 }

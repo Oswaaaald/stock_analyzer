@@ -10,6 +10,8 @@ type ScoreResponse = {
   red_flags: string[];
   subscores: Record<string, number>;
   coverage?: number;
+  verdict: "sain" | "a_surveiller" | "fragile";
+  verdict_reason: string;
 };
 
 type SuggestItem = { symbol: string; shortname: string; exchDisp: string };
@@ -21,6 +23,7 @@ export default function Page() {
   const [data, setData] = useState<ScoreResponse | null>(null);
   const [error, setError] = useState<string | null>(null);
 
+  // suggestions (Yahoo search)
   useEffect(() => {
     const t = setTimeout(async () => {
       if (!q || q.trim().length < 2) { setSuggests([]); return; }
@@ -71,7 +74,7 @@ export default function Page() {
             value={q}
             onChange={(e) => setQ(e.target.value)}
             onKeyDown={onEnter}
-            placeholder="AAPL, RACE, OR.PA, 7203.T, TSLA, ... "
+            placeholder="AAPL, RACE, OR.PA, 7203.T, TSLA, ..."
             className="flex-1 px-4 py-3 rounded-xl bg-slate-900 border border-slate-700 focus:outline-none focus:ring-2 focus:ring-sky-500"
           />
           <button
@@ -108,35 +111,39 @@ export default function Page() {
       {data && (
         <div className="mt-8 space-y-6">
           <div className="p-5 rounded-2xl border border-slate-700 bg-slate-900/60">
+            {/* Header + verdict */}
             <div className="flex items-center justify-between">
               <h2 className="text-xl font-semibold">{data.ticker.toUpperCase()}</h2>
               <div className="flex items-center gap-3">
                 <span
-                  className={`w-3 h-3 rounded-full ${
-                    data.color === "green"
-                      ? "bg-green-500"
-                      : data.color === "orange"
-                      ? "bg-amber-500"
-                      : "bg-red-500"
+                  className={`px-2 py-1 text-xs rounded-full border ${
+                    data.verdict === "sain"
+                      ? "bg-green-600/20 text-green-300 border-green-600/40"
+                      : data.verdict === "a_surveiller"
+                      ? "bg-amber-600/20 text-amber-300 border-amber-600/40"
+                      : "bg-red-600/20 text-red-300 border-red-600/40"
                   }`}
-                />
-                <span className="text-2xl font-bold tabular-nums">
-                  {data.score}/100
+                  title={data.verdict_reason}
+                >
+                  {data.verdict === "sain" ? "SAIN"
+                    : data.verdict === "a_surveiller" ? "À SURVEILLER" : "FRAGILE"}
                 </span>
+                <span className="text-2xl font-bold tabular-nums">{data.score}/100</span>
               </div>
             </div>
+            <div className="text-xs text-slate-400 mt-1">{data.verdict_reason}</div>
 
+            {/* Coverage + adjusted */}
             {"coverage" in data && typeof data.coverage === "number" && (
               <div className="text-xs text-slate-400 mt-1">
                 Couverture des données : {data.coverage}% (mode gratuit)
               </div>
             )}
             {"score_adj" in data && typeof data.score_adj === "number" && (
-              <div className="text-xs text-slate-400">
-                Score ajusté (selon couverture) : {data.score_adj}/100
-              </div>
+              <div className="text-xs text-slate-400">Score ajusté (selon couverture) : {data.score_adj}/100</div>
             )}
 
+            {/* Reasons + flags */}
             <div className="mt-4 grid grid-cols-2 gap-4">
               <div>
                 <h3 className="text-sm uppercase tracking-wide text-slate-400">Raisons principales</h3>
@@ -152,6 +159,7 @@ export default function Page() {
               </div>
             </div>
 
+            {/* Subscores */}
             <div className="mt-4">
               <h3 className="text-sm uppercase tracking-wide text-slate-400">Sous-scores</h3>
               <div className="mt-2 grid grid-cols-4 gap-3">
@@ -165,9 +173,7 @@ export default function Page() {
             </div>
           </div>
 
-          <div className="text-xs text-slate-400">
-            Pas un conseil en investissement. Sources publiques, sans clé.
-          </div>
+          <div className="text-xs text-slate-400">Pas un conseil en investissement. Sources publiques, sans clé.</div>
         </div>
       )}
     </main>
