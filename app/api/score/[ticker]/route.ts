@@ -1,12 +1,11 @@
-// Exécuter sur runtime Node.js (plus permissif que Edge pour certaines libs)
+// Exécuter sur runtime Node.js (Edge pourrait bloquer certaines requêtes)
 export const runtime = "nodejs";
 
 import { NextResponse } from "next/server";
-import yf from "yahoo-finance2";
 
-// ---------------- Cache mémoire simple (persiste le temps de vie du process) -----------
+// --- Cache mémoire simple ---
 const MEM: Record<string, { expires: number; data: any }> = {};
-const TTL_MS = 30 * 60 * 1000; // 30 minutes
+const TTL_MS = 30 * 60 * 1000; // 30 min
 
 type DataBundle = {
   ticker: string;
@@ -24,8 +23,6 @@ type ScorePayload = {
   red_flags: string[];
   subscores: Record<string, number>;
 };
-
-// ---------------------------------------------------------------------------------------
 
 export async function GET(
   _req: Request,
@@ -78,71 +75,73 @@ export async function GET(
   }
 }
 
-// ---------------------------------------------------------------------------------------
-// Provider sans clé (yahoo-finance2)
+// ------------------------------ Provider no-key via fetch Yahoo ------------------------------
 
 async function fetchAllNoKey(ticker: string): Promise<DataBundle> {
-  // quote: prix & infos rapides
-  const quote = await yf.quote(ticker).catch(() => null);
+  const ua = {
+    "User-Agent":
+      "Mozilla/5.0 (compatible; StockAnalyzer/1.0; +https://example.com)",
+    "Accept": "application/json, text/plain, */*",
+  };
 
-  // summary: secteur/industrie + quelques métriques financières
-  const summary = await yf
-    .quoteSummary(ticker, {
-      modules: [
-        "summaryProfile",
-        "price",
-        "defaultKeyStatistics",
-        "financialData",
-      ],
-    })
-    .catch(() => null);
+  const [quote, summary, chart] = await Promise.all([
+    fetchJson(
+      `https://query1.finance.yahoo.com/v7/finance/quote?symbols=${encodeURIComponent(
+        ticker
+      )}`,
+      ua
+    ),
+    fetchJson(
+      `https://query1.finance.yahoo.com/v10/finance/quoteSummary/${encodeURIComponent(
+        ticker
+      )}?modules=summaryProfile,price,defaultKeyStatistics,financialData`,
+      ua
+    ),
+    fetchJson(
+      `https://query1.finance.yahoo.com/v8/finance/chart/${encodeURIComponent(
+        ticker
+      )}?range=2y&interval=1d`,
+      ua
+    ),
+  ]);
 
-  // historique 2 ans (1d) pour 200DMA
-  const hist = await yf
-    .historical(ticker, {
-      period1: new Date(Date.now() - 1000 * 60 * 60 * 24 * 365 * 2),
-      period2: new Date(),
-      interval: "1d",
-    })
-    .catch(() => []);
+  const qRes = quote?.quoteResponse?.result?.[0] || {};
+  const sRes = summary?.quoteSummary?.result?.[0] || {};
+  const cRes = chart?.chart?.result?.[0] || {};
 
   const price =
-    (quote as any)?.regularMarketPrice ??
-    (quote as any)?.previousClose ??
-    null;
+    qRes.regularMarketPrice ?? qRes.previousClose ?? null;
 
   // 200DMA
   let px_vs_200dma: number | null = null;
-  if (Array.isArray(hist) && hist.length >= 200) {
-    const closes = hist
-      .map((h: any) => h?.close)
-      .filter((x: any) => typeof x === "number")
-      .slice(-200);
+  try {
+    const closes: number[] = (cRes?.indicators?.quote?.[0]?.close || []).filter(
+      (x: any) => typeof x === "number"
+    );
     if (closes.length >= 200) {
-      const avg = closes.reduce((a: number, b: number) => a + b, 0) / closes.length;
-      if (avg && typeof price === "number") {
-        px_vs_200dma = (price - avg) / avg;
+      const last = closes.at(-1)!;
+      const avg =
+        closes.slice(-200).reduce((a: number, b: number) => a + b, 0) / 200;
+      if (avg && typeof last === "number") {
+        px_vs_200dma = (last - avg) / avg;
       }
     }
-  }
+  } catch {}
 
-  const sector = (summary as any)?.summaryProfile?.sector ?? undefined;
-  const industry = (summary as any)?.summaryProfile?.industry ?? undefined;
+  const sector = sRes?.summaryProfile?.sector;
+  const industry = sRes?.summaryProfile?.industry;
+  const opMargin = sRes?.financialData?.operatingMargins ?? null;
 
-  // marges & co (si dispo)
-  const opMargin = (summary as any)?.financialData?.operatingMargins ?? null;
-
-  // Beaucoup de métriques (ROIC, FCF yield…) nécessitent des retraitements lourds → null pour MVP
   return {
     ticker,
     sector,
     industry,
     fundamentals: {
-      roic_3y: null, // non fiable sans retraitements approfondis
+      roic_3y: null,
       op_margin: opMargin ?? null,
       rev_cagr_3y: null,
       fcf_to_ebit: null,
-      rnd_to_sales_quantile: 0.5, // neutre
+      rnd_to_sales_quantile: 0.5,
       net_debt_to_ebitda: null,
       current_ratio: null,
       interest_coverage: null,
@@ -159,14 +158,21 @@ async function fetchAllNoKey(ticker: string): Promise<DataBundle> {
     prices: {
       px: price,
       px_vs_200dma,
-      rs_6m_vs_sector_percentile: 0.5, // neutre pour MVP
+      rs_6m_vs_sector_percentile: 0.5,
       eps_revisions_3m: 0,
     },
   };
 }
 
-// ---------------------------------------------------------------------------------------
-// Scoring minimal tolérant aux valeurs nulles
+async function fetchJson(url: string, headers: Record<string, string>) {
+  const res = await fetch(url, { headers });
+  if (!res.ok) {
+    throw new Error(`HTTP ${res.status} on ${url}`);
+  }
+  return res.json();
+}
+
+// ------------------------------ Scoring minimal ------------------------------
 
 function clip(x: number, lo: number, hi: number) {
   return Math.max(lo, Math.min(hi, x));
@@ -183,13 +189,10 @@ function computeScore(data: DataBundle) {
   }
 
   // Sécurité (0..25)
-  let s = 0; // inconnues -> neutre (0)
+  let s = 0;
 
   // Valorisation (0..25)
   let v = 0;
-  if (typeof f.fcf_yield === "number") {
-    v += f.fcf_yield > 0.06 ? 10 : f.fcf_yield >= 0.04 ? 7 : f.fcf_yield >= 0.02 ? 4 : 1;
-  }
 
   // Momentum (0..15)
   let m = 0;
@@ -204,27 +207,24 @@ function computeScore(data: DataBundle) {
     momentum: clip(m, 0, 15),
   };
 
-  // Malus (désactivés pour MVP faute de data fiable)
   let malus = 0;
 
   return { subscores, malus };
 }
 
 function buildReasons(_data: DataBundle, subs: Record<string, number>) {
-  // Règles simples basées sur ce qui est disponible
   const reasons: string[] = [];
-  if (subscoresIsHigh(subs.quality, 20)) reasons.push("Qualité opérationnelle décente (proxy marges)");
-  if (subscoresIsHigh(subs.momentum, 6)) reasons.push("Cours au-dessus de la moyenne 200 jours");
-  if (subscoresIsHigh(subs.valuation, 7)) reasons.push("Valorisation potentiellement attractive (proxy FCF)");
+  if (isHigh(subs.quality, 20)) reasons.push("Qualité opérationnelle décente (proxy marges)");
+  if (isHigh(subs.momentum, 6)) reasons.push("Cours au-dessus de la moyenne 200 jours");
+  if (isHigh(subs.valuation, 7)) reasons.push("Valorisation potentiellement attractive (proxy FCF)");
   if (!reasons.length) reasons.push("Données limitées (mode gratuit) : vérifiez les détails");
   return reasons;
 
-  function subscoresIsHigh(val: number, thr: number) {
+  function isHigh(val: number, thr: number) {
     return typeof val === "number" && val >= thr;
   }
 }
 
 function detectRedFlags(_data: DataBundle) {
-  // Sans états complets fiables, on reste prudent
   return [] as string[];
 }
