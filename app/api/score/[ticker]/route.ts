@@ -45,7 +45,7 @@ type ScorePayload = {
   reasons_positive: string[];
   red_flags: string[];
   subscores: Record<string, number>;
-  coverage: number; // 0..100 (par métriques disponibles)
+  coverage: number; // 0..100 pour l'UI (piliers)
   proof?: {
     price_source?: string;
     price_points?: number;
@@ -162,31 +162,42 @@ export async function GET(req: Request, { params }: { params: { ticker: string }
     const bundle: DataBundle = { ticker: t, fundamentals, prices: priceFeed, sources_used };
     const { subscores, maxes } = computeScore(bundle);
 
-    // ===== Couverture basée sur les métriques réellement disponibles =====
-    // (somme des max partiels : reflète quelles briques sont présentes)
-    const coverage = Math.max(
-      0,
-      Math.min(
-        100,
-        Math.round(maxes.quality + maxes.safety + maxes.valuation + maxes.momentum)
-      )
+    // ===== Couverture affichée (UI) = par PILIERS =====
+    const qualityPresent   = typeof fundamentals.op_margin.value === "number";
+    const safetyPresent    =
+      typeof fundamentals.current_ratio.value === "number" || typeof fundamentals.net_cash.value === "number";
+    const valuationPresent =
+      typeof fundamentals.fcf_yield.value === "number" || typeof fundamentals.earnings_yield.value === "number";
+    const momentumPresent  =
+      typeof priceFeed.px_vs_200dma.value === "number" ||
+      (typeof priceFeed.ret_60d.value === "number" && priceFeed.ret_60d.value > 0);
+
+    const coverage_display =
+      (qualityPresent ? 35 : 0) +
+      (safetyPresent ? 25 : 0) +
+      (valuationPresent ? 25 : 0) +
+      (momentumPresent ? 15 : 0);
+
+    // ===== Couverture pour la normalisation du score = “maxes” dispos =====
+    const denom = Math.max(
+      1,
+      Math.round(maxes.quality + maxes.safety + maxes.valuation + maxes.momentum) // typiquement ≤ 39
     );
 
     const total = subscores.quality + subscores.safety + subscores.valuation + subscores.momentum;
     const raw = Math.max(0, Math.min(100, Math.round(total)));
-
-    const score_adj = coverage > 0 ? Math.round((total / coverage) * 100) : 0;
+    const score_adj = Math.round((total / denom) * 100); // ← remet des 60–80 quand les briques clés sont là
 
     // Couleur & verdict basés sur le score affiché (shown)
     const shown = score_adj ?? raw;
     const color: ScorePayload["color"] = shown >= 65 ? "green" : shown >= 50 ? "orange" : "red";
 
-    // Momentum présent si 200DMA dispo et/ou tendance 60j > 0 (pour le wording du verdict)
-    const momentumPresent =
-      (typeof priceFeed.px_vs_200dma.value === "number") ||
-      (typeof priceFeed.ret_60d.value === "number" && priceFeed.ret_60d.value > 0);
-
-    const { verdict, reason } = makeVerdict({ coverage, total, momentumPresent, score_adj: shown });
+    const { verdict, reason } = makeVerdict({
+      coverage: coverage_display,
+      total,
+      momentumPresent,
+      score_adj: shown,
+    });
 
     const reasons = buildReasons(bundle, subscores);
 
@@ -200,7 +211,7 @@ export async function GET(req: Request, { params }: { params: { ticker: string }
       reasons_positive: reasons.slice(0, 3),
       red_flags: [],
       subscores,
-      coverage,
+      coverage: coverage_display, // UI
       proof: {
         price_source: priceFeed.meta?.source_primary,
         price_points: priceFeed.meta?.points,
@@ -393,12 +404,9 @@ function computeFundamentalsFromV10(r: any): Fundamentals {
   const fcf_over_ni = fcf != null && ni0 != null && ni0 !== 0 ? fcf / ni0 : null;
 
   // ROIC ~ NOPAT / (Debt + Equity - Cash)
-  // - NOPAT ≈ operatingIncome * (1 - taxRate)
-  // - Fallback si operatingIncome manquant: NOPAT ≈ netIncome (proxy prudente)
   const taxRate =
     preTax0 && taxExp0 != null && preTax0 !== 0 ? Math.min(0.5, Math.max(0, taxExp0 / preTax0)) : 0.21;
-  const nopat =
-    opInc0 != null ? opInc0 * (1 - taxRate) : (ni0 != null ? ni0 : null);
+  const nopat = opInc0 != null ? opInc0 * (1 - taxRate) : (ni0 != null ? ni0 : null);
   const invested =
     (debt ?? null) != null || (eq0 ?? null) != null ? ((debt ?? 0) + (eq0 ?? 0) - (cash ?? 0)) : null;
   const roic = nopat != null && invested && invested !== 0 ? nopat / invested : null;
@@ -460,7 +468,7 @@ function computeScore(d: DataBundle) {
   let m = 0,
     mMax = 0;
   if (typeof p.px_vs_200dma.value === "number") {
-    mMax = 10;
+    mMax += 10;
     m += p.px_vs_200dma.value >= 0.05 ? 10 : p.px_vs_200dma.value > -0.05 ? 6 : 2;
   }
   if (typeof p.ret_20d.value === "number") {
@@ -471,8 +479,9 @@ function computeScore(d: DataBundle) {
     mMax += 2;
     m += p.ret_60d.value > 0.06 ? 2 : p.ret_60d.value > 0 ? 1 : 0;
   }
+  // borne logique côté score
   m = Math.min(m, 15);
-  mMax = 15;
+  // mMax reste *ce qui est réellement disponible* (0..15)
 
   const subscores = {
     quality: clip(q, 0, 35),
@@ -496,7 +505,7 @@ function buildReasons(_d: DataBundle, subs: Record<string, number>) {
 
 function makeVerdict(args: { coverage: number; total: number; momentumPresent: boolean; score_adj: number }) {
   const { coverage, momentumPresent, score_adj } = args;
-  const coverageOk = coverage >= 40; // assoupli pour éviter “À SURVEILLER” partout
+  const coverageOk = coverage >= 40; // assoupli
   if (score_adj >= 70 && coverageOk && momentumPresent) return { verdict: "sain" as const, reason: "Score élevé et couverture suffisante" };
   if (score_adj >= 50 || momentumPresent) return { verdict: "a_surveiller" as const, reason: "Signal positif mais incomplet" + (coverageOk ? "" : " (couverture limitée)") };
   return { verdict: "fragile" as const, reason: "Signal faible" + (coverageOk ? "" : " (données partielles)") };

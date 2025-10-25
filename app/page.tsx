@@ -55,14 +55,14 @@ export default function Page() {
   const debounceId = useRef<ReturnType<typeof setTimeout> | null>(null);
   const inputRef = useRef<HTMLInputElement | null>(null);
   const sugRef = useRef<HTMLDivElement | null>(null);
-  const suppressSuggestRef = useRef<boolean>(false); // NEW: supprime l'ouverture auto
+  const suppressSuggestRef = useRef<boolean>(false); // évite réouverture auto
 
   /* ========= URL param -> auto lookup ========= */
   useEffect(() => {
     const sp = new URLSearchParams(location.search);
     const t = sp.get("ticker");
     if (t) {
-      suppressSuggestRef.current = true; // ne pas ouvrir de suggestions lors du setQ programmatique
+      suppressSuggestRef.current = true;
       setQ(t);
       setShowSug(false);
       void lookup(t);
@@ -86,7 +86,6 @@ export default function Page() {
       const json: ScoreResponse = await res.json();
       setData(json);
 
-      // URL
       const url = new URL(location.href);
       url.searchParams.set("ticker", sym);
       history.replaceState(null, "", url.toString());
@@ -94,7 +93,7 @@ export default function Page() {
       setError(e?.message || "Erreur inconnue");
     } finally {
       setLoading(false);
-      setShowSug(false); // ferme les suggestions après requête
+      setShowSug(false);
       inputRef.current?.blur();
     }
   }
@@ -106,12 +105,10 @@ export default function Page() {
       setShowSug(false);
       return;
     }
-    // Empêche l'ouverture après setQ programmatique (URL, chip, suggestion)
     if (suppressSuggestRef.current) {
       suppressSuggestRef.current = false;
       return;
     }
-
     if (debounceId.current) clearTimeout(debounceId.current);
     debounceId.current = setTimeout(async () => {
       setSugLoading(true);
@@ -182,10 +179,16 @@ export default function Page() {
     return <span className={`px-2.5 py-1 rounded-full text-xs border ${v.classes}`}>{v.label}</span>;
   }, [data]);
 
-  function barColor(score: number) {
-    if (score >= 70) return "bg-emerald-500";
-    if (score >= 50) return "bg-amber-500";
-    return "bg-rose-500";
+  // === couleur unique pilotée par le verdict (ruban + barre) ===
+  function verdictColor(v: "sain" | "a_surveiller" | "fragile") {
+    switch (v) {
+      case "sain":
+        return "bg-emerald-500";
+      case "a_surveiller":
+        return "bg-amber-500";
+      case "fragile":
+        return "bg-rose-500";
+    }
   }
 
   function fmtPct(x?: number | null) {
@@ -251,7 +254,7 @@ export default function Page() {
                     key={`${it.symbol}-${i}`}
                     role="option"
                     onClick={() => {
-                      suppressSuggestRef.current = true; // évite réouverture au setQ
+                      suppressSuggestRef.current = true;
                       setQ(it.symbol);
                       setShowSug(false);
                       void lookup(it.symbol);
@@ -319,15 +322,7 @@ export default function Page() {
             <div className="relative overflow-hidden rounded-3xl border border-slate-800 bg-gradient-to-b from-slate-900/60 to-slate-900/30">
               {/* Ribbon */}
               <div className="absolute -right-14 top-6 rotate-45">
-                <div
-                  className={`px-16 py-1 text-xs tracking-wider text-white/90 ${
-                    (data.score_adj ?? data.score) >= 70
-                      ? "bg-emerald-500"
-                      : (data.score_adj ?? data.score) >= 50
-                      ? "bg-amber-500"
-                      : "bg-rose-500"
-                  }`}
-                >
+                <div className={`px-16 py-1 text-xs tracking-wider text-white/90 ${verdictColor(data.verdict)}`}>
                   {data.verdict.toUpperCase()}
                 </div>
               </div>
@@ -353,7 +348,7 @@ export default function Page() {
                     </div>
                     <div className="mt-2 h-2 rounded-full bg-slate-800 overflow-hidden">
                       <div
-                        className={`h-full ${barColor(data.score_adj ?? data.score)}`}
+                        className={`h-full ${verdictColor(data.verdict)}`}
                         style={{ width: `${Math.min(100, data.score_adj ?? data.score)}%` }}
                       />
                     </div>
@@ -494,7 +489,7 @@ function Badge({
 function SourceChip({ src }: { src: string }) {
   const label = src.replace(/^price:/, "price · ").replace(/^sec:/, "sec · ");
   const variant =
-    /fin-html/.test(src) ? "ok" : /yahoo:html|yahoo:v7|yahoo:summary/.test(src) ? "default" : /wikipedia/.test(src) ? "muted" : "default";
+    /fin-html/.test(src) ? "ok" : /yahoo:html|yahoo:v7|yahoo:summary|yahoo:v10/.test(src) ? "default" : /wikipedia/.test(src) ? "muted" : "default";
   return <Badge variant={variant as any}>{label}</Badge>;
 }
 
