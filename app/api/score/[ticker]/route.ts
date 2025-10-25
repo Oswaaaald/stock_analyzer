@@ -330,7 +330,6 @@ function parseStooqCsv(csv: string): { dates: string[]; closes: number[] } {
   for (let i = 1; i < lines.length; i++) {
     const parts = lines[i].split(",");
     const d = parts[idxDate];
-    the:
     const c = parseFloat(parts[idxClose]);
     if (d && Number.isFinite(c)) { dates.push(d); closes.push(c); }
   }
