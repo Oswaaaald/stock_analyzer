@@ -1,6 +1,5 @@
-import type { Config } from "tailwindcss";
-
-export default {
+/** @type {import('tailwindcss').Config} */
+module.exports = {
   content: [
     "./app/**/*.{js,ts,jsx,tsx,mdx}",
     "./pages/**/*.{js,ts,jsx,tsx,mdx}",
@@ -12,7 +11,7 @@ export default {
     extend: {
       colors: {
         slate: {
-          950: "#0a0f1a", // fond + profond
+          950: "#0a0f1a",
         },
       },
       borderRadius: {
@@ -20,9 +19,9 @@ export default {
         "3xl": "1.25rem",
       },
       boxShadow: {
-        "elev": "0 10px 30px rgba(0,0,0,.35)",
+        elev: "0 10px 30px rgba(0,0,0,.35)",
       },
     },
   },
   plugins: [],
-} satisfies Config;
+};
