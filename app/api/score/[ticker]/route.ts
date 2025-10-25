@@ -73,38 +73,94 @@ type ScorePayload = {
 /* ======================================================================================
  *  HANDLER
  * ====================================================================================*/
-export async function GET(_req: Request, { params }: { params: { ticker: string } }) {
+export async function GET(req: Request, { params }: { params: { ticker: string } }) {
   const t = (params.ticker || "").toUpperCase().trim();
   if (!t) return NextResponse.json({ error: "Ticker requis" }, { status: 400 });
 
+  // NEW: flag debug
+  const url = new URL(req.url);
+  const isDebug = url.searchParams.get("debug") === "1";
+
   const now = Date.now();
-  const cacheKey = `score_${t}`;
+  const cacheKey = `score_${t}${isDebug ? ":dbg" : ""}`;
   const hit = MEM[cacheKey];
-  if (hit && hit.expires > now) return NextResponse.json(hit.data);
+  if (!isDebug && hit && hit.expires > now) return NextResponse.json(hit.data);
 
   try {
     // Prix (Yahoo → Stooq)
     const priceFeed = await fetchPricesBestOf(t);
 
-    // Fondamentaux : SEC/IFRS
-    const sec = await fetchFromSEC_US_IfPossible(t, priceFeed.px.value);
-
-    // FMP ratios (demo)
-    const fmp = await fetchFmpRatiosIfPossible(t);
-
-    // Yahoo JSON summary (best effort)
+    // Fondamentaux (toutes les sources)
+    const sec  = await fetchFromSEC_US_IfPossible(t, priceFeed.px.value);
+    const fmp  = await fetchFmpRatiosIfPossible(t);
     const ySum = await fetchYahooSummaryIfPossible(t);
-
-    // Yahoo v7/quote (souvent riche en Europe)
-    const yV7 = await fetchYahooQuoteV7(t);
-
-    // Yahoo HTML Key Statistics (scrape permissif)
-    const yHtml = await fetchYahooKeyStatsHtml(t);
-
-    // Wikipedia (EN/FR) : op_margin (revenue/op income)
+    const yV7  = await fetchYahooQuoteV7(t);
+    const yHtml= await fetchYahooKeyStatsHtml(t);
     const wiki = await fetchWikipediaOpMargin(t);
 
-    // Fusion pondérée des fondamentaux
+    // --- MODE DEBUG : on renvoie un snapshot de chaque fetcher, pour diagnostiquer
+    if (isDebug) {
+      return NextResponse.json({
+        ticker: t,
+        prices: {
+          source: priceFeed.meta?.source_primary,
+          points: priceFeed.meta?.points,
+          recency_days: priceFeed.meta?.recency_days,
+          px: priceFeed.px.value,
+          px_vs_200dma: priceFeed.px_vs_200dma.value,
+          pct_52w: priceFeed.pct_52w.value,
+          ret_20d: priceFeed.ret_20d.value,
+          ret_60d: priceFeed.ret_60d.value,
+        },
+        yahoo_v7: {
+          used: yV7.used,
+          earnings_yield: (yV7.fundamentals as any)?.earnings_yield?.value ?? null,
+          net_cash_proxy: (yV7.fundamentals as any)?.net_cash?.value ?? null,
+        },
+        yahoo_summary: {
+          used: ySum.used,
+          op_margin: (ySum.fundamentals as any)?.op_margin?.value ?? null,
+          current_ratio: (ySum.fundamentals as any)?.current_ratio?.value ?? null,
+          fcf_yield: (ySum.fundamentals as any)?.fcf_yield?.value ?? null,
+          earnings_yield: (ySum.fundamentals as any)?.earnings_yield?.value ?? null,
+          net_cash: (ySum.fundamentals as any)?.net_cash?.value ?? null,
+        },
+        yahoo_html: {
+          used: yHtml.used,
+          op_margin: (yHtml.fundamentals as any)?.op_margin?.value ?? null,
+          current_ratio: (yHtml.fundamentals as any)?.current_ratio?.value ?? null,
+          earnings_yield: (yHtml.fundamentals as any)?.earnings_yield?.value ?? null,
+          fcf_yield: (yHtml.fundamentals as any)?.fcf_yield?.value ?? null,
+          net_cash: (yHtml.fundamentals as any)?.net_cash?.value ?? null,
+        },
+        wikipedia: {
+          used: wiki.used,
+          op_margin: (wiki.fundamentals as any)?.op_margin?.value ?? null,
+        },
+        sec_ifrs: {
+          used: sec.used,
+          note: sec.note ?? null,
+          op_margin: sec.fundamentals.op_margin.value,
+          current_ratio: sec.fundamentals.current_ratio.value,
+          dilution_3y: sec.fundamentals.dilution_3y.value,
+          fcf_positive_last4: sec.fundamentals.fcf_positive_last4.value,
+          fcf_yield: sec.fundamentals.fcf_yield.value,
+          earnings_yield: sec.fundamentals.earnings_yield.value,
+          net_cash: sec.fundamentals.net_cash.value,
+        },
+        fmp_demo: {
+          used: fmp.used,
+          op_margin: (fmp.fundamentals as any)?.op_margin?.value ?? null,
+          current_ratio: (fmp.fundamentals as any)?.current_ratio?.value ?? null,
+          fcf_yield: (fmp.fundamentals as any)?.fcf_yield?.value ?? null,
+          earnings_yield: (fmp.fundamentals as any)?.earnings_yield?.value ?? null,
+        },
+      }, {
+        headers: { "Cache-Control": "no-store" },
+      });
+    }
+
+    // --- MODE NORMAL : on continue comme avant
     const fundamentals = mergeFundamentalsWeighted({
       sec: sec.fundamentals,
       fmp: fmp.fundamentals,
@@ -114,31 +170,30 @@ export async function GET(_req: Request, { params }: { params: { ticker: string 
       yv7: yV7,
     });
 
-    const bundle: DataBundle = {
+    const bundle = {
       ticker: t,
       fundamentals,
       prices: priceFeed,
       sources_used: [
         priceFeed.meta?.source_primary ? `price:${priceFeed.meta.source_primary}` : "price:unknown",
-        ...(sec.used?.length ? sec.used.map((x) => `sec:${x}`) : []),
+        ...(sec.used?.length ? sec.used.map((x: string) => `sec:${x}`) : []),
         ...(fmp.used ? ["fmp:ratios"] : []),
         ...(ySum.used ? ["yahoo:summary"] : []),
         ...(yV7.used ? ["yahoo:v7"] : []),
         ...(yHtml.used ? ["yahoo:html"] : []),
         ...(wiki.used ? ["wikipedia"] : []),
       ],
-    };
+    } as const;
 
-    // SCORE
     const { subscores, malus, maxes } = computeScore(bundle);
     const total = subscores.quality + subscores.safety + subscores.valuation + subscores.momentum;
     const raw = Math.max(0, Math.min(100, Math.round(total) - malus));
     const coverage = Math.max(0, Math.min(100, Math.round(maxes.quality + maxes.safety + maxes.valuation + maxes.momentum)));
     const score_adj = coverage > 0 ? Math.round((total / coverage) * 100) : 0;
     const color: ScorePayload["color"] = raw >= 70 ? "green" : raw >= 50 ? "orange" : "red";
-    const { verdict, reason } = makeVerdict(bundle, subscores, coverage);
-    const reasons = buildReasons(bundle, subscores);
-    const flags = detectRedFlags(bundle);
+    const { verdict, reason } = makeVerdict(bundle as any, subscores, coverage);
+    const reasons = buildReasons(bundle as any, subscores);
+    const flags = detectRedFlags(bundle as any);
 
     const payload: ScorePayload = {
       ticker: t,
@@ -152,18 +207,26 @@ export async function GET(_req: Request, { params }: { params: { ticker: string 
       subscores,
       coverage,
       proof: {
-        price_source: bundle.prices.meta?.source_primary,
-        price_points: bundle.prices.meta?.points,
-        price_has_200dma: bundle.prices.px_vs_200dma.value !== null,
-        price_recency_days: bundle.prices.meta?.recency_days ?? null,
+        price_source: priceFeed.meta?.source_primary,
+        price_points: priceFeed.meta?.points,
+        price_has_200dma: priceFeed.px_vs_200dma.value !== null,
+        price_recency_days: priceFeed.meta?.recency_days ?? null,
         sec_used: sec.used,
         sec_note: sec.note || null,
-        valuation_used: fundamentals.fcf_yield.value !== null || fundamentals.earnings_yield.value !== null,
-        sources_used: bundle.sources_used,
+        valuation_used: !!(fundamentals.fcf_yield.value ?? fundamentals.earnings_yield.value),
+        sources_used: [
+          priceFeed.meta?.source_primary ? `price:${priceFeed.meta.source_primary}` : "price:unknown",
+          ...(sec.used?.length ? sec.used.map((x: string) => `sec:${x}`) : []),
+          ...(fmp.used ? ["fmp:ratios"] : []),
+          ...(ySum.used ? ["yahoo:summary"] : []),
+          ...(yV7.used ? ["yahoo:v7"] : []),
+          ...(yHtml.used ? ["yahoo:html"] : []),
+          ...(wiki.used ? ["wikipedia"] : []),
+        ],
       },
     };
 
-    MEM[cacheKey] = { expires: now + TTL_MS, data: payload };
+    if (!isDebug) MEM[cacheKey] = { expires: now + TTL_MS, data: payload };
     return NextResponse.json(payload, {
       headers: { "Cache-Control": "s-maxage=600, stale-while-revalidate=1200" },
     });
