@@ -1,4 +1,4 @@
-// Exécuter sur runtime Node.js (Edge pourrait bloquer certaines requêtes)
+// Exécuter sur runtime Node.js (les fetch externes sont plus permissifs qu'en Edge)
 export const runtime = "nodejs";
 
 import { NextResponse } from "next/server";
@@ -9,10 +9,13 @@ const TTL_MS = 30 * 60 * 1000; // 30 min
 
 type DataBundle = {
   ticker: string;
-  sector?: string;
-  industry?: string;
   fundamentals: Record<string, any>;
-  prices: Record<string, any>;
+  prices: {
+    px: number | null;
+    px_vs_200dma: number | null;
+    rs_6m_vs_sector_percentile: number | null;
+    eps_revisions_3m: number | null;
+  };
 };
 
 type ScorePayload = {
@@ -39,13 +42,13 @@ export async function GET(
   }
 
   try {
-    const bundle = await fetchAllNoKey(t);
+    const bundle = await fetchAllNoKeyStooq(t);
     const { subscores, malus } = computeScore(bundle);
     const raw = Math.round(
       0.35 * subscores.quality +
-        0.25 * subscores.safety +
-        0.25 * subscores.valuation +
-        0.15 * subscores.momentum
+      0.25 * subscores.safety +
+      0.25 * subscores.valuation +
+      0.15 * subscores.momentum
     );
     const final = Math.max(0, Math.min(100, raw - malus));
     const color: ScorePayload["color"] =
@@ -67,121 +70,129 @@ export async function GET(
       headers: { "Cache-Control": "s-maxage=600, stale-while-revalidate=1200" },
     });
   } catch (e: any) {
-    const msg =
-      typeof e?.message === "string"
-        ? e.message
-        : e?.toString?.() || "Erreur provider";
+    const msg = typeof e?.message === "string" ? e.message : (e?.toString?.() || "Erreur provider");
     return NextResponse.json({ error: msg }, { status: 500 });
   }
 }
 
-// ------------------------------ Provider no-key via fetch Yahoo ------------------------------
+/* =======================================================================================
+   Provider no-key via Stooq (CSV public)
+   - URL jour: https://stooq.com/q/d/l/?s=<symbol>&i=d
+   - On teste plusieurs variantes de symbole (aapl, aapl.us, or.pa, etc.)
+   - On parse le CSV à la main (pas de lib) et on calcule la 200DMA
+======================================================================================= */
 
-async function fetchAllNoKey(ticker: string): Promise<DataBundle> {
-  const ua = {
-    "User-Agent": "Mozilla/5.0 (compatible; StockAnalyzer/1.0)",
-    "Accept": "application/json, text/plain, */*",
-  };
+async function fetchAllNoKeyStooq(ticker: string): Promise<DataBundle> {
+  const candidates = makeStooqCandidates(ticker);
 
-  // 1) Toujours OK en général
-  const quote = await fetchJson(
-    `https://query1.finance.yahoo.com/v7/finance/quote?symbols=${encodeURIComponent(ticker)}`,
-    ua
-  );
-
-  // 2) Toujours OK en général
-  const chart = await fetchJson(
-    `https://query1.finance.yahoo.com/v8/finance/chart/${encodeURIComponent(ticker)}?range=2y&interval=1d`,
-    ua
-  );
-
-  // 3) Optionnel : on ESSAIE summary; si 401 on ignore
-  let summary: any = null;
-  try {
-    summary = await fetchJson(
-      `https://query1.finance.yahoo.com/v10/finance/quoteSummary/${encodeURIComponent(ticker)}?modules=summaryProfile,financialData`,
-      ua
-    );
-  } catch {
-    // fallback query2
+  // essaie chaque candidate jusqu'à trouver un CSV valide
+  let closes: number[] | null = null;
+  for (const sym of candidates) {
     try {
-      summary = await fetchJson(
-        `https://query2.finance.yahoo.com/v10/finance/quoteSummary/${encodeURIComponent(ticker)}?modules=summaryProfile,financialData`,
-        ua
-      );
+      const csv = await fetchCsv(`https://stooq.com/q/d/l/?s=${encodeURIComponent(sym)}&i=d`);
+      const parsed = parseStooqCsv(csv); // { dates: string[], closes: number[] }
+      if (parsed.closes.length > 0) {
+        closes = parsed.closes;
+        break;
+      }
     } catch {
-      summary = null; // on vit sans (pas bloquant)
+      // continue
     }
   }
 
-  const qRes = quote?.quoteResponse?.result?.[0] || {};
-  const cRes = chart?.chart?.result?.[0] || {};
-  const sRes = summary?.quoteSummary?.result?.[0] || {};
+  if (!closes || closes.length === 0) {
+    throw new Error(`Aucune donnée Stooq pour ${ticker} (essais: ${candidates.join(", ")})`);
+  }
 
-  const price = qRes.regularMarketPrice ?? qRes.previousClose ?? null;
+  // prix = dernier close connu
+  const px = closes[closes.length - 1] ?? null;
 
-  // 200DMA
+  // px vs 200DMA
   let px_vs_200dma: number | null = null;
-  try {
-    const closes: number[] = (cRes?.indicators?.quote?.[0]?.close || [])
-      .filter((x: any) => typeof x === "number");
-    if (closes.length >= 200) {
-      const last = closes.at(-1)!;
-      const avg = closes.slice(-200).reduce((a: number, b: number) => a + b, 0) / 200;
-      if (avg && typeof last === "number") {
-        px_vs_200dma = (last - avg) / avg;
-      }
-    }
-  } catch {}
-
-  // sector/industry sont optionnels (si summary a marché)
-  const sector = sRes?.summaryProfile?.sector ?? undefined;
-  const industry = sRes?.summaryProfile?.industry ?? undefined;
-
-  // marge op (si dispo), sinon null
-  const opMargin = sRes?.financialData?.operatingMargins ?? null;
+  if (closes.length >= 200 && typeof px === "number") {
+    const last200 = closes.slice(-200);
+    const avg = last200.reduce((a, b) => a + b, 0) / last200.length;
+    if (avg) px_vs_200dma = (px - avg) / avg;
+  }
 
   return {
     ticker,
-    sector,
-    industry,
     fundamentals: {
-      roic_3y: null,
-      op_margin: opMargin ?? null,
-      rev_cagr_3y: null,
-      fcf_to_ebit: null,
-      rnd_to_sales_quantile: 0.5,
-      net_debt_to_ebitda: null,
-      current_ratio: null,
-      interest_coverage: null,
-      dilution_3y: null,
-      fcf_positive_last4: null,
+      // Sans états financiers publics fiables/no-key, on laisse à null pour MVP
+      op_margin: null,
       fcf_yield: null,
-      pe_vs_sector: null,
-      ev_ebitda_vs_sector: null,
-      gross_margin_yoy_delta: null,
-      receivables_to_sales_yoy_delta: null,
-      short_term_debt_gt_cash: false,
-      audit_concern: false,
     },
     prices: {
-      px: price,
+      px,
       px_vs_200dma,
-      rs_6m_vs_sector_percentile: 0.5,
+      rs_6m_vs_sector_percentile: 0.5, // neutre
       eps_revisions_3m: 0,
     },
   };
 }
 
-async function fetchJson(url: string, headers: Record<string, string>) {
-  const r = await fetch(url, { headers });
-  if (!r.ok) throw new Error(`HTTP ${r.status} on ${url}`);
-  return r.json();
+function makeStooqCandidates(ticker: string): string[] {
+  // Stooq utilise des symboles lowercase, souvent suffixés .us pour US.
+  // Heuristiques simples :
+  const t = ticker.toLowerCase();
+  const out = new Set<string>();
+
+  // 1) tel quel
+  out.add(t);
+
+  // 2) version US
+  out.add(`${t}.us`);
+
+  // 3) remplacements fréquents (ex: BRK.B -> brk-b.us)
+  out.add(`${t.replace(/\./g, "-")}.us`);
+  out.add(t.replace(/\./g, "-"));
+
+  // 4) cas Euronext/PA déjà suffixé
+  // (si l'utilisateur tape OR.PA, garde "or.pa")
+  if (/\.[a-z]{2,3}$/.test(t)) out.add(t);
+
+  return Array.from(out);
 }
 
+async function fetchCsv(url: string): Promise<string> {
+  const r = await fetch(url, {
+    headers: {
+      "User-Agent": "Mozilla/5.0 (compatible; StockAnalyzer/1.0)",
+      "Accept": "text/csv, text/plain, */*",
+      "Cache-Control": "no-cache",
+    },
+  });
+  if (!r.ok) throw new Error(`HTTP ${r.status} on ${url}`);
+  return r.text();
+}
 
-// ------------------------------ Scoring minimal ------------------------------
+function parseStooqCsv(csv: string): { dates: string[]; closes: number[] } {
+  // CSV format: Date,Open,High,Low,Close,Volume
+  const lines = csv.trim().split(/\r?\n/);
+  if (lines.length <= 1) return { dates: [], closes: [] };
 
+  const header = lines[0].split(",");
+  const idxDate = header.indexOf("Date");
+  const idxClose = header.indexOf("Close");
+
+  const dates: string[] = [];
+  const closes: number[] = [];
+
+  for (let i = 1; i < lines.length; i++) {
+    const parts = lines[i].split(",");
+    const d = parts[idxDate];
+    const c = parseFloat(parts[idxClose]);
+    if (d && Number.isFinite(c)) {
+      dates.push(d);
+      closes.push(c);
+    }
+  }
+  return { dates, closes };
+}
+
+/* =======================================================================================
+   Scoring minimal (tolérant aux nulls)
+======================================================================================= */
 function clip(x: number, lo: number, hi: number) {
   return Math.max(lo, Math.min(hi, x));
 }
@@ -190,17 +201,20 @@ function computeScore(data: DataBundle) {
   const f = data.fundamentals;
   const p = data.prices;
 
-  // Qualité (0..35)
+  // Qualité (0..35) — pas de data fiable => 0
   let q = 0;
   if (typeof f.op_margin === "number") {
     q += f.op_margin >= 0.25 ? 8 : f.op_margin >= 0.15 ? 6 : f.op_margin >= 0.05 ? 3 : 0;
   }
 
-  // Sécurité (0..25)
+  // Sécurité (0..25) — inconnu => 0
   let s = 0;
 
-  // Valorisation (0..25)
+  // Valorisation (0..25) — inconnu => 0
   let v = 0;
+  if (typeof f.fcf_yield === "number") {
+    v += f.fcf_yield > 0.06 ? 10 : f.fcf_yield >= 0.04 ? 7 : f.fcf_yield >= 0.02 ? 4 : 1;
+  }
 
   // Momentum (0..15)
   let m = 0;
@@ -215,16 +229,15 @@ function computeScore(data: DataBundle) {
     momentum: clip(m, 0, 15),
   };
 
-  let malus = 0;
-
+  const malus = 0;
   return { subscores, malus };
 }
 
 function buildReasons(_data: DataBundle, subs: Record<string, number>) {
   const reasons: string[] = [];
-  if (isHigh(subs.quality, 20)) reasons.push("Qualité opérationnelle décente (proxy marges)");
   if (isHigh(subs.momentum, 6)) reasons.push("Cours au-dessus de la moyenne 200 jours");
-  if (isHigh(subs.valuation, 7)) reasons.push("Valorisation potentiellement attractive (proxy FCF)");
+  if (isHigh(subs.valuation, 7)) reasons.push("Valorisation potentiellement attractive (proxy)");
+  if (isHigh(subs.quality, 20)) reasons.push("Qualité opérationnelle décente (proxy)");
   if (!reasons.length) reasons.push("Données limitées (mode gratuit) : vérifiez les détails");
   return reasons;
 
