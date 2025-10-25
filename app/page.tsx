@@ -5,21 +5,31 @@ import { useEffect, useMemo, useRef, useState } from "react";
 /* ====================== Types ====================== */
 type ScoreResponse = {
   ticker: string;
+  company_name?: string | null;
+  exchange?: string | null;
+
   score: number;          // brut 0..100
   score_adj?: number;     // normalisé 0..100 (affiché)
   color: "green" | "orange" | "red";
   verdict: "sain" | "a_surveiller" | "fragile";
   verdict_reason: string;
+
   reasons_positive: string[];
   red_flags: string[];
+
   subscores: Record<string, number>; // { quality:0..35, safety:0..25, valuation:0..25, momentum:0..15 }
   coverage: number;       // "Couverture des données" (0..100)
+
   proof?: {
     price_source?: string;
     price_points?: number;
     price_has_200dma: boolean;
     price_recency_days?: number | null;
+    price_last_date?: string | null;
+
     valuation_used?: boolean;
+    valuation_metric?: "FCFY" | "EY" | null;
+
     sources_used?: string[];
   };
   ratios?: {
@@ -98,9 +108,16 @@ export default function Page() {
       url.searchParams.set("ticker", sym);
       history.replaceState(null, "", url.toString());
 
-      // méta affichage si fourni
-      if (meta) setSelected(meta);
-      else setSelected((prev) => ({ symbol: sym, name: prev?.name, exchange: prev?.exchange }));
+      // méta affichage si fourni, sinon fallback sur API (company_name/exchange)
+      if (meta) {
+        setSelected(meta);
+      } else {
+        setSelected({
+          symbol: sym,
+          name: json.company_name ?? undefined,
+          exchange: json.exchange ?? undefined,
+        });
+      }
     } catch (e: any) {
       setError(e?.message || "Erreur inconnue");
     } finally {
@@ -175,19 +192,39 @@ export default function Page() {
   const onEnter = (e: React.KeyboardEvent<HTMLInputElement>) => {
     if (e.key === "Enter") {
       setShowSug(false);
-      // si pas choisi depuis la liste, on reset le "selected" pour éviter anciens noms
       lookup(undefined, { symbol: q });
       inputRef.current?.blur();
     }
   };
+
+  const verdictBadge = useMemo(() => {
+    if (!data) return null;
+    const map = {
+      sain: { label: "ENTREPRISE SOLIDE", classes: "bg-emerald-500/10 text-emerald-300 border-emerald-600/50" },
+      a_surveiller: { label: "ENTREPRISE À SURVEILLER", classes: "bg-amber-500/10 text-amber-300 border-amber-600/50" },
+      fragile: { label: "ENTREPRISE FRAGILE", classes: "bg-rose-500/10 text-rose-300 border-rose-600/50" },
+    } as const;
+    const v = map[data.verdict];
+    return <span className={`px-2.5 py-1 rounded-full text-xs border ${v.classes}`}>{v.label}</span>;
+  }, [data]);
 
   function barColor(score: number) {
     if (score >= 70) return "bg-emerald-500";
     if (score >= 50) return "bg-amber-500";
     return "bg-rose-500";
   }
+
   function fmtPct(x?: number | null) {
     return typeof x === "number" ? `${(x * 100).toFixed(1)}%` : "—";
+  }
+  // Clamp visuel pour éviter des chiffres absurdes (ex : ROIC proxy)
+  function fmtPctClamped(x?: number | null, capAbs = 2.0) {
+    if (typeof x !== "number") return "—";
+    const capped = Math.max(-capAbs, Math.min(capAbs, x));
+    const s = `${(capped * 100).toFixed(1)}%`;
+    if (x > capAbs) return `> ${s}`;
+    if (x < -capAbs) return `< ${s}`;
+    return s;
   }
 
   // libellés piliers + dénominateurs
@@ -199,7 +236,7 @@ export default function Page() {
     momentum: "Momentum / Tendance",
   };
 
-  // texte d’interprétation sous la note (à gauche)
+  // texte d’interprétation sous le titre
   const interpretation = useMemo(() => {
     if (!data) return "";
     const shown = data.score_adj ?? data.score;
@@ -207,13 +244,6 @@ export default function Page() {
     if (shown >= 50) return "Profil correct avec des points à surveiller.";
     return "Profil fragile ou données partielles.";
   }, [data]);
-
-  // helpers verdict inline
-  const verdictLabel = (v: ScoreResponse["verdict"]) =>
-    v === "sain" ? "ENTREPRISE SOLIDE" : v === "a_surveiller" ? "ENTREPRISE À SURVEILLER" : "ENTREPRISE FRAGILE";
-
-  const verdictClass = (c: ScoreResponse["color"]) =>
-    c === "green" ? "text-emerald-400" : c === "orange" ? "text-amber-400" : "text-rose-400";
 
   /* ====================== Render ====================== */
   return (
@@ -343,50 +373,47 @@ export default function Page() {
           {/* Left: Score & pillars */}
           <div className="lg:col-span-2">
             <div className="rounded-3xl border border-slate-800 bg-gradient-to-b from-slate-900/60 to-slate-900/30 p-6 md:p-7">
-              {/* Header: nom */}
+              {/* Header line: name + chips */}
               <div className="flex items-start gap-4">
                 <div className="flex-1">
                   <div className="flex items-center gap-3 flex-wrap">
                     <h2 className="text-2xl font-semibold tracking-tight">
                       {selected?.name
                         ? `${selected.name}${selected.exchange ? " — " + selected.exchange?.toUpperCase() : ""}`
-                        : data.ticker.toUpperCase()}
+                        : (data.company_name
+                            ? `${data.company_name}${data.exchange ? " — " + data.exchange?.toUpperCase() : ""}`
+                            : data.ticker.toUpperCase())}
                     </h2>
+
+                    {/* >>> ICI : Couverture PUIS badge verdict (déplacé) <<< */}
+                    <abbr title="Estimation de la part des données réellement disponibles pour calculer la note finale.">
+                      <span className="text-xs px-2 py-0.5 rounded-full border border-slate-700 text-slate-300">
+                        Couverture des données&nbsp;: {data.coverage}%
+                      </span>
+                    </abbr>
+                    {verdictBadge}
                   </div>
 
-                  {/* Couverture + Verdict (inline) */}
-                  <div className="mt-1 flex flex-wrap items-center gap-2 text-xs">
-                    <span className="px-2 py-0.5 rounded-full border border-slate-700 text-slate-300">
-                      Couverture des données : {data.coverage}%
-                    </span>
-                    <span className="opacity-40">|</span>
-                    <span className={verdictClass(data.color)}>
-                      {verdictLabel(data.verdict)}
-                    </span>
-                  </div>
+                  {/* Interpretation (à gauche) */}
+                  <div className="mt-2 text-slate-300 text-sm">{interpretation}</div>
+                </div>
 
-                  {/* Score line */}
-                  <div className="mt-3 flex items-end gap-4 flex-wrap">
-                    <div>
-                      <div className="text-4xl font-extrabold tabular-nums">
-                        {data.score_adj ?? data.score}
-                        <span className="text-lg text-slate-400">/100</span>
-                      </div>
-                      <div className="mt-1 text-sm text-slate-300">
-                        {interpretation}
-                      </div>
-                      <div className="mt-1 text-xs text-slate-500">
-                        Note brute&nbsp;: {data.score}/100
-                      </div>
-                    </div>
-                    <div className="flex-1 min-w-[220px]">
-                      <div className="h-2 rounded-full bg-slate-800 overflow-hidden">
-                        <div
-                          className={`h-full ${barColor(data.score_adj ?? data.score)}`}
-                          style={{ width: `${Math.min(100, data.score_adj ?? data.score)}%` }}
-                        />
-                      </div>
-                    </div>
+                {/* Score block (en haut à droite) */}
+                <div className="w-40 shrink-0">
+                  <div className="text-4xl font-extrabold tabular-nums text-right">
+                    {data.score_adj ?? data.score}
+                    <span className="text-lg text-slate-400">/100</span>
+                  </div>
+                  <div className="mt-2 h-2 rounded-full bg-slate-800 overflow-hidden">
+                    <div
+                      className={`h-full ${barColor(data.score_adj ?? data.score)}`}
+                      style={{ width: `${Math.min(100, data.score_adj ?? data.score)}%` }}
+                    />
+                  </div>
+                  <div className="mt-1 text-right text-xs text-slate-500">
+                    <abbr title="Note brute issue de la somme des sous-scores, sans normalisation par la couverture.">
+                      Note brute&nbsp;: {data.score}/100
+                    </abbr>
                   </div>
                 </div>
               </div>
@@ -398,21 +425,26 @@ export default function Page() {
                   {Object.entries(data.subscores || {}).map(([k, v]) => {
                     const max = PILLAR_MAX[k] ?? 10;
                     const pct = Math.max(0, Math.min(100, (v / max) * 100));
+                    const tips: Record<string, string> = {
+                      quality: "Rentabilité & efficacité opérationnelle",
+                      safety: "Liquidité, levier & trésorerie",
+                      valuation: "Rendement FCF / bénéfices vs prix",
+                      momentum: "Prix vs moyenne mobile 200 jours + performance récente",
+                    };
                     return (
                       <div key={k} className="p-4 rounded-2xl bg-slate-900/40 border border-slate-800">
                         <div className="flex items-center justify-between">
-                          <div className="text-sm">{PILLAR_LABEL[k] || k}</div>
-                          <div className="text-sm font-semibold tabular-nums">{Math.round(v)} / {max}</div>
+                          <abbr title={tips[k] || ""} className="no-underline">
+                            <div className="text-sm">{PILLAR_LABEL[k] || k}</div>
+                          </abbr>
+                          <abbr title={`Sous-score ${PILLAR_LABEL[k] || k}: ${Math.round(v)} sur ${max}`} className="no-underline">
+                            <div className="text-sm font-semibold tabular-nums">{Math.round(v)} / {max}</div>
+                          </abbr>
                         </div>
                         <div className="mt-2 h-2 rounded-full bg-slate-800 overflow-hidden">
                           <div className="h-full bg-slate-300" style={{ width: `${pct}%` }} />
                         </div>
-                        <div className="mt-1 text-xs text-slate-500">
-                          {k === "quality" && "Rentabilité & efficacité opérationnelle"}
-                          {k === "safety" && "Liquidité, levier & trésorerie"}
-                          {k === "valuation" && "Rendement FCF / bénéfices vs prix"}
-                          {k === "momentum" && "Prix vs 200j + performance récente"}
-                        </div>
+                        <div className="mt-1 text-xs text-slate-500">{tips[k]}</div>
                       </div>
                     );
                   })}
@@ -447,7 +479,7 @@ export default function Page() {
                         </li>
                       ))
                     ) : (
-                      <li className="text-slate-400 text-sm">Aucune limite majeure détectée</li>
+                      <li className="text-slate-400 text-sm">Aucun point de vigilance majeur détecté</li>
                     )}
                   </ul>
                 </div>
@@ -457,10 +489,10 @@ export default function Page() {
               <div className="mt-6">
                 <h3 className="text-sm uppercase tracking-wide text-slate-400">Ratios</h3>
                 <div className="mt-2 grid grid-cols-2 sm:grid-cols-4 gap-3">
-                  <RatioCard label="ROE" value={fmtPct(data.ratios?.roe)} />
-                  <RatioCard label="ROA" value={fmtPct(data.ratios?.roa)} />
-                  <RatioCard label="FCF / RN" value={fmtPct(data.ratios?.fcf_over_netincome)} />
-                  <RatioCard label="ROIC (approx.)" value={fmtPct(data.ratios?.roic)} />
+                  <RatioCard label="ROE" value={fmtPctClamped(data.ratios?.roe)} />
+                  <RatioCard label="ROA" value={fmtPctClamped(data.ratios?.roa)} />
+                  <RatioCard label="FCF / RN" value={fmtPctClamped(data.ratios?.fcf_over_netincome)} />
+                  <RatioCard label="ROIC (approx.)" value={fmtPctClamped(data.ratios?.roic)} />
                 </div>
               </div>
             </div>
@@ -488,16 +520,22 @@ export default function Page() {
                   {typeof data.proof?.price_recency_days === "number" && (
                     <Badge>Fraîcheur : {data.proof?.price_recency_days} j</Badge>
                   )}
+                  {data.proof?.price_last_date && <Badge>Dernier prix : {data.proof?.price_last_date}</Badge>}
                 </div>
               </div>
 
               {/* Valuation */}
               <div className="mt-3 p-3 rounded-2xl bg-slate-950/40 border border-slate-800">
                 <div className="text-xs text-slate-400">Valorisation utilisée</div>
-                <div className="mt-2">
+                <div className="mt-2 flex items-center gap-2">
                   <Badge variant={data.proof?.valuation_used ? "ok" : "warn"}>
                     {data.proof?.valuation_used ? "oui" : "non"}
                   </Badge>
+                  {data.proof?.valuation_metric && (
+                    <Badge variant="muted">
+                      Métrique : {data.proof.valuation_metric}
+                    </Badge>
+                  )}
                 </div>
               </div>
 
