@@ -66,6 +66,7 @@ type ScorePayload = {
     price_recency_days?: number | null;
     sec_used?: string[]; // taxonomies
     sec_note?: string | null;
+    valuation_used?: boolean;
   };
 
   // debug optionnel
@@ -139,6 +140,7 @@ export async function GET(
         price_recency_days: pricesAny.__recencyDays ?? null,
         sec_used: bundle.fundamentals.__taxonomies,
         sec_note: bundle.fundamentals.__note ?? null,
+        valuation_used: Boolean(sec.__valuationUsed),
       },
       // debug: { ...bundle.fundamentals, ...bundle.prices }
     };
@@ -205,7 +207,7 @@ async function fetchYahooChart(ticker: string): Promise<OHLCFeed | null> {
   return null;
 }
 
-// --- Helper JSON safe (AJOUTÉ) ---
+// --- Helper JSON safe ---
 async function fetchJsonSafe(url: string, headers: Record<string, string>) {
   try {
     const r = await fetch(url, { headers });
@@ -400,7 +402,6 @@ function pickBestUnit(units?: FactUnits, preferUSD = true): FactPoint[] | undefi
   return best ? sortByEnd(best) : undefined;
 }
 
-
 function sortByEnd(arr: FactPoint[]): FactPoint[] {
   return [...arr].sort((a, b) => parseEndDate(a.end) - parseEndDate(b.end));
 }
@@ -562,22 +563,34 @@ async function fetchFromSEC_US_IfPossible(ticker: string, lastPrice: number | nu
     fund.fcf_positive_last4 = countPos;
   }
 
-  // FCF yield (TTM si dispo)
+  // ----- Valuation : seulement si signal crédible & US-GAAP
+  const isUS = fund.__taxonomies?.includes("us-gaap");
+  const valuationOK = isUS && typeof lastPrice === "number" && cfoSeries && capSeries;
+
+  let __valuationUsed = false;
   const cfoTTM = sumLastNQuarterly(cfoSeries, 4) ?? lastAnnual(cfoSeries);
   const capTTM = sumLastNQuarterly(capSeries, 4) ?? lastAnnual(capSeries);
-  if (typeof lastPrice === "number" && typeof cfoTTM === "number" && typeof capTTM === "number") {
-    // market cap ~ price * latest shares
+  if (valuationOK && typeof cfoTTM === "number" && typeof capTTM === "number") {
     const shLast = lastVal(sharesSeries);
     if (typeof shLast === "number" && shLast > 0) {
       const mcap = lastPrice * shLast;
       if (mcap > 0) {
         const fcf = cfoTTM - Math.abs(capTTM);
-        fund.fcf_yield = fcf / mcap;
+        let y = fcf / mcap;
+        // clamp conservateur pour éviter les aberrations no-key
+        y = Math.max(-0.05, Math.min(0.08, y));
+        // n’activer la valuation que si FCF a été positif sur ≥ 2 des 4 dernières périodes
+        if (typeof fund.fcf_positive_last4 === "number" && fund.fcf_positive_last4 >= 2) {
+          fund.fcf_yield = y;
+          __valuationUsed = true;
+        } else {
+          fund.fcf_yield = null;
+        }
       }
     }
   }
 
-  return { fundamentals: fund };
+  return { fundamentals: fund, __valuationUsed };
 }
 
 /* ============================ Scoring (0..100) ============================ */
@@ -613,7 +626,7 @@ function computeScore(data: DataBundle) {
     s += f.fcf_positive_last4 >= 3 ? 4 : 0;
   }
 
-  // Valorisation (max 25)
+  // Valorisation (max 25) — uniquement si fcf_yield présent (déjà filtré & clampé)
   let v = 0, vMax = 0;
   if (typeof f.fcf_yield === "number") {
     vMax += 10;
