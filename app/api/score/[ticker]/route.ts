@@ -12,6 +12,10 @@ const CONTACT_EMAIL = process.env.CONTACT_EMAIL || "contact@example.com";
 
 /* ============================ Types ============================ */
 
+type FactPoint = { val: number; fy?: string; fp?: string; end?: string };
+type FactUnits = { [unit: string]: FactPoint[] };
+type Taxo = { [tag: string]: { units: FactUnits } };
+
 type Fundamentals = {
   op_margin: number | null;
   current_ratio: number | null;
@@ -30,12 +34,14 @@ type Prices = {
   pct_52w: number | null;       // position entre plus bas/plus haut 52 semaines (0..1)
   max_dd_1y: number | null;     // max drawdown sur 1 an (négatif)
   ret_20d: number | null;       // performance 20 jours
+  ret_60d: number | null;       // performance 60 jours (nouveau)
   rs_6m_vs_sector_percentile: number | null; // placeholder
   eps_revisions_3m: number | null;           // placeholder
 
   // métadonnées prix (optionnelles)
   __source?: "yahoo" | "stooq.com" | "stooq.pl";
   __points?: number; // nombre de clôtures utilisées
+  __recencyDays?: number; // fraicheur
 };
 
 type DataBundle = { ticker: string; fundamentals: Fundamentals; prices: Prices };
@@ -57,6 +63,7 @@ type ScorePayload = {
     price_source?: Prices["__source"];
     price_points?: number;
     price_has_200dma: boolean;
+    price_recency_days?: number | null;
     sec_used?: string[]; // taxonomies
     sec_note?: string | null;
   };
@@ -80,10 +87,10 @@ export async function GET(
   if (hit && hit.expires > now) return NextResponse.json(hit.data);
 
   try {
-    // 1) Prix (monde entier) → Yahoo Chart → Stooq .com → Stooq .pl
-    const pricesAny = await fetchPricesAny(t);
+    // 1) Prix (monde entier) → Yahoo Chart → Stooq .com → Stooq .pl (on retient la meilleure source)
+    const pricesAny = await fetchPricesBestOf(t);
 
-    // 2) Fondamentaux via SEC (US + foreign filers IFRS) si dispo
+    // 2) Fondamentaux via SEC (US + foreign filers IFRS) si dispo (avec giga fallback de tags)
     const sec = await fetchFromSEC_US_IfPossible(t, pricesAny.px);
 
     const bundle: DataBundle = {
@@ -111,7 +118,7 @@ export async function GET(
     const reasons = buildReasons(bundle, subscores);
     const flags = detectRedFlags(bundle);
 
-    // 4) Verdict simple (lisible en 2 secondes) — basé sur score ajusté + couverture
+    // 4) Verdict simple — basé sur score ajusté + couverture + momentum
     const { verdict, reason } = makeVerdict(bundle, subscores, coverage);
 
     const payload: ScorePayload = {
@@ -129,16 +136,11 @@ export async function GET(
         price_source: pricesAny.__source,
         price_points: pricesAny.__points,
         price_has_200dma: bundle.prices.px_vs_200dma !== null,
+        price_recency_days: pricesAny.__recencyDays ?? null,
         sec_used: bundle.fundamentals.__taxonomies,
         sec_note: bundle.fundamentals.__note ?? null,
       },
-      // Décommente pour diagnostiquer
-      // debug: {
-      //   ...bundle.fundamentals,
-      //   px_vs_200dma: bundle.prices.px_vs_200dma,
-      //   ret_20d: bundle.prices.ret_20d,
-      //   pct_52w: bundle.prices.pct_52w,
-      // }
+      // debug: { ...bundle.fundamentals, ...bundle.prices }
     };
 
     MEM[cacheKey] = { expires: now + TTL_MS, data: payload };
@@ -151,43 +153,131 @@ export async function GET(
   }
 }
 
-/* ============================ AGRÉGATEUR PRIX (monde entier) ============================ */
+/* ============================ PRIX : multi-sources + reconciliation ============================ */
 
-async function fetchPricesAny(ticker: string): Promise<Prices> {
-  // 1) Yahoo Chart
+type OHLCFeed = { dates: number[]; closes: number[]; source: Prices["__source"] };
+
+async function fetchPricesBestOf(ticker: string): Promise<Prices> {
+  const feeds: OHLCFeed[] = [];
+  try { const y = await fetchYahooChart(ticker); if (y) feeds.push(y); } catch {}
+  try { const s1 = await fetchStooq(ticker, "https://stooq.com"); if (s1) feeds.push(s1); } catch {}
+  try { const s2 = await fetchStooq(ticker, "https://stooq.pl"); if (s2) feeds.push(s2); } catch {}
+
+  if (!feeds.length) throw new Error(`Aucune donnée de prix pour ${ticker} (Yahoo+Stooq échecs)`);
+
+  // Choix de la meilleure source : la plus récente, sinon la plus dense
+  feeds.sort((a, b) => {
+    const recA = (a.dates?.[a.dates.length - 1] ?? 0);
+    const recB = (b.dates?.[b.dates.length - 1] ?? 0);
+    if (recA !== recB) return recB - recA;
+    return (b.closes.length - a.closes.length);
+  });
+  const best = feeds[0];
+
+  const enriched = enrichCloses(best.closes);
+  enriched.__source = best.source;
+  enriched.__points = best.closes.length;
+  enriched.__recencyDays = Math.round((Date.now() - best.dates[best.dates.length - 1]) / (1000 * 3600 * 24));
+  return enriched;
+}
+
+// Yahoo (dates + closes)
+async function fetchYahooChart(ticker: string): Promise<OHLCFeed | null> {
+  const headers = {
+    "User-Agent": "Mozilla/5.0 (compatible; StockAnalyzer/1.0)",
+    "Accept": "application/json, text/plain, */*",
+  };
+  const urls = [
+    `https://query1.finance.yahoo.com/v8/finance/chart/${encodeURIComponent(ticker)}?range=2y&interval=1d`,
+    `https://query2.finance.yahoo.com/v8/finance/chart/${encodeURIComponent(ticker)}?range=2y&interval=1d`,
+  ];
+  for (const url of urls) {
+    const js = await fetchJsonSafe(url, headers);
+    const res = js?.chart?.result?.[0];
+    if (!res) continue;
+    const ts: number[] = (res?.timestamp || []).map((t: number) => t * 1000);
+    const closes: number[] = (res?.indicators?.quote?.[0]?.close || []) as number[];
+    const adj: number[] = (res?.indicators?.adjclose?.[0]?.adjclose || []) as number[];
+    const raw = (closes?.filter(n => typeof n === "number")?.length ? closes : adj) || [];
+    const arr = raw.filter((n) => typeof n === "number" && Number.isFinite(n));
+    if (arr.length) return { dates: ts.slice(-arr.length), closes: arr, source: "yahoo" };
+  }
+  return null;
+}
+
+// Stooq (CSV -> dates + closes)
+async function fetchStooq(ticker: string, origin: "https://stooq.com" | "https://stooq.pl"): Promise<OHLCFeed | null> {
+  const candidates = makeStooqCandidates(ticker);
+  for (const sym of candidates) {
+    const urlDaily = `${origin}/q/d/l/?s=${encodeURIComponent(sym)}&i=d`;
+    const csvDaily = await fetchCsvSafe(urlDaily);
+    const parsedDaily = csvDaily ? parseStooqCsv(csvDaily) : null;
+    if (parsedDaily?.closes?.length) return { ...parsedDaily, source: origin.endsWith(".pl") ? "stooq.pl" : "stooq.com" };
+
+    const urlSnap = `${origin}/q/l/?s=${encodeURIComponent(sym)}&f=sd2t2ohlcv&h&e=csv`;
+    const csvSnap = await fetchCsvSafe(urlSnap);
+    const parsedSnap = csvSnap ? parseStooqLiteCsv(csvSnap) : null;
+    if (parsedSnap?.closes?.length) return { ...parsedSnap, source: origin.endsWith(".pl") ? "stooq.pl" : "stooq.com" };
+  }
+  return null;
+}
+function makeStooqCandidates(ticker: string): string[] {
+  const t = ticker.toLowerCase();
+  const out = new Set<string>();
+  out.add(t);
+  out.add(`${t}.us`);
+  out.add(t.replace(/\./g, "-"));
+  out.add(`${t.replace(/\./g, "-")}.us`);
+  if (/\.[a-z]{2,3}$/.test(t)) out.add(t);
+  return Array.from(out);
+}
+async function fetchCsvSafe(url: string): Promise<string | null> {
   try {
-    const y = await fetchYahooChartCloses(ticker);
-    if (y && y.length) {
-      const enriched = enrichCloses(y);
-      enriched.__source = "yahoo";
-      enriched.__points = y.length;
-      return enriched;
+    const r = await fetch(url, {
+      headers: {
+        "User-Agent": "Mozilla/5.0 (compatible; StockAnalyzer/1.0)",
+        "Accept": "text/csv, text/plain, */*",
+        "Cache-Control": "no-cache",
+      },
+    });
+    if (!r.ok) return null;
+    return await r.text();
+  } catch { return null; }
+}
+function parseStooqCsv(csv: string): { dates: number[]; closes: number[] } {
+  const lines = csv.trim().split(/\r?\n/);
+  if (lines.length <= 1) return { dates: [], closes: [] };
+  const header = lines[0].split(",");
+  const idxDate = header.indexOf("Date");
+  const idxClose = header.indexOf("Close");
+  const dates: number[] = [];
+  const closes: number[] = [];
+  for (let i = 1; i < lines.length; i++) {
+    const parts = lines[i].split(",");
+    const d = parts[idxDate];
+    const c = parseFloat(parts[idxClose]);
+    if (d && Number.isFinite(c)) {
+      dates.push(new Date(d).getTime());
+      closes.push(c);
     }
-  } catch {}
-
-  // 2) Stooq (.com)
-  try {
-    const closes = await fetchStooqCloses(ticker, "https://stooq.com");
-    if (closes && closes.length) {
-      const enriched = enrichCloses(closes);
-      enriched.__source = "stooq.com";
-      enriched.__points = closes.length;
-      return enriched;
+  }
+  return { dates, closes };
+}
+function parseStooqLiteCsv(csv: string): { dates: number[]; closes: number[] } {
+  const lines = csv.trim().split(/\r?\n/);
+  if (lines.length <= 1) return { dates: [], closes: [] };
+  const dates: number[] = [];
+  const closes: number[] = [];
+  for (let i = 1; i < lines.length; i++) {
+    const parts = lines[i].split(",");
+    const d = parts[1];
+    const c = parseFloat(parts[6]);
+    if (d && Number.isFinite(c)) {
+      dates.push(new Date(d).getTime());
+      closes.push(c);
     }
-  } catch {}
-
-  // 3) Stooq (.pl)
-  try {
-    const closes = await fetchStooqCloses(ticker, "https://stooq.pl");
-    if (closes && closes.length) {
-      const enriched = enrichCloses(closes);
-      enriched.__source = "stooq.pl";
-      enriched.__points = closes.length;
-      return enriched;
-    }
-  } catch {}
-
-  throw new Error(`Aucune donnée de prix pour ${ticker} (Yahoo+Stooq échecs)`);
+  }
+  return { dates, closes };
 }
 
 function enrichCloses(closes: number[]): Prices {
@@ -199,6 +289,7 @@ function enrichCloses(closes: number[]): Prices {
       pct_52w: null,
       max_dd_1y: null,
       ret_20d: null,
+      ret_60d: null,
       rs_6m_vs_sector_percentile: null,
       eps_revisions_3m: null,
     };
@@ -231,13 +322,16 @@ function enrichCloses(closes: number[]): Prices {
     max_dd_1y = mdd; // négatif
   }
 
-  // 20d return
+  // 20d & 60d return
   let ret_20d: number | null = null;
-  if (closes.length >= 21) {
-    const prev = closes[closes.length - 21];
-    if (typeof prev === "number" && prev > 0 && typeof px === "number") {
-      ret_20d = px / prev - 1;
-    }
+  let ret_60d: number | null = null;
+  if (closes.length >= 21 && typeof px === "number") {
+    const prev20 = closes[closes.length - 21];
+    if (typeof prev20 === "number" && prev20 > 0) ret_20d = px / prev20 - 1;
+  }
+  if (closes.length >= 61 && typeof px === "number") {
+    const prev60 = closes[closes.length - 61];
+    if (typeof prev60 === "number" && prev60 > 0) ret_60d = px / prev60 - 1;
   }
 
   return {
@@ -246,110 +340,13 @@ function enrichCloses(closes: number[]): Prices {
     pct_52w,
     max_dd_1y,
     ret_20d,
+    ret_60d,
     rs_6m_vs_sector_percentile: 0.5, // placeholder
     eps_revisions_3m: 0,              // placeholder
   };
 }
 
-// ---------- Yahoo Chart ----------
-async function fetchYahooChartCloses(ticker: string): Promise<number[] | null> {
-  const headers = {
-    "User-Agent": "Mozilla/5.0 (compatible; StockAnalyzer/1.0)",
-    "Accept": "application/json, text/plain, */*",
-  };
-  let js = await fetchJsonSafe(
-    `https://query1.finance.yahoo.com/v8/finance/chart/${encodeURIComponent(ticker)}?range=2y&interval=1d`,
-    headers
-  );
-  if (!js) {
-    js = await fetchJsonSafe(
-      `https://query2.finance.yahoo.com/v8/finance/chart/${encodeURIComponent(ticker)}?range=2y&interval=1d`,
-      headers
-    );
-  }
-  if (!js) return null;
-  const res = js?.chart?.result?.[0];
-  if (!res) return null;
-  const closes: number[] = (res?.indicators?.quote?.[0]?.close || []) as number[];
-  const adj: number[] = (res?.indicators?.adjclose?.[0]?.adjclose || []) as number[];
-  const arr = (closes?.filter(n => typeof n === "number")?.length ? closes : adj) || [];
-  return arr.filter((n) => typeof n === "number" && Number.isFinite(n));
-}
-async function fetchJsonSafe(url: string, headers: Record<string, string>) {
-  try { const r = await fetch(url, { headers }); if (!r.ok) return null; return await r.json(); }
-  catch { return null; }
-}
-
-// ---------- Stooq ----------
-async function fetchStooqCloses(ticker: string, origin: "https://stooq.com" | "https://stooq.pl") {
-  const candidates = makeStooqCandidates(ticker);
-  for (const sym of candidates) {
-    const urlDaily = `${origin}/q/d/l/?s=${encodeURIComponent(sym)}&i=d`;
-    const csvDaily = await fetchCsvSafe(urlDaily);
-    const parsedDaily = csvDaily ? parseStooqCsv(csvDaily) : null;
-    if (parsedDaily?.closes?.length) return parsedDaily.closes;
-
-    const urlSnap = `${origin}/q/l/?s=${encodeURIComponent(sym)}&f=sd2t2ohlcv&h&e=csv`;
-    const csvSnap = await fetchCsvSafe(urlSnap);
-    const parsedSnap = csvSnap ? parseStooqLiteCsv(csvSnap) : null;
-    if (parsedSnap?.closes?.length) return parsedSnap.closes;
-  }
-  return null;
-}
-function makeStooqCandidates(ticker: string): string[] {
-  const t = ticker.toLowerCase();
-  const out = new Set<string>();
-  out.add(t);
-  out.add(`${t}.us`);
-  out.add(t.replace(/\./g, "-"));
-  out.add(`${t.replace(/\./g, "-")}.us`);
-  if (/\.[a-z]{2,3}$/.test(t)) out.add(t);
-  return Array.from(out);
-}
-async function fetchCsvSafe(url: string): Promise<string | null> {
-  try {
-    const r = await fetch(url, {
-      headers: {
-        "User-Agent": "Mozilla/5.0 (compatible; StockAnalyzer/1.0)",
-        "Accept": "text/csv, text/plain, */*",
-        "Cache-Control": "no-cache",
-      },
-    });
-    if (!r.ok) return null;
-    return await r.text();
-  } catch { return null; }
-}
-function parseStooqCsv(csv: string): { dates: string[]; closes: number[] } {
-  const lines = csv.trim().split(/\r?\n/);
-  if (lines.length <= 1) return { dates: [], closes: [] };
-  const header = lines[0].split(",");
-  const idxDate = header.indexOf("Date");
-  const idxClose = header.indexOf("Close");
-  const dates: string[] = [];
-  const closes: number[] = [];
-  for (let i = 1; i < lines.length; i++) {
-    const parts = lines[i].split(",");
-    const d = parts[idxDate];
-    const c = parseFloat(parts[idxClose]);
-    if (d && Number.isFinite(c)) { dates.push(d); closes.push(c); }
-  }
-  return { dates, closes };
-}
-function parseStooqLiteCsv(csv: string): { dates: string[]; closes: number[] } {
-  const lines = csv.trim().split(/\r?\n/);
-  if (lines.length <= 1) return { dates: [], closes: [] };
-  const dates: string[] = [];
-  const closes: number[] = [];
-  for (let i = 1; i < lines.length; i++) {
-    const parts = lines[i].split(",");
-    const d = parts[1];
-    const c = parseFloat(parts[6]);
-    if (d && Number.isFinite(c)) { dates.push(d); closes.push(c); }
-  }
-  return { dates, closes };
-}
-
-/* ============================ SEC EDGAR (US + IFRS foreign filers) ============================ */
+/* ============================ SEC EDGAR (US + IFRS) : giga fallback ============================ */
 
 let TICKER_MAP: Record<string, { cik_str: number; ticker: string; title: string }> = {};
 let TICKER_MAP_EXP = 0;
@@ -373,20 +370,51 @@ async function loadTickerMap(): Promise<Record<string, { cik_str: number; ticker
   return TICKER_MAP;
 }
 
-type FactUnits = { [unit: string]: Array<{ val: number; fy?: string; fp?: string; end?: string }> };
-type Taxo = { [tag: string]: { units: FactUnits } };
-
-function lastNum(arr?: any[], prop: string = "val") {
-  return Array.isArray(arr) && arr.length ? (arr[arr.length - 1]?.[prop] ?? null) : null;
+function parseEndDate(s?: string): number {
+  if (!s) return 0;
+  const t = Date.parse(s);
+  return Number.isFinite(t) ? t : 0;
 }
-function sumLastN(arr?: any[], n = 4) {
-  if (!Array.isArray(arr) || !arr.length) return null;
-  let s = 0, c = 0;
-  for (let i = arr.length - 1; i >= 0 && c < n; i--, c++) {
-    const v = arr[i]?.val; if (typeof v !== "number") return null;
+
+function pickBestUnit(units?: FactUnits, preferUSD = true): FactPoint[] | null {
+  if (!units) return null;
+  if (preferUSD && units.USD && units.USD.length) return sortByEnd(units.USD);
+  // sinon choisir l’unité avec le plus de points numériques
+  let best: FactPoint[] | null = null;
+  for (const [u, arr] of Object.entries(units)) {
+    const valid = Array.isArray(arr) ? arr.filter(p => typeof p?.val === "number") : [];
+    if (!valid.length) continue;
+    if (!best || valid.length > best.length) best = valid;
+  }
+  return best ? sortByEnd(best) : null;
+}
+
+function sortByEnd(arr: FactPoint[]): FactPoint[] {
+  return [...arr].sort((a, b) => parseEndDate(a.end) - parseEndDate(b.end));
+}
+
+function lastVal(arr?: FactPoint[]) {
+  return (arr && arr.length) ? arr[arr.length - 1].val ?? null : null;
+}
+
+function sumLastNQuarterly(arr?: FactPoint[], n = 4) {
+  if (!arr || !arr.length) return null;
+  const q = arr.filter(p => (p.fp || "").toUpperCase().startsWith("Q"));
+  if (q.length < n) return null;
+  let s = 0;
+  for (let i = q.length - n; i < q.length; i++) {
+    const v = q[i]?.val;
+    if (typeof v !== "number") return null;
     s += v;
   }
-  return c === n ? s : null;
+  return s;
+}
+
+function lastAnnual(arr?: FactPoint[]) {
+  if (!arr || !arr.length) return null;
+  const annual = arr.filter(p => !p.fp || (p.fp || "").toUpperCase() === "FY");
+  if (!annual.length) return null;
+  return annual[annual.length - 1].val ?? null;
 }
 
 async function fetchFromSEC_US_IfPossible(ticker: string, lastPrice: number | null) {
@@ -423,72 +451,98 @@ async function fetchFromSEC_US_IfPossible(ticker: string, lastPrice: number | nu
       Object.keys(usgaap).length ? "us-gaap" : null,
       Object.keys(ifrs).length ? "ifrs-full" : null,
     ].filter(Boolean) as string[];
-    fund.__note = "TTM si disponible, sinon dernière période disponible";
+    fund.__note = "TTM si disponible (somme Q), sinon dernier annuel.";
   } catch {
     return { fundamentals: fund };
   }
 
-  // Operating margin (TTM si possible)
-  const revUSD  = usgaap.RevenueFromContractWithCustomerExcludingAssessedTax?.units?.USD
-               || usgaap.Revenues?.units?.USD;
-  const opUSD   = usgaap.OperatingIncomeLoss?.units?.USD;
-  const revIFRS = ifrs.Revenue?.units?.USD
-               || ifrs.RevenueFromContractsWithCustomersExcludingAssessedTax?.units?.USD;
-  const opIFRS  = ifrs.OperatingProfitLoss?.units?.USD
-               || ifrs.ProfitLossFromOperatingActivities?.units?.USD;
+  // ----- Revenue & Operating Income (giga-fallback)
+  const revCandidates = [
+    usgaap.RevenueFromContractWithCustomerExcludingAssessedTax?.units,
+    usgaap.Revenues?.units,
+    ifrs.Revenue?.units,
+    ifrs.RevenueFromContractsWithCustomersExcludingAssessedTax?.units,
+  ];
+  const opIncCandidates = [
+    usgaap.OperatingIncomeLoss?.units,
+    ifrs.OperatingProfitLoss?.units,
+    ifrs.ProfitLossFromOperatingActivities?.units,
+  ];
 
-  const revTTM = sumLastN(revUSD, 4) ?? sumLastN(revIFRS, 4);
-  const opTTM  = sumLastN(opUSD, 4)  ?? sumLastN(opIFRS, 4);
-  const revLast = lastNum(revUSD) ?? lastNum(revIFRS);
-  const opLast  = lastNum(opUSD)  ?? lastNum(opIFRS);
+  const revSeries = pickBestUnit(revCandidates.find(Boolean) as FactUnits | undefined);
+  const opSeries  = pickBestUnit(opIncCandidates.find(Boolean) as FactUnits | undefined);
 
-  const rev = (typeof revTTM === "number" ? revTTM : revLast);
-  const op  = (typeof opTTM  === "number" ? opTTM  : opLast);
-  if (typeof rev === "number" && rev !== 0 && typeof op === "number") fund.op_margin = op / rev;
+  const revTTM = sumLastNQuarterly(revSeries, 4) ?? lastAnnual(revSeries);
+  const opTTM  = sumLastNQuarterly(opSeries, 4) ?? lastAnnual(opSeries);
 
-  // Current ratio
-  const caUSD = usgaap.AssetsCurrent?.units?.USD;
-  const clUSD = usgaap.LiabilitiesCurrent?.units?.USD;
-  const caIFR = ifrs.CurrentAssets?.units?.USD;
-  const clIFR = ifrs.CurrentLiabilities?.units?.USD;
-  const ca = lastNum(caUSD) ?? lastNum(caIFR);
-  const cl = lastNum(clUSD) ?? lastNum(clIFR);
-  if (typeof ca === "number" && typeof cl === "number" && cl !== 0) fund.current_ratio = ca / cl;
+  if (typeof revTTM === "number" && revTTM !== 0 && typeof opTTM === "number") {
+    fund.op_margin = opTTM / revTTM;
+  }
 
-  // Dilution 3 ans
-  const shUSD = usgaap.CommonStockSharesOutstanding?.units?.shares
-             || usgaap.EntityCommonStockSharesOutstanding?.units?.shares;
-  const shIFR = ifrs.NumberOfSharesOutstanding?.units?.shares
-             || ifrs.WeightedAverageNumberOfOrdinarySharesOutstandingDiluted?.units?.shares;
-  const sharesArr = shUSD || shIFR;
-  if (Array.isArray(sharesArr) && sharesArr.length >= 2) {
-    const last = sharesArr.at(-1)?.val;
-    const i0 = Math.max(0, sharesArr.length - 13);
-    const prev = sharesArr[i0]?.val;
+  // ----- Current ratio (CA / CL)
+  const caSeries = pickBestUnit(
+    (usgaap.AssetsCurrent?.units) ||
+    (ifrs.CurrentAssets?.units)
+  );
+  const clSeries = pickBestUnit(
+    (usgaap.LiabilitiesCurrent?.units) ||
+    (ifrs.CurrentLiabilities?.units)
+  );
+  const caLast = lastVal(caSeries);
+  const clLast = lastVal(clSeries);
+  if (typeof caLast === "number" && typeof clLast === "number" && clLast !== 0) {
+    fund.current_ratio = caLast / clLast;
+  }
+
+  // ----- Shares (dilution 3y) : liste élargie
+  const sharesUnits =
+    usgaap.CommonStockSharesOutstanding?.units ||
+    usgaap.EntityCommonStockSharesOutstanding?.units ||
+    ifrs.NumberOfSharesOutstanding?.units ||
+    ifrs.WeightedAverageNumberOfOrdinarySharesOutstandingDiluted?.units ||
+    ifrs.WeightedAverageNumberOfSharesOutstandingDiluted?.units;
+
+  const sharesSeries = pickBestUnit(sharesUnits as FactUnits | undefined, false);
+  if (sharesSeries && sharesSeries.length >= 2) {
+    const last = sharesSeries.at(-1)!.val;
+    // approx. 3y en arrière (12 trimestres si séries trimestrielles, sinon 2-4 annuels)
+    const idx = Math.max(0, sharesSeries.length - 13);
+    const prev = sharesSeries[idx]?.val;
     if (typeof last === "number" && typeof prev === "number" && prev > 0) {
       fund.dilution_3y = (last - prev) / prev;
     }
   }
 
-  // FCF + FCF yield
-  const cfoUSD = usgaap.NetCashProvidedByUsedInOperatingActivities?.units?.USD
-              || usgaap.NetCashProvidedByUsedInOperatingActivitiesContinuingOperations?.units?.USD;
-  const cfoIFR = ifrs.CashFlowsFromUsedInOperatingActivities?.units?.USD
-              || ifrs.CashFlowsFromUsedInOperations?.units?.USD;
-  const capexUSD = usgaap.PaymentsToAcquireProductiveAssets?.units?.USD
-                || usgaap.PurchasesOfPropertyPlantAndEquipment?.units?.USD;
-  const capexIFR = ifrs.PurchaseOfPropertyPlantAndEquipment?.units?.USD
-                || ifrs.AdditionsToPropertyPlantAndEquipment?.units?.USD;
+  // ----- CFO & CapEx (giga-fallback IFRS/USGAAP)
+  const cfoCandidates = [
+    usgaap.NetCashProvidedByUsedInOperatingActivities?.units,
+    usgaap.NetCashProvidedByUsedInOperatingActivitiesContinuingOperations?.units,
+    ifrs.CashFlowsFromUsedInOperatingActivities?.units,
+    (ifrs as any).NetCashFromOperatingActivities?.units,
+    (ifrs as any).CashFlowsFromOperationsBeforeChangesInWorkingCapital?.units,
+  ];
+  const capexCandidates = [
+    usgaap.PaymentsToAcquireProductiveAssets?.units,
+    usgaap.PurchasesOfPropertyPlantAndEquipment?.units,
+    ifrs.PurchaseOfPropertyPlantAndEquipment?.units,
+    (ifrs as any).AdditionsToPropertyPlantAndEquipment?.units,
+    (ifrs as any).PaymentsForPropertyPlantAndEquipment?.units,
+    (ifrs as any).CapitalExpenditureClassifiedByNature?.units,
+  ];
 
-  const cfoArr = cfoUSD || cfoIFR;
-  const capArr = capexUSD || capexIFR;
+  const cfoSeries = pickBestUnit(cfoCandidates.find(Boolean) as FactUnits | undefined);
+  const capSeries = pickBestUnit(capexCandidates.find(Boolean) as FactUnits | undefined);
 
-  if (Array.isArray(cfoArr) && Array.isArray(capArr)) {
-    const n = Math.min(4, Math.min(cfoArr.length, capArr.length));
+  // fcf_positive_last4 (quarterly si possible)
+  if (cfoSeries && capSeries) {
     let countPos = 0;
+    // prendre 4 dernières périodes alignées si possible, sinon on vérifie juste les 4 dernières valeurs disponibles
+    const cN = Math.min(4, cfoSeries.length);
+    const kN = Math.min(4, capSeries.length);
+    const n = Math.min(cN, kN);
     for (let i = 1; i <= n; i++) {
-      const cfo = cfoArr[cfoArr.length - i]?.val;
-      const cap = capArr[capArr.length - i]?.val;
+      const cfo = cfoSeries[cfoSeries.length - i]?.val;
+      const cap = capSeries[capSeries.length - i]?.val;
       if (typeof cfo === "number" && typeof cap === "number") {
         const fcf = cfo - Math.abs(cap);
         if (fcf > 0) countPos++;
@@ -497,14 +551,18 @@ async function fetchFromSEC_US_IfPossible(ticker: string, lastPrice: number | nu
     fund.fcf_positive_last4 = countPos;
   }
 
-  const lastCFO = lastNum(cfoArr);
-  const lastCap = lastNum(capArr);
-  const shLast  = Array.isArray(sharesArr) && sharesArr.length ? sharesArr.at(-1)?.val : null;
-  if (typeof lastPrice === "number" && typeof shLast === "number" && shLast > 0) {
-    const mcap = lastPrice * shLast;
-    if (typeof lastCFO === "number" && typeof lastCap === "number" && mcap > 0) {
-      const fcf = lastCFO - Math.abs(lastCap);
-      fund.fcf_yield = fcf / mcap;
+  // FCF yield (TTM si dispo)
+  const cfoTTM = sumLastNQuarterly(cfoSeries, 4) ?? lastAnnual(cfoSeries);
+  const capTTM = sumLastNQuarterly(capSeries, 4) ?? lastAnnual(capSeries);
+  if (typeof lastPrice === "number" && typeof cfoTTM === "number" && typeof capTTM === "number") {
+    // market cap ~ price * latest shares
+    const shLast = lastVal(sharesSeries);
+    if (typeof shLast === "number" && shLast > 0) {
+      const mcap = lastPrice * shLast;
+      if (mcap > 0) {
+        const fcf = cfoTTM - Math.abs(capTTM);
+        fund.fcf_yield = fcf / mcap;
+      }
     }
   }
 
@@ -555,9 +613,20 @@ function computeScore(data: DataBundle) {
   // Momentum (max 15)
   let m = 0, mMax = 0;
   if (typeof p.px_vs_200dma === "number") {
-    mMax = 15;
-    m = p.px_vs_200dma >= 0.05 ? 15 : p.px_vs_200dma > -0.05 ? 8 : 3;
+    mMax = 10; // 200DMA (10/15)
+    m += p.px_vs_200dma >= 0.05 ? 10 : p.px_vs_200dma > -0.05 ? 6 : 2;
   }
+  if (typeof p.ret_20d === "number") {
+    mMax += 3;
+    m += p.ret_20d > 0.03 ? 3 : p.ret_20d > 0 ? 2 : 0;
+  }
+  if (typeof p.ret_60d === "number") {
+    mMax += 2;
+    m += p.ret_60d > 0.06 ? 2 : p.ret_60d > 0 ? 1 : 0;
+  }
+  // clip sur 15 au cas où plusieurs signaux s’accumulent
+  m = Math.min(m, 15);
+  mMax = 15;
 
   const subscores = {
     quality: clip(q, 0, 35),
@@ -576,7 +645,7 @@ function buildReasons(_data: DataBundle, subs: Record<string, number>) {
   if (subs.quality >= 6) reasons.push("Marge opérationnelle décente");
   if (subs.safety >= 4) reasons.push("Bilans plutôt sains (ratio court terme / dilution / FCF)");
   if (subs.valuation >= 7) reasons.push("Rendement FCF potentiellement attractif");
-  if (subs.momentum >= 8) reasons.push("Cours au-dessus de la moyenne 200 jours");
+  if (subs.momentum >= 8) reasons.push("Cours au-dessus de la moyenne 200 jours et tendance récente positive");
   if (!reasons.length) reasons.push("Données limitées (mode gratuit) : vérifiez les détails");
   return reasons;
 }
@@ -592,10 +661,10 @@ function makeVerdict(
   subs: Record<string, number>,
   coverage: number
 ) {
-  // momentum ok si px > 200DMA ou ret_20d > 0
+  // momentum ok si px > 200DMA ou ret_60d > 0
   const momOK =
     (typeof d.prices.px_vs_200dma === "number" && d.prices.px_vs_200dma >= 0) ||
-    (typeof d.prices.ret_20d === "number" && d.prices.ret_20d > 0);
+    (typeof d.prices.ret_60d === "number" && d.prices.ret_60d > 0);
 
   // re-calcul local du score ajusté à partir des sous-scores et de la couverture effective
   const total = subs.quality + subs.safety + subs.valuation + subs.momentum;

@@ -16,6 +16,7 @@ type ScoreResponse = {
     price_source?: "yahoo" | "stooq.com" | "stooq.pl";
     price_points?: number;
     price_has_200dma: boolean;
+    price_recency_days?: number | null;
     sec_used?: string[];
     sec_note?: string | null;
   };
@@ -71,6 +72,19 @@ export default function Page() {
     if (e.key === "Enter") lookup();
   };
 
+  const coverageBadge = (cov?: number) => {
+    if (typeof cov !== "number") return null;
+    const level =
+      cov >= 70 ? "bg-green-600/20 text-green-300 border-green-600/40" :
+      cov >= 40 ? "bg-amber-600/20 text-amber-300 border-amber-600/40" :
+                  "bg-red-600/20 text-red-300 border-red-600/40";
+    return (
+      <span className={`px-2 py-1 text-xs rounded-full border ${level}`} title="Part des critères effectivement scorés">
+        Fiabilité {cov}%
+      </span>
+    );
+  };
+
   return (
     <main className="max-w-3xl mx-auto px-6 py-10">
       <h1 className="text-3xl font-bold tracking-tight">Stock Analyzer (no-key, global)</h1>
@@ -121,7 +135,10 @@ export default function Page() {
           <div className="p-5 rounded-2xl border border-slate-700 bg-slate-900/60">
             {/* Header + verdict */}
             <div className="flex items-center justify-between">
-              <h2 className="text-xl font-semibold">{data.ticker.toUpperCase()}</h2>
+              <div className="flex items-center gap-2">
+                <h2 className="text-xl font-semibold">{data.ticker.toUpperCase()}</h2>
+                {coverageBadge(data.coverage)}
+              </div>
               <div className="flex items-center gap-3">
                 <span
                   className={`px-2 py-1 text-xs rounded-full border ${
@@ -136,20 +153,18 @@ export default function Page() {
                   {data.verdict === "sain" ? "SAIN"
                     : data.verdict === "a_surveiller" ? "À SURVEILLER" : "FRAGILE"}
                 </span>
-                <span className="text-2xl font-bold tabular-nums">{data.score}/100</span>
+                {/* Mettre le score AJUSTÉ en avant */}
+                {"score_adj" in data && typeof data.score_adj === "number" ? (
+                  <span className="text-2xl font-bold tabular-nums">{data.score_adj}/100</span>
+                ) : (
+                  <span className="text-2xl font-bold tabular-nums">{data.score}/100</span>
+                )}
               </div>
             </div>
             <div className="text-xs text-slate-400 mt-1">{data.verdict_reason}</div>
 
-            {/* Coverage + adjusted */}
-            {"coverage" in data && typeof data.coverage === "number" && (
-              <div className="text-xs text-slate-400 mt-1">
-                Couverture des données : {data.coverage}% (mode gratuit)
-              </div>
-            )}
-            {"score_adj" in data && typeof data.score_adj === "number" && (
-              <div className="text-xs text-slate-400">Score ajusté (selon couverture) : {data.score_adj}/100</div>
-            )}
+            {/* Affiche aussi le score brut à côté, discret */}
+            <div className="text-xs text-slate-500">Score (brut): {data.score}/100</div>
 
             {/* Reasons + flags */}
             <div className="mt-4 grid grid-cols-2 gap-4">
@@ -185,8 +200,16 @@ export default function Page() {
               <details className="mt-4 text-xs text-slate-400">
                 <summary className="cursor-pointer">Preuves (sources & fraîcheur)</summary>
                 <div className="mt-2 space-y-1">
-                  <div>Prix: {data.proof.price_source || "—"}{data.proof.price_points ? ` · ${data.proof.price_points} points` : ""}{data.proof.price_has_200dma ? " · 200DMA OK" : ""}</div>
-                  <div>SEC: {data.proof.sec_used?.length ? data.proof.sec_used.join(", ") : "—"}{data.proof.sec_note ? ` · ${data.proof.sec_note}` : ""}</div>
+                  <div>
+                    Prix: {data.proof.price_source || "—"}
+                    {typeof data.proof.price_points === "number" ? ` · ${data.proof.price_points} points` : ""}
+                    {data.proof.price_has_200dma ? " · 200DMA OK" : ""}
+                    {typeof data.proof.price_recency_days === "number" ? ` · ${data.proof.price_recency_days}j` : ""}
+                  </div>
+                  <div>
+                    SEC: {data.proof.sec_used?.length ? data.proof.sec_used.join(", ") : "—"}
+                    {data.proof.sec_note ? ` · ${data.proof.sec_note}` : ""}
+                  </div>
                 </div>
               </details>
             )}
