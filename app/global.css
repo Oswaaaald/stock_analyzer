@@ -1,0 +1,28 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+/* Tweaks typographiques & lissage */
+html, body {
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
+}
+
+* {
+  outline-offset: 2px;
+}
+
+/* Carte “glassy” réutilisable si besoin */
+.card {
+  @apply rounded-3xl border border-slate-700/70 bg-slate-900/60 backdrop-blur shadow-elev;
+}
+
+/* Bouton gradient réutilisable */
+.btn-primary {
+  @apply px-5 py-2.5 rounded-xl font-semibold text-slate-900 transition;
+  background-image: linear-gradient(90deg, #22d3ee, #34d399);
+}
+
+input::placeholder {
+  @apply text-slate-500;
+}
