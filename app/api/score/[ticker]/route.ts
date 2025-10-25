@@ -162,16 +162,91 @@ export async function GET(req: Request, { params }: { params: { ticker: string }
     const bundle: DataBundle = { ticker: t, fundamentals, prices: priceFeed, sources_used };
     const { subscores, maxes } = computeScore(bundle);
 
-    // ===== Fiabilité (UI) basée sur les *maxes* réellement disponibles =====
-    // Chaque pilier est ramené à son plafond interne (8/6/10/15) puis mappé sur (35/25/25/15).
-    const covQuality = Math.min(1, (maxes.quality || 0) / 8) * 35;   // 0..35
-    const covSafety  = Math.min(1, (maxes.safety  || 0) / 6) * 25;   // 0..25
-    const covVal     = Math.min(1, (maxes.valuation|| 0) / 10) * 25; // 0..25
-    const covMom     = Math.min(1, (maxes.momentum || 0) / 15) * 15; // 0..15
-    const coverage_display = Math.round(covQuality + covSafety + covVal + covMom); // 0..100
+    /* ===== Fiabilité (UI) par pilier avec règles plus strictes & caps ===== */
+    const pts = priceFeed.meta?.points ?? 0;
+    const recency = priceFeed.meta?.recency_days ?? 999;
 
-    // ===== Couverture pour la normalisation du score (dénominateur) =====
-    // Somme des maxes effectivement disponibles (0..39)
+    // Présence des briques
+    const hasOp   = typeof fundamentals.op_margin.value === "number";
+    const hasROE  = fundamentals.roe?.value != null;
+    const hasROA  = fundamentals.roa?.value != null;
+    const hasROIC = fundamentals.roic?.value != null;
+
+    const hasCR   = fundamentals.current_ratio.value != null;
+    const hasNC   = fundamentals.net_cash.value != null;
+
+    const hasFCFY = fundamentals.fcf_yield.value != null;
+    const hasEY   = fundamentals.earnings_yield.value != null;
+
+    const has200  = typeof priceFeed.px_vs_200dma.value === "number" && pts >= 200;
+    const hasR20  = priceFeed.ret_20d.value != null;
+    const hasR60  = priceFeed.ret_60d.value != null;
+    const hasShortRet = hasR20 || hasR60;
+
+    // ---------- Qualité (35) ----------
+    // Noyau = op_margin (indispensable), + ROE/ROA (un des deux), + ROIC bonus
+    // Si op_margin manquant OU aucun ROE/ROA, cap à 70% du pilier.
+    let q_w = 0;
+    if (hasOp) q_w += 0.6;
+    if (hasROE || hasROA) q_w += 0.3;
+    if (hasROIC) q_w += 0.1;
+    let covQuality = q_w * 35;
+    if (!(hasOp && (hasROE || hasROA))) {
+      covQuality *= 0.7; // cap si noyau incomplet
+    }
+
+    // ---------- Sécurité (25) ----------
+    // current_ratio (0.7) + net_cash (0.3). Un seul présent => cap 70% du pilier.
+    let s_w = 0;
+    if (hasCR) s_w += 0.7;
+    if (hasNC) s_w += 0.3;
+    let covSafety = s_w * 25;
+    if ((hasCR ? 1 : 0) + (hasNC ? 1 : 0) === 1) {
+      covSafety *= 0.7; // cap si 1 seul signal sur 2
+    }
+
+    // ---------- Valorisation (25) ----------
+    // fcf_yield (0.7) + earnings_yield (0.3). Seulement EY => cap 70%.
+    let v_w = 0;
+    if (hasFCFY) v_w += 0.7;
+    if (hasEY)   v_w += 0.3;
+    let covVal = v_w * 25;
+    if (!hasFCFY && hasEY) {
+      covVal *= 0.7; // cap si pas de FCFY
+    }
+
+    // ---------- Momentum (15) ----------
+    // 200DMA (0.6) + ret_20d (0.2) + ret_60d (0.2)
+    // Si pas de 200DMA OU pas de ret courts => cap 75%. Si aucun ret court => cap 80%.
+    let m_w = 0;
+    if (has200) m_w += 0.6;
+    if (hasR20) m_w += 0.2;
+    if (hasR60) m_w += 0.2;
+    let covMom = m_w * 15;
+    if (!has200 || !hasShortRet) {
+      covMom *= 0.75;
+    }
+    if (!hasR20 && !hasR60) {
+      covMom *= 0.8; // un cran de plus si zéro retour court
+    }
+
+    // Somme brute (avant pénalités globales)
+    let coverage_display = Math.round(covQuality + covSafety + covVal + covMom);
+
+    // ---------- Pénalités globales (fraîcheur & densité) ----------
+    // Densité (points prix)
+    if (pts < 120)      coverage_display -= 10;
+    else if (pts < 240) coverage_display -= 5;
+
+    // Fraîcheur
+    if (recency > 14)      coverage_display -= 10;
+    else if (recency > 7)  coverage_display -= 5;
+
+    // Bornes finales
+    coverage_display = Math.max(5, Math.min(100, coverage_display));
+
+    /* ===== Score brut & ajusté ===== */
+    // Dénominateur = somme des *maxes réellement disponibles* (0..39)
     const denom = Math.max(
       1,
       Math.round(maxes.quality + maxes.safety + maxes.valuation + maxes.momentum)
