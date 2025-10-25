@@ -377,22 +377,21 @@ export default function Page() {
               <div className="flex items-start gap-4">
                 <div className="flex-1">
                   <div className="flex items-center gap-3 flex-wrap">
-                    <h2 className="text-2xl font-semibold tracking-tight">
-                      {selected?.name
-                        ? `${selected.name}${selected.exchange ? " — " + selected.exchange?.toUpperCase() : ""}`
-                        : (data.company_name
-                            ? `${data.company_name}${data.exchange ? " — " + data.exchange?.toUpperCase() : ""}`
-                            : data.ticker.toUpperCase())}
-                    </h2>
-
-                    {/* >>> ICI : Couverture PUIS badge verdict (déplacé) <<< */}
-                    <abbr title="Estimation de la part des données réellement disponibles pour calculer la note finale.">
-                      <span className="text-xs px-2 py-0.5 rounded-full border border-slate-700 text-slate-300">
-                        Couverture des données&nbsp;: {data.coverage}%
-                      </span>
-                    </abbr>
-                    {verdictBadge}
-                  </div>
+				  <h2 className="basis-full text-2xl font-semibold tracking-tight">
+				    {selected?.name
+				      ? `${selected.name}${selected.exchange ? " — " + selected.exchange?.toUpperCase() : ""}`
+				      : (data.company_name
+				          ? `${data.company_name}${data.exchange ? " — " + data.exchange?.toUpperCase() : ""}`
+				          : data.ticker.toUpperCase())}
+				  </h2>
+					
+				  <abbr title="Estimation de la part des données réellement disponibles pour calculer la note finale.">
+				    <span className="text-xs px-2 py-0.5 rounded-full border border-slate-700 text-slate-300">
+				      Couverture des données&nbsp;: {data.coverage}%
+				    </span>
+				  </abbr>
+				  {verdictBadge}
+				</div>
 
                   {/* Interpretation (à gauche) */}
                   <div className="mt-2 text-slate-300 text-sm">{interpretation}</div>
