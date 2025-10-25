@@ -6,12 +6,12 @@ type ScoreResponse = {
   score: number;
   score_adj?: number;
   color: "green" | "orange" | "red";
+  verdict: "sain" | "a_surveiller" | "fragile";
+  verdict_reason: string;
   reasons_positive: string[];
   red_flags: string[];
   subscores: Record<string, number>;
-  coverage?: number;
-  verdict: "sain" | "a_surveiller" | "fragile";
-  verdict_reason: string;
+  coverage: number;
   proof?: {
     price_source?: string;
     price_points?: number;
@@ -24,261 +24,354 @@ type ScoreResponse = {
   };
 };
 
-type SuggestItem = { symbol: string; shortname: string; exchDisp: string };
+const SUGGESTIONS = ["AAPL", "MSFT", "NVDA", "TSLA", "RMS.PA", "MC.PA", "ASML.AS"];
 
 export default function Page() {
   const [q, setQ] = useState("");
-  const [suggests, setSuggests] = useState<SuggestItem[]>([]);
   const [loading, setLoading] = useState(false);
   const [data, setData] = useState<ScoreResponse | null>(null);
   const [error, setError] = useState<string | null>(null);
 
-  // suggestions via /api/suggest (déjà présent chez toi)
+  // Pré-remplir depuis URL ?ticker=...
   useEffect(() => {
-    const t = setTimeout(async () => {
-      if (!q || q.trim().length < 2) { setSuggests([]); return; }
-      try {
-        const res = await fetch(`/api/suggest?q=${encodeURIComponent(q.trim())}`);
-        const js = await res.json();
-        setSuggests(js.items || []);
-      } catch { setSuggests([]); }
-    }, 200);
-    return () => clearTimeout(t);
-  }, [q]);
+    const sp = new URLSearchParams(location.search);
+    const t = sp.get("ticker");
+    if (t) {
+      setQ(t);
+      void lookup(t);
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
 
-  const lookup = async (symbol?: string) => {
-    const tick = (symbol || q).trim();
-    if (!tick) return;
+  async function lookup(ticker?: string) {
+    const sym = (ticker ?? q).trim();
+    if (!sym) return;
     setLoading(true);
     setError(null);
     setData(null);
     try {
-      const res = await fetch(`/api/score/${encodeURIComponent(tick)}`, { cache: "no-store" });
+      const res = await fetch(`/api/score/${encodeURIComponent(sym)}`, { cache: "no-store" });
       if (!res.ok) {
         const j = await res.json().catch(() => ({}));
         throw new Error(j?.error || `API ${res.status}`);
       }
       const json: ScoreResponse = await res.json();
-      setData(json); setSuggests([]); setQ(tick);
+      setData(json);
+      const url = new URL(location.href);
+      url.searchParams.set("ticker", sym);
+      history.replaceState(null, "", url.toString());
     } catch (e: any) {
       setError(e?.message || "Erreur inconnue");
     } finally {
       setLoading(false);
     }
+  }
+
+  const onEnter = (e: React.KeyboardEvent<HTMLInputElement>) => {
+    if (e.key === "Enter") lookup();
   };
 
-  const onEnter = (e: React.KeyboardEvent<HTMLInputElement>) => { if (e.key === "Enter") lookup(); };
-
-  // UI helpers
-  const scoreDisplay = useMemo(() => (!data ? 0 : typeof data.score_adj === "number" ? data.score_adj : data.score), [data]);
-
-  const verdictChip = (v: ScoreResponse["verdict"]) =>
-    v === "sain" ? "bg-green-600/20 text-green-300 border-green-500/40"
-      : v === "a_surveiller" ? "bg-amber-600/20 text-amber-300 border-amber-500/40"
-      : "bg-red-600/20 text-red-300 border-red-500/40";
-
-  const coverageBadge = (cov?: number) => {
-    if (typeof cov !== "number") return null;
-    const level =
-      cov >= 70 ? "bg-green-600/20 text-green-300 border-green-600/40" :
-      cov >= 40 ? "bg-amber-600/20 text-amber-300 border-amber-600/40" :
-                  "bg-red-600/20 text-red-300 border-red-600/40";
+  const verdictBadge = useMemo(() => {
+    if (!data) return null;
+    const map = {
+      sain: { label: "SAIN", classes: "bg-emerald-500/10 text-emerald-300 border-emerald-600/50" },
+      a_surveiller: { label: "À SURVEILLER", classes: "bg-amber-500/10 text-amber-300 border-amber-600/50" },
+      fragile: { label: "FRAGILE", classes: "bg-rose-500/10 text-rose-300 border-rose-600/50" },
+    } as const;
+    const v = map[data.verdict];
     return (
-      <span className={`px-2 py-1 text-xs rounded-full border ${level}`} title="Part des critères effectivement scorés">
-        Fiabilité {cov}%
+      <span className={`px-2.5 py-1 rounded-full text-xs border ${v.classes}`}>
+        {v.label}
       </span>
     );
-  };
+  }, [data]);
 
-  const ringStyle = useMemo(() => {
-    const pct = Math.max(0, Math.min(100, scoreDisplay));
-    const hue = pct >= 70 ? 140 : pct >= 40 ? 40 : 0;
-    const grad = `conic-gradient(hsl(${hue}deg 70% 50%) ${pct * 3.6}deg, rgba(148,163,184,.2) 0)`;
-    return { backgroundImage: grad };
-  }, [scoreDisplay]);
+  function barColor(score: number) {
+    if (score >= 70) return "bg-emerald-500";
+    if (score >= 50) return "bg-amber-500";
+    return "bg-rose-500";
+  }
 
   return (
-    <main className="min-h-screen bg-[radial-gradient(1200px_600px_at_10%_-10%,rgba(56,189,248,.15),transparent),radial-gradient(800px_400px_at_90%_-10%,rgba(94,234,212,.12),transparent)]">
-      <div className="max-w-4xl mx-auto px-6 py-10">
-        {/* Header */}
-        <header className="flex items-center justify-between">
-          <h1 className="text-3xl md:text-4xl font-extrabold tracking-tight bg-clip-text text-transparent bg-gradient-to-r from-sky-300 via-emerald-300 to-slate-200">
-            Stock Analyzer
-          </h1>
-          <div className="text-xs text-slate-400">no-key · global</div>
-        </header>
+    <main className="min-h-screen bg-slate-950 text-slate-100">
+      {/* Top bar */}
+      <header className="sticky top-0 z-30 backdrop-blur supports-[backdrop-filter]:bg-slate-950/60 bg-slate-950/90 border-b border-slate-800">
+        <div className="max-w-6xl mx-auto px-5 py-3 flex items-center gap-3">
+          <div className="w-2.5 h-2.5 rounded-full bg-sky-500 shadow-[0_0_18px] shadow-sky-500/70" />
+          <h1 className="text-lg md:text-xl font-semibold">Stock Analyzer</h1>
+          <span className="ml-2 text-xs px-2 py-0.5 rounded-full border border-slate-700 text-slate-300">
+            no-key · global
+          </span>
+          <div className="ml-auto hidden md:flex items-center gap-2 text-xs text-slate-400">
+            <span className="hidden sm:inline">Gratuit · sans API key</span>
+            <span className="opacity-40">|</span>
+            <span>200DMA, SEC/IFRS, Yahoo</span>
+          </div>
+        </div>
+      </header>
 
-        {/* Search */}
-        <div className="mt-8 relative">
-          <div className="flex items-center gap-2 rounded-2xl bg-slate-900/70 backdrop-blur border border-slate-700 px-3 py-2 shadow-lg ring-1 ring-black/20">
+      {/* Search */}
+      <section className="max-w-6xl mx-auto px-5 pt-8">
+        <div className="grid gap-4 md:grid-cols-[1fr_auto]">
+          <div className="flex rounded-2xl border border-slate-800 bg-slate-900/40 focus-within:ring-2 focus-within:ring-sky-500">
             <input
               value={q}
               onChange={(e) => setQ(e.target.value)}
               onKeyDown={onEnter}
-              placeholder="Rechercher : AAPL, RACE, OR.PA, 7203.T, TSLA…"
-              className="flex-1 bg-transparent px-3 py-3 outline-none placeholder:text-slate-500"
+              placeholder="Tapez un ticker… (AAPL, TSLA, RMS.PA, ASML.AS)"
+              className="flex-1 px-4 py-3.5 bg-transparent outline-none placeholder:text-slate-500"
             />
-            <button
-              onClick={() => lookup()}
-              disabled={!q || loading}
-              className="px-5 py-2.5 rounded-xl bg-gradient-to-r from-sky-500 to-emerald-500 text-slate-900 font-semibold hover:opacity-95 disabled:opacity-50 transition"
-            >
-              {loading ? "Analyse…" : "Analyser"}
-            </button>
           </div>
-
-          {suggests.length > 0 && (
-            <div className="absolute z-10 mt-3 w-full rounded-2xl border border-slate-700 bg-slate-900/95 backdrop-blur p-2 max-h-72 overflow-auto shadow-2xl">
-              {suggests.map((s) => (
-                <button
-                  key={s.symbol}
-                  onClick={() => lookup(s.symbol)}
-                  className="w-full text-left px-3 py-2 rounded-xl hover:bg-slate-800/70 transition"
-                >
-                  <div className="font-medium text-slate-100">{s.symbol}</div>
-                  <div className="text-xs text-slate-400">{s.shortname || "—"} · {s.exchDisp}</div>
-                </button>
-              ))}
-            </div>
-          )}
+          <button
+            onClick={() => lookup()}
+            disabled={!q || loading}
+            className="px-6 py-3.5 rounded-2xl bg-sky-600 hover:bg-sky-500 disabled:opacity-50 font-medium"
+          >
+            {loading ? "Analyse…" : "Analyser"}
+          </button>
         </div>
 
-        {/* Error */}
+        {/* Chips */}
+        <div className="flex flex-wrap gap-2 mt-3">
+          {SUGGESTIONS.map((t) => (
+            <button
+              key={t}
+              onClick={() => lookup(t)}
+              className="text-xs px-2.5 py-1.5 rounded-full border border-slate-800 bg-slate-900/30 hover:bg-slate-800/50 text-slate-300"
+            >
+              {t}
+            </button>
+          ))}
+        </div>
+
+        {/* Errors */}
         {error && (
-          <div className="mt-6 p-4 rounded-2xl bg-red-900/30 border border-red-700 text-red-100">
+          <div className="mt-4 p-4 rounded-2xl bg-rose-950/40 border border-rose-800/60 text-rose-200">
             {error}
           </div>
         )}
+      </section>
 
-        {/* Result */}
-        {data && (
-          <section className="mt-8">
-            <div className="rounded-3xl border border-slate-700/70 bg-slate-900/60 backdrop-blur shadow-xl p-6 md:p-8">
-              {/* Top row */}
-              <div className="grid grid-cols-1 md:grid-cols-[1fr_auto] gap-6 items-center">
-                <div className="space-y-2">
-                  <div className="flex items-center gap-3 flex-wrap">
-                    <h2 className="text-2xl md:text-3xl font-bold tracking-tight">{data.ticker.toUpperCase()}</h2>
-                    {coverageBadge(data.coverage)}
-                    <span
-                      className={`px-2 py-1 text-xs rounded-full border ${
-                        data.verdict === "sain" ? "bg-green-600/20 text-green-300 border-green-500/40"
-                        : data.verdict === "a_surveiller" ? "bg-amber-600/20 text-amber-300 border-amber-500/40"
-                        : "bg-red-600/20 text-red-300 border-red-500/40"
-                      }`}
-                      title={data.verdict_reason}
-                    >
-                      {data.verdict === "sain" ? "SAIN" : data.verdict === "a_surveiller" ? "À SURVEILLER" : "FRAGILE"}
-                    </span>
-                  </div>
-                  <div className="text-sm text-slate-400">{data.verdict_reason}</div>
-                  <div className="text-xs text-slate-500">Score (brut) : {data.score}/100</div>
-                </div>
-
-                {/* Score ring */}
-                <div className="mx-auto md:mx-0">
-                  <div className="relative w-28 h-28 rounded-full p-[6px] bg-slate-800/60 border border-slate-700">
-                    <div className="absolute inset-0 m-[6px] rounded-full" style={ringStyle} />
-                    <div className="relative w-full h-full rounded-full bg-slate-950/80 flex items-center justify-center">
-                      <div className="text-center">
-                        <div className="text-3xl font-extrabold tabular-nums">{scoreDisplay}</div>
-                        <div className="text-[10px] uppercase tracking-wide text-slate-400">/100</div>
-                      </div>
-                    </div>
-                  </div>
+      {/* Result */}
+      {data && (
+        <section className="max-w-6xl mx-auto px-5 py-8 grid lg:grid-cols-3 gap-6">
+          {/* Left: Score & reasons */}
+          <div className="lg:col-span-2">
+            <div className="relative overflow-hidden rounded-3xl border border-slate-800 bg-gradient-to-b from-slate-900/60 to-slate-900/30">
+              {/* Ribbon */}
+              <div className="absolute -right-14 top-6 rotate-45">
+                <div
+                  className={`px-16 py-1 text-xs tracking-wider text-white/90 ${barColor(
+                    data.score_adj ?? data.score
+                  )}`}
+                >
+                  {data.verdict.toUpperCase()}
                 </div>
               </div>
 
-              {/* Reasons & flags */}
-              <div className="mt-6 grid grid-cols-1 md:grid-cols-2 gap-4">
-                <div className="rounded-2xl bg-slate-900/70 border border-slate-800 p-4">
-                  <h3 className="text-sm uppercase tracking-wide text-slate-400">Raisons principales</h3>
-                  <div className="mt-2 flex flex-wrap gap-2">
-                    {data.reasons_positive.map((r, i) => (
-                      <span key={i} className="px-3 py-1 rounded-full bg-slate-800/60 border border-slate-700 text-sm">
-                        {r}
+              <div className="p-6 md:p-7">
+                <div className="flex items-start gap-4">
+                  <div className="flex-1">
+                    <div className="flex items-center gap-3">
+                      <h2 className="text-2xl font-semibold tracking-tight">
+                        {data.ticker.toUpperCase()}
+                      </h2>
+                      {verdictBadge}
+                      <span className="text-xs px-2 py-0.5 rounded-full border border-slate-700 text-slate-300">
+                        Fiabilité {data.coverage}%
                       </span>
+                    </div>
+
+                    <p className="mt-1 text-slate-400">
+                      {data.verdict_reason}
+                    </p>
+                  </div>
+
+                  <div className="w-36 shrink-0">
+                    <div className="text-4xl font-extrabold tabular-nums text-right">
+                      {data.score_adj ?? data.score}
+                      <span className="text-lg text-slate-400">/100</span>
+                    </div>
+                    <div className="mt-2 h-2 rounded-full bg-slate-800 overflow-hidden">
+                      <div
+                        className={`h-full ${barColor(
+                          data.score_adj ?? data.score
+                        )}`}
+                        style={{ width: `${Math.min(100, data.score_adj ?? data.score)}%` }}
+                      />
+                    </div>
+                    <div className="mt-1 text-right text-xs text-slate-400">
+                      Score (brut) : {data.score}/100
+                    </div>
+                  </div>
+                </div>
+
+                {/* Reasons */}
+                <div className="mt-6 grid md:grid-cols-2 gap-5">
+                  <div className="p-4 rounded-2xl bg-slate-900/50 border border-slate-800">
+                    <h3 className="text-sm uppercase tracking-wide text-slate-400">
+                      Raisons principales
+                    </h3>
+                    <ul className="mt-2 space-y-1.5">
+                      {(data.reasons_positive || []).map((r, i) => (
+                        <li key={i} className="flex items-start gap-2">
+                          <span className="mt-1 w-1.5 h-1.5 rounded-full bg-emerald-400/90" />
+                          <span>{r}</span>
+                        </li>
+                      ))}
+                    </ul>
+                  </div>
+                  <div className="p-4 rounded-2xl bg-slate-900/50 border border-slate-800">
+                    <h3 className="text-sm uppercase tracking-wide text-slate-400">
+                      Drapeaux rouges
+                    </h3>
+                    <ul className="mt-2 space-y-1.5">
+                      {data.red_flags?.length ? (
+                        data.red_flags.map((r, i) => (
+                          <li key={i} className="flex items-start gap-2">
+                            <span className="mt-1 w-1.5 h-1.5 rounded-full bg-rose-400/90" />
+                            <span>{r}</span>
+                          </li>
+                        ))
+                      ) : (
+                        <li className="flex items-start gap-2">
+                          <span className="mt-1 w-1.5 h-1.5 rounded-full bg-slate-500/80" />
+                          <span>Aucun majeur détecté</span>
+                        </li>
+                      )}
+                    </ul>
+                  </div>
+                </div>
+
+                {/* Subscores */}
+                <div className="mt-6">
+                  <h3 className="text-sm uppercase tracking-wide text-slate-400">
+                    Sous-scores
+                  </h3>
+                  <div className="mt-2 grid grid-cols-2 sm:grid-cols-4 gap-3">
+                    {Object.entries(data.subscores || {}).map(([k, v]) => (
+                      <div
+                        key={k}
+                        className="p-4 rounded-2xl bg-slate-900/40 border border-slate-800"
+                      >
+                        <div className="text-xs text-slate-400 capitalize">
+                          {k}
+                        </div>
+                        <div className="text-2xl font-semibold tabular-nums">
+                          {Math.round(v)}
+                        </div>
+                      </div>
                     ))}
                   </div>
                 </div>
-                <div className="rounded-2xl bg-slate-900/70 border border-slate-800 p-4">
-                  <h3 className="text-sm uppercase tracking-wide text-slate-400">Drapeaux rouges</h3>
-                  <div className="mt-2 flex flex-wrap gap-2">
-                    {data.red_flags.length ? data.red_flags.map((r, i) => (
-                      <span key={i} className="px-3 py-1 rounded-full bg-red-900/20 border border-red-800/60 text-sm text-red-200">
-                        {r}
-                      </span>
-                    )) : (
-                      <span className="px-3 py-1 rounded-full bg-slate-800/60 border border-slate-700 text-sm">
-                        Aucun majeur détecté
-                      </span>
-                    )}
-                  </div>
-                </div>
               </div>
-
-              {/* Subscores bars */}
-              <div className="mt-6">
-                <h3 className="text-sm uppercase tracking-wide text-slate-400">Sous-scores</h3>
-                <div className="mt-3 space-y-3">
-                  {Object.entries(data.subscores).map(([k, v]) => {
-                    const max = k === "momentum" ? 15 : k === "quality" ? 35 : k === "safety" ? 25 : 25;
-                    const pct = Math.max(0, Math.min(100, Math.round((v / max) * 100)));
-                    return (
-                      <div key={k}>
-                        <div className="flex items-center justify-between text-xs mb-1">
-                          <span className="capitalize text-slate-300">{k}</span>
-                          <span className="tabular-nums text-slate-400">{Math.round(v)}</span>
-                        </div>
-                        <div className="h-2.5 rounded-full bg-slate-800 overflow-hidden">
-                          <div className="h-full rounded-full transition-all" style={{ width: `${pct}%`, backgroundImage: "linear-gradient(90deg, #22d3ee, #34d399)" }} />
-                        </div>
-                      </div>
-                    );
-                  })}
-                </div>
-              </div>
-
-              {/* Proofs & sources */}
-              {data.proof && (
-                <details className="mt-6 text-xs text-slate-400 group">
-                  <summary className="cursor-pointer inline-flex items-center gap-2">
-                    <span className="w-1.5 h-1.5 rounded-full bg-slate-500 group-open:bg-emerald-400 transition" />
-                    Preuves (sources & fraîcheur)
-                  </summary>
-                  <div className="mt-3 grid grid-cols-1 md:grid-cols-2 gap-3">
-                    <div className="rounded-xl bg-slate-900/60 border border-slate-800 p-3">
-                      <div className="text-[11px] uppercase tracking-wide text-slate-500 mb-1">Prix</div>
-                      <div>Source : {data.proof.price_source || "—"}</div>
-                      <div>Points : {typeof data.proof.price_points === "number" ? data.proof.price_points : "—"}</div>
-                      <div>{data.proof.price_has_200dma ? "200DMA OK" : "200DMA indisponible"}</div>
-                      <div>Fraîcheur : {typeof data.proof.price_recency_days === "number" ? `${data.proof.price_recency_days} j` : "—"}</div>
-                    </div>
-                    <div className="rounded-xl bg-slate-900/60 border border-slate-800 p-3">
-                      <div className="text-[11px] uppercase tracking-wide text-slate-500 mb-1">Compta (SEC)</div>
-                      <div>Taxonomies : {data.proof.sec_used?.length ? data.proof.sec_used.join(", ") : "—"}</div>
-                      <div>Note : {data.proof.sec_note || "—"}</div>
-                      <div>Valuation utilisée : {data.proof.valuation_used ? "oui" : "non"}</div>
-                    </div>
-                  </div>
-
-                  {!!data.proof.sources_used?.length && (
-                    <div className="mt-3 flex flex-wrap gap-2">
-                      {data.proof.sources_used.map((s, i) => (
-                        <span key={i} className="px-2 py-1 rounded-full bg-slate-800/60 border border-slate-700">
-                          {s}
-                        </span>
-                      ))}
-                    </div>
-                  )}
-                </details>
-              )}
             </div>
 
-            <div className="mt-4 text-xs text-slate-400">Pas un conseil en investissement. Sources publiques, sans clé.</div>
-          </section>
-        )}
-      </div>
+            {/* Disclaimer */}
+            <p className="mt-3 text-xs text-slate-500">
+              Pas un conseil en investissement. Sources publiques, sans clé.
+            </p>
+          </div>
+
+          {/* Right: Proofs */}
+          <aside className="lg:col-span-1">
+            <div className="rounded-3xl border border-slate-800 bg-slate-900/40 p-5">
+              <h3 className="text-sm uppercase tracking-wide text-slate-400">
+                Preuves (sources &amp; fraîcheur)
+              </h3>
+
+              {/* Price block */}
+              <div className="mt-3 p-3 rounded-2xl bg-slate-950/40 border border-slate-800">
+                <div className="text-xs text-slate-400">Prix</div>
+                <div className="mt-1 text-sm">
+                  <span className="px-2 py-0.5 rounded-full border border-slate-700 bg-slate-900/60">
+                    Source : {data.proof?.price_source || "?"}
+                  </span>
+                </div>
+                <div className="mt-2 flex flex-wrap gap-2 text-xs">
+                  {typeof data.proof?.price_points === "number" && (
+                    <Badge>Points : {data.proof?.price_points}</Badge>
+                  )}
+                  {data.proof?.price_has_200dma && <Badge variant="ok">200DMA OK</Badge>}
+                  {typeof data.proof?.price_recency_days === "number" && (
+                    <Badge>Fraîcheur : {data.proof?.price_recency_days} j</Badge>
+                  )}
+                </div>
+              </div>
+
+              {/* SEC block */}
+              <div className="mt-3 p-3 rounded-2xl bg-slate-950/40 border border-slate-800">
+                <div className="text-xs text-slate-400">Compta (SEC)</div>
+                <div className="mt-2 flex flex-wrap gap-2 text-xs">
+                  {data.proof?.sec_used?.length ? (
+                    data.proof?.sec_used?.map((s) => <Badge key={s}>{s}</Badge>)
+                  ) : (
+                    <Badge variant="muted">—</Badge>
+                  )}
+                </div>
+                {data.proof?.sec_note && (
+                  <div className="mt-1 text-xs text-slate-400">{data.proof.sec_note}</div>
+                )}
+              </div>
+
+              {/* Valuation */}
+              <div className="mt-3 p-3 rounded-2xl bg-slate-950/40 border border-slate-800">
+                <div className="text-xs text-slate-400">Valorisation utilisée</div>
+                <div className="mt-2">
+                  <Badge variant={data.proof?.valuation_used ? "ok" : "warn"}>
+                    {data.proof?.valuation_used ? "oui" : "non"}
+                  </Badge>
+                </div>
+              </div>
+
+              {/* Sources */}
+              <div className="mt-3 p-3 rounded-2xl bg-slate-950/40 border border-slate-800">
+                <div className="text-xs text-slate-400">Sources</div>
+                <div className="mt-2 flex flex-wrap gap-1.5">
+                  {(data.proof?.sources_used || []).map((s) => (
+                    <SourceChip key={s} src={s} />
+                  ))}
+                </div>
+              </div>
+            </div>
+          </aside>
+        </section>
+      )}
     </main>
   );
+}
+
+/* ---------------- UI helpers ---------------- */
+
+function Badge({
+  children,
+  variant = "default",
+}: {
+  children: React.ReactNode;
+  variant?: "default" | "ok" | "warn" | "muted";
+}) {
+  const map: Record<string, string> = {
+    default: "border-slate-700 bg-slate-900/60 text-slate-200",
+    ok: "border-emerald-700/50 bg-emerald-500/10 text-emerald-300",
+    warn: "border-amber-700/50 bg-amber-500/10 text-amber-300",
+    muted: "border-slate-800 bg-slate-900/40 text-slate-400",
+  };
+  return (
+    <span className={`text-xs px-2 py-0.5 rounded-full border ${map[variant]}`}>
+      {children}
+    </span>
+  );
+}
+
+function SourceChip({ src }: { src: string }) {
+  const label = src.replace(/^price:/, "price · ").replace(/^sec:/, "sec · ");
+
+  // Highlight des sources “riches”
+  const variant =
+    /fin-html/.test(src) ? "ok" :
+    /yahoo:html|yahoo:v7|yahoo:summary/.test(src) ? "default" :
+    /wikipedia/.test(src) ? "muted" :
+    "default";
+
+  return <Badge variant={variant as any}>{label}</Badge>;
 }

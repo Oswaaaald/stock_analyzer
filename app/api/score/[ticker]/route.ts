@@ -4,7 +4,7 @@ export const runtime = "nodejs";
 import { NextResponse } from "next/server";
 
 /* ======================================================================================
- *  CACHE SIMPLE (mémoire process)
+ *  CACHE SIMPLE (mémoire proces)
  * ====================================================================================*/
 const MEM: Record<string, { expires: number; data: any }> = {};
 const TTL_MS = 30 * 60 * 1000; // 30 min
@@ -27,7 +27,7 @@ type Fundamentals = {
   fcf_positive_last4: Metric;   // 0..4
   fcf_yield: Metric;            // FCF / MarketCap
   earnings_yield: Metric;       // 1 / (Trailing P/E)
-  net_cash: Metric;             // cash - debt (booléen proxy : >0 => 1)
+  net_cash: Metric;             // cash - debt (positif => 1, sinon 0, conservateur)
 };
 
 type Prices = {
@@ -77,7 +77,7 @@ export async function GET(req: Request, { params }: { params: { ticker: string }
   const t = (params.ticker || "").toUpperCase().trim();
   if (!t) return NextResponse.json({ error: "Ticker requis" }, { status: 400 });
 
-  // Flag debug
+  // flag debug
   const url = new URL(req.url);
   const isDebug = url.searchParams.get("debug") === "1";
 
@@ -90,12 +90,13 @@ export async function GET(req: Request, { params }: { params: { ticker: string }
     // Prix (Yahoo → Stooq)
     const priceFeed = await fetchPricesBestOf(t);
 
-    // Fondamentaux (toutes les sources)
+    // Fondamentaux (multi-sources)
     const sec  = await fetchFromSEC_US_IfPossible(t, priceFeed.px.value);
     const fmp  = await fetchFmpRatiosIfPossible(t);
     const ySum = await fetchYahooSummaryIfPossible(t);
     const yV7  = await fetchYahooQuoteV7(t);
     const yHtml= await fetchYahooKeyStatsHtml(t);
+    const yFin = await fetchYahooFinancialsHtml(t); // ← NEW
     const wiki = await fetchWikipediaOpMargin(t);
 
     // --- MODE DEBUG : snapshot de chaque fetcher
@@ -133,6 +134,12 @@ export async function GET(req: Request, { params }: { params: { ticker: string }
           fcf_yield: (yHtml.fundamentals as any)?.fcf_yield?.value ?? null,
           net_cash: (yHtml.fundamentals as any)?.net_cash?.value ?? null,
         },
+        yahoo_fin_html: { // ← NEW
+          used: yFin.used,
+          current_ratio: (yFin.fundamentals as any)?.current_ratio?.value ?? null,
+          fcf_yield: (yFin.fundamentals as any)?.fcf_yield?.value ?? null,
+          earnings_yield: (yFin.fundamentals as any)?.earnings_yield?.value ?? null,
+        },
         wikipedia: {
           used: wiki.used,
           op_margin: (wiki.fundamentals as any)?.op_margin?.value ?? null,
@@ -160,15 +167,21 @@ export async function GET(req: Request, { params }: { params: { ticker: string }
       });
     }
 
-    // --- MODE NORMAL
-    const fundamentals = mergeFundamentalsWeighted({
+    // --- MODE NORMAL : merge pondéré
+    let fundamentals = mergeFundamentalsWeighted({
       sec: sec.fundamentals,
       fmp: fmp.fundamentals,
       ysum: ySum,
       yhtml: yHtml,
       wiki: wiki,
-      yv7:  yV7,
+      yv7: yV7,
     });
+
+    // Injecte les champs récupérés via Yahoo Financials HTML (si manquants)
+    const mergeIf = (a?: any, b?: any) => (b && b.value != null ? b : a);
+    fundamentals.current_ratio   = mergeIf(fundamentals.current_ratio,  (yFin.fundamentals as any).current_ratio);
+    fundamentals.fcf_yield       = mergeIf(fundamentals.fcf_yield,      (yFin.fundamentals as any).fcf_yield);
+    fundamentals.earnings_yield  = mergeIf(fundamentals.earnings_yield, (yFin.fundamentals as any).earnings_yield);
 
     const sources_used: string[] = [
       priceFeed.meta?.source_primary ? `price:${priceFeed.meta.source_primary}` : "price:unknown",
@@ -177,15 +190,11 @@ export async function GET(req: Request, { params }: { params: { ticker: string }
       ...(ySum.used ? ["yahoo:summary"] : []),
       ...(yV7.used ? ["yahoo:v7"] : []),
       ...(yHtml.used ? ["yahoo:html"] : []),
+      ...(yFin.used ? ["yahoo:fin-html"] : []), // ← NEW
       ...(wiki.used ? ["wikipedia"] : []),
     ];
 
-    const bundle: DataBundle = {
-      ticker: t,
-      fundamentals,
-      prices: priceFeed,
-      sources_used,
-    };
+    const bundle: DataBundle = { ticker: t, fundamentals, prices: priceFeed, sources_used };
 
     const { subscores, malus, maxes } = computeScore(bundle);
     const total = subscores.quality + subscores.safety + subscores.valuation + subscores.momentum;
@@ -249,7 +258,6 @@ async function fetchPricesBestOf(ticker: string): Promise<Prices> {
   try { const s2 = await fetchStooq(ticker, "https://stooq.pl"); if (s2) feeds.push(s2); } catch {}
   if (!feeds.length) throw new Error(`Aucune donnée de prix pour ${ticker}`);
 
-  // Choix : le plus récent et le plus long
   feeds.sort((a, b) => {
     const ra = a.dates.at(-1) ?? 0;
     const rb = b.dates.at(-1) ?? 0;
@@ -386,7 +394,7 @@ async function loadTickerMap(): Promise<typeof TICKER_MAP> {
 function pickBestUnit(units?: FactUnits, preferUSD = true): FactPoint[] | undefined {
   if (!units) return undefined;
   if (preferUSD && units.USD && units.USD.length) return sortByEnd(units.USD);
-  let best: FactPoint[] | undefined;
+  let best: FactPoint[] | undefined = undefined;
   for (const arr of Object.values(units)) {
     const valid = Array.isArray(arr) ? arr.filter(p => typeof p?.val === "number") : [];
     if (!valid.length) continue;
@@ -446,10 +454,15 @@ async function fetchFromSEC_US_IfPossible(ticker: string, lastPrice: number | nu
   } catch { return { fundamentals: fund, used, note }; }
 
   // Rev & OpInc → op_margin
+  // ÉLARGI pour couvrir TSLA et autres : SalesRevenueNet, IncludingAssessedTax, etc.
   const revUnits =
     usgaap.RevenueFromContractWithCustomerExcludingAssessedTax?.units ||
-    usgaap.Revenues?.units || (ifrs as any).Revenue?.units ||
+    usgaap.Revenues?.units ||
+    usgaap.SalesRevenueNet?.units ||                                    // ← NEW
+    usgaap.RevenueFromContractWithCustomerIncludingAssessedTax?.units ||// ← NEW
+    (ifrs as any).Revenue?.units ||
     (ifrs as any).RevenueFromContractsWithCustomersExcludingAssessedTax?.units;
+
   const opUnits =
     usgaap.OperatingIncomeLoss?.units ||
     (ifrs as any).OperatingProfitLoss?.units ||
@@ -618,7 +631,7 @@ async function fetchYahooSummaryIfPossible(ticker: string) {
     const pe = safeNum(r?.defaultKeyStatistics?.trailingPE ?? r?.summaryDetail?.trailingPE);
     if (pe && pe > 0) out.earnings_yield = asMetric(1 / pe, 0.35, "yahoo");
 
-    // Net cash via totalCash - totalDebt si dispo
+    // Net cash via totalCash - totalDebt si exposé
     const cash = safeNum(r?.financialData?.totalCash);
     const debt = safeNum(r?.financialData?.totalDebt);
     if (cash !== null && debt !== null) out.net_cash = asMetric(cash - debt > 0 ? 1 : 0, 0.35, "yahoo");
@@ -647,9 +660,11 @@ async function fetchYahooQuoteV7(ticker: string) {
     if (!r) return { fundamentals: out, used: false };
     used = true;
 
+    // Valo proxy : Earnings Yield = 1/PE si PE > 0
     const pe = typeof r.trailingPE === "number" ? r.trailingPE : (typeof r.peRatio === "number" ? r.peRatio : null);
     if (pe && pe > 0) out.earnings_yield = { value: 1 / pe, confidence: 0.45, source: "yahoo-v7" };
 
+    // Sécurité proxy (faible poids) : Price/Book bas → petit bonus sécurité (approx)
     if (typeof r.priceToBook === "number" && r.priceToBook > 0) {
       out.net_cash = { value: r.priceToBook < 1.2 ? 1 : 0, confidence: 0.25, source: "yahoo-v7" };
     }
@@ -658,7 +673,7 @@ async function fetchYahooQuoteV7(ticker: string) {
 }
 
 /* ======================================================================================
- *  Yahoo HTML Key Statistics (scrape permissif)
+ *  Yahoo HTML Key Statistics (scrape permissif) — +Trailing P/E, Cash/Debt
  * ====================================================================================*/
 async function fetchYahooKeyStatsHtml(ticker: string) {
   const url = `https://finance.yahoo.com/quote/${encodeURIComponent(ticker)}/key-statistics`;
@@ -680,7 +695,7 @@ async function fetchYahooKeyStatsHtml(ticker: string) {
     const m = html.match(re);
     if (m) {
       const v = parseFloat(m[1].replace(/[^\d.-]/g, "")) / 100;
-      if (Number.isFinite(v)) { out.op_margin = asMetric(v, 0.3, "yahoo-html"); break; }
+      if (Number.isFinite(v)) { out.op_margin = asMetric(v, 0.35, "yahoo-html"); break; }
     }
   }
 
@@ -693,7 +708,7 @@ async function fetchYahooKeyStatsHtml(ticker: string) {
     const c = html.match(re);
     if (c) {
       const v = parseFloat(c[1].replace(/[^\d.-]/g, ""));
-      if (Number.isFinite(v)) { out.current_ratio = asMetric(v, 0.25, "yahoo-html"); break; }
+      if (Number.isFinite(v)) { out.current_ratio = asMetric(v, 0.3, "yahoo-html"); break; }
     }
   }
 
@@ -706,7 +721,7 @@ async function fetchYahooKeyStatsHtml(ticker: string) {
     const p = html.match(re);
     if (p) {
       const pe = parseFloat(p[1].replace(/[^\d.-]/g, ""));
-      if (Number.isFinite(pe) && pe > 0) { out.earnings_yield = asMetric(1 / pe, 0.25, "yahoo-html"); break; }
+      if (Number.isFinite(pe) && pe > 0) { out.earnings_yield = asMetric(1 / pe, 0.3, "yahoo-html"); break; }
     }
   }
 
@@ -719,11 +734,11 @@ async function fetchYahooKeyStatsHtml(ticker: string) {
     const p = html.match(re);
     if (p) {
       const ratio = parseFloat(p[1].replace(/[^\d.-]/g, ""));
-      if (Number.isFinite(ratio) && ratio > 0) { out.fcf_yield = asMetric(Math.max(-0.05, Math.min(0.08, 1 / ratio)), 0.25, "yahoo-html"); break; }
+      if (Number.isFinite(ratio) && ratio > 0) { out.fcf_yield = asMetric(Math.max(-0.05, Math.min(0.08, 1 / ratio)), 0.3, "yahoo-html"); break; }
     }
   }
 
-  // Total Cash (mrq) & Total Debt (mrq) → net_cash booléen
+  // Total Cash & Total Debt → net_cash booléen
   const cashRe = /Total\s*Cash\s*\(mrq\)[^<]*?<\/span>[^<]*?([\d.,\-]+)\s*[MBT]?/i;
   const debtRe = /Total\s*Debt\s*\(mrq\)[^<]*?<\/span>[^<]*?([\d.,\-]+)\s*[MBT]?/i;
   const cm = html.match(cashRe);
@@ -732,7 +747,7 @@ async function fetchYahooKeyStatsHtml(ticker: string) {
     const cash = parseFloat(cm[1].replace(/[^\d.-]/g, ""));
     const debt = parseFloat(dm[1].replace(/[^\d.-]/g, ""));
     if (Number.isFinite(cash) && Number.isFinite(debt)) {
-      out.net_cash = asMetric(cash > debt ? 1 : 0, 0.25, "yahoo-html");
+      out.net_cash = asMetric(cash > debt ? 1 : 0, 0.3, "yahoo-html");
     }
   }
 
@@ -740,7 +755,102 @@ async function fetchYahooKeyStatsHtml(ticker: string) {
 }
 
 /* ======================================================================================
- *  Wikipedia : op_margin via revenue & operating income
+ *  Yahoo Financials HTML (Balance Sheet + Cash Flow) — NEW
+ * ====================================================================================*/
+async function fetchYahooFinancialsHtml(ticker: string) {
+  const base = `https://finance.yahoo.com/quote/${encodeURIComponent(ticker)}`;
+  const pages = {
+    summary:       `${base}`,
+    balance_sheet: `${base}/balance-sheet?p=${encodeURIComponent(ticker)}`,
+    cash_flow:     `${base}/cash-flow?p=${encodeURIComponent(ticker)}`
+  };
+  const out: Partial<Fundamentals> = {};
+  let used = false;
+
+  const get = async (u: string) => await fetchTextSafe(u, "text/html");
+  const num = (s: string) => parseFloat(s.replace(/[^\d.-]/g, ""));
+
+  // Summary → Trailing P/E → earnings_yield
+  try {
+    const html = await get(pages.summary);
+    if (html && !html.includes("Rate Limited")) {
+      used = true;
+      const m = html.match(/Trailing\s*P\/E[^<]*?<\/span>[^<]*?([\d.,\-]+)/i) ||
+                html.match(/PE\s*\(TTM\)[^<]*?<\/span>[^<]*?([\d.,\-]+)/i);
+      if (m) {
+        const pe = num(m[1]);
+        if (Number.isFinite(pe) && pe > 0) {
+          out.earnings_yield = { value: 1 / pe, confidence: 0.28, source: "yahoo-fin-html" };
+        }
+      }
+    }
+  } catch {}
+
+  // Balance Sheet → Current Ratio (mrq)
+  try {
+    const html = await get(pages.balance_sheet);
+    if (html && !html.includes("Rate Limited")) {
+      used = true;
+      const reList = [
+        /Current\s*Ratio\s*\(mrq\)[^<]*?<\/span>[^<]*?([\d.,\-]+)/i,
+        /Current\s*Ratio[^<]*?<\/span>[^<]*?([\d.,\-]+)/i,
+        /Current\s*ratio[^<]*?<\/span>[^<]*?([\d.,\-]+)/i
+      ];
+      for (const re of reList) {
+        const m = html.match(re);
+        if (m) {
+          const v = num(m[1]);
+          if (Number.isFinite(v)) { out.current_ratio = { value: v, confidence: 0.30, source: "yahoo-fin-html" }; break; }
+        }
+      }
+    }
+  } catch {}
+
+  // Cash Flow → OCF & CapEx (ttm) → FCF yield
+  try {
+    const html = await get(pages.cash_flow);
+    if (html && !html.includes("Rate Limited")) {
+      used = true;
+      const findNum = (res: RegExp[]) => {
+        for (const re of res) {
+          const m = html.match(re);
+          if (m) {
+            const v = num(m[1]);
+            if (Number.isFinite(v)) return v;
+          }
+        }
+        return null;
+      };
+      const ocf = findNum([
+        /Operating\s*Cash\s*Flow\s*\(ttm\)[^<]*?<\/span>[^<]*?([\d.,\-]+)/i,
+        /Total\s*Cash\s*From\s*Operating\s*Activities[^<]*?<\/span>[^<]*?([\d.,\-]+)/i
+      ]);
+      const cap = findNum([
+        /Capital\s*Expenditures\s*\(ttm\)[^<]*?<\/span>[^<]*?([\d.,\-]+)/i,
+        /Capital\s*Expenditures[^<]*?<\/span>[^<]*?([\d.,\-]+)/i
+      ]);
+
+      // prix / actions depuis JSON embarqué (quand dispo)
+      const price = findNum([/"regularMarketPrice":\s*([\d.]+)/i]);
+      const shares = findNum([/"sharesOutstanding":\s*([\d.]+)/i]);
+
+      if (typeof price === "number" && typeof shares === "number" && shares > 0 &&
+          typeof ocf === "number" && typeof cap === "number") {
+        const mcap = price * shares;
+        if (mcap > 0) {
+          let y = (ocf - Math.abs(cap)) / mcap;
+          y = Math.max(-0.05, Math.min(0.08, y));
+          out.fcf_yield = { value: y, confidence: 0.30, source: "yahoo-fin-html" };
+        }
+      }
+    }
+  } catch {}
+
+  return { fundamentals: out, used };
+}
+
+/* ======================================================================================
+ *  Wikipedia (EN → FR) : op_margin via revenue & operating income
  * ====================================================================================*/
 async function fetchWikipediaOpMargin(ticker: string) {
   const search = await fetchJsonSafe(`https://query2.finance.yahoo.com/v1/finance/search?q=${encodeURIComponent(ticker)}`);
@@ -755,12 +865,12 @@ async function fetchWikipediaOpMargin(ticker: string) {
     const api = await fetchJsonSafe(`https://${lang}.wikipedia.org/w/api.php?action=parse&page=${pageTitle}&prop=wikitext&format=json&redirects=1&origin=*`);
     const wikitext: string | null = api?.parse?.wikitext?.["*"] || null;
     const fromWikitext = parseOpMarginFromWikiText(wikitext);
-    if (fromWikitext !== null) return { used: true, fundamentals: { op_margin: asMetric(fromWikitext, 0.22, "wikipedia") } };
+    if (fromWikitext !== null) return { used: true, fundamentals: { op_margin: asMetric(fromWikitext, 0.25, "wikipedia") } };
 
     const htmlApi = await fetchJsonSafe(`https://${lang}.wikipedia.org/w/api.php?action=parse&page=${pageTitle}&prop=text&format=json&redirects=1&origin=*`);
     const html: string | null = htmlApi?.parse?.text?.["*"] || null;
     const fromHtml = parseOpMarginFromWikiHTML(html);
-    if (fromHtml !== null) return { used: true, fundamentals: { op_margin: asMetric(fromHtml, 0.2, "wikipedia") } };
+    if (fromHtml !== null) return { used: true, fundamentals: { op_margin: asMetric(fromHtml, 0.22, "wikipedia") } };
   }
 
   return { used: false, fundamentals: {} as Partial<Fundamentals> };
@@ -878,6 +988,7 @@ function computeScore(d: DataBundle) {
   if (typeof f.fcf_positive_last4.value === "number") {
     sMax += 4; s += f.fcf_positive_last4.value >= 3 ? 4 : 0;
   }
+  // Net cash (booléen 0/1)
   if (typeof f.net_cash.value === "number") {
     sMax += 2; s += f.net_cash.value > 0 ? 2 : 0;
   }
