@@ -12,6 +12,13 @@ type ScoreResponse = {
   coverage?: number;
   verdict: "sain" | "a_surveiller" | "fragile";
   verdict_reason: string;
+  proof?: {
+    price_source?: "yahoo" | "stooq.com" | "stooq.pl";
+    price_points?: number;
+    price_has_200dma: boolean;
+    sec_used?: string[];
+    sec_note?: string | null;
+  };
   debug?: Record<string, any>;
 };
 
@@ -173,9 +180,20 @@ export default function Page() {
               </div>
             </div>
 
+            {/* PROOFS */}
+            {"proof" in (data as any) && data.proof && (
+              <details className="mt-4 text-xs text-slate-400">
+                <summary className="cursor-pointer">Preuves (sources & fraîcheur)</summary>
+                <div className="mt-2 space-y-1">
+                  <div>Prix: {data.proof.price_source || "—"}{data.proof.price_points ? ` · ${data.proof.price_points} points` : ""}{data.proof.price_has_200dma ? " · 200DMA OK" : ""}</div>
+                  <div>SEC: {data.proof.sec_used?.length ? data.proof.sec_used.join(", ") : "—"}{data.proof.sec_note ? ` · ${data.proof.sec_note}` : ""}</div>
+                </div>
+              </details>
+            )}
+
             {/* DEBUG optionnel */}
             {"debug" in (data as any) && data.debug && (
-              <details className="mt-4 text-xs text-slate-400">
+              <details className="mt-2 text-xs text-slate-400">
                 <summary className="cursor-pointer">Debug</summary>
                 <pre className="mt-2 whitespace-pre-wrap">
 {JSON.stringify((data as any).debug, null, 2)}

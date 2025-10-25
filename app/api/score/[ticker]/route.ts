@@ -18,6 +18,10 @@ type Fundamentals = {
   dilution_3y: number | null;
   fcf_positive_last4: number | null;
   fcf_yield: number | null;
+
+  // métadonnées SEC (optionnelles)
+  __taxonomies?: string[]; // ex: ["us-gaap","ifrs-full"]
+  __note?: string;
 };
 
 type Prices = {
@@ -28,6 +32,10 @@ type Prices = {
   ret_20d: number | null;       // performance 20 jours
   rs_6m_vs_sector_percentile: number | null; // placeholder
   eps_revisions_3m: number | null;           // placeholder
+
+  // métadonnées prix (optionnelles)
+  __source?: "yahoo" | "stooq.com" | "stooq.pl";
+  __points?: number; // nombre de clôtures utilisées
 };
 
 type DataBundle = { ticker: string; fundamentals: Fundamentals; prices: Prices };
@@ -43,6 +51,17 @@ type ScorePayload = {
   coverage: number;              // points max effectivement disponibles (0..100)
   verdict: "sain" | "a_surveiller" | "fragile";
   verdict_reason: string;
+
+  // preuves / traçabilité
+  proof?: {
+    price_source?: Prices["__source"];
+    price_points?: number;
+    price_has_200dma: boolean;
+    sec_used?: string[]; // taxonomies
+    sec_note?: string | null;
+  };
+
+  // debug optionnel
   debug?: Record<string, any>;
 };
 
@@ -75,12 +94,20 @@ export async function GET(
 
     // 3) Score officiel + couverture
     const { subscores, malus, maxes } = computeScore(bundle);
-    const total = subscores.quality + subscores.safety + subscores.valuation + subscores.momentum;
+    const total =
+      subscores.quality +
+      subscores.safety +
+      subscores.valuation +
+      subscores.momentum;
+
     const raw = Math.max(0, Math.min(100, Math.round(total) - malus));
-    const coverage = maxes.quality + maxes.safety + maxes.valuation + maxes.momentum; // 0..100
+    const coverage =
+      maxes.quality + maxes.safety + maxes.valuation + maxes.momentum; // 0..100
     const score_adj = coverage > 0 ? Math.round((total / coverage) * 100) : 0;
 
-    const color: ScorePayload["color"] = raw >= 70 ? "green" : raw >= 50 ? "orange" : "red";
+    const color: ScorePayload["color"] =
+      raw >= 70 ? "green" : raw >= 50 ? "orange" : "red";
+
     const reasons = buildReasons(bundle, subscores);
     const flags = detectRedFlags(bundle);
 
@@ -98,6 +125,13 @@ export async function GET(
       coverage: Math.max(0, Math.min(100, Math.round(coverage))),
       verdict,
       verdict_reason: reason,
+      proof: {
+        price_source: pricesAny.__source,
+        price_points: pricesAny.__points,
+        price_has_200dma: bundle.prices.px_vs_200dma !== null,
+        sec_used: bundle.fundamentals.__taxonomies,
+        sec_note: bundle.fundamentals.__note ?? null,
+      },
       // Décommente pour diagnostiquer
       // debug: {
       //   ...bundle.fundamentals,
@@ -122,20 +156,35 @@ export async function GET(
 async function fetchPricesAny(ticker: string): Promise<Prices> {
   // 1) Yahoo Chart
   try {
-    const closes = await fetchYahooChartCloses(ticker);
-    if (closes && closes.length) return enrichCloses(closes);
+    const y = await fetchYahooChartCloses(ticker);
+    if (y && y.length) {
+      const enriched = enrichCloses(y);
+      enriched.__source = "yahoo";
+      enriched.__points = y.length;
+      return enriched;
+    }
   } catch {}
 
   // 2) Stooq (.com)
   try {
     const closes = await fetchStooqCloses(ticker, "https://stooq.com");
-    if (closes && closes.length) return enrichCloses(closes);
+    if (closes && closes.length) {
+      const enriched = enrichCloses(closes);
+      enriched.__source = "stooq.com";
+      enriched.__points = closes.length;
+      return enriched;
+    }
   } catch {}
 
   // 3) Stooq (.pl)
   try {
     const closes = await fetchStooqCloses(ticker, "https://stooq.pl");
-    if (closes && closes.length) return enrichCloses(closes);
+    if (closes && closes.length) {
+      const enriched = enrichCloses(closes);
+      enriched.__source = "stooq.pl";
+      enriched.__points = closes.length;
+      return enriched;
+    }
   } catch {}
 
   throw new Error(`Aucune donnée de prix pour ${ticker} (Yahoo+Stooq échecs)`);
@@ -281,6 +330,7 @@ function parseStooqCsv(csv: string): { dates: string[]; closes: number[] } {
   for (let i = 1; i < lines.length; i++) {
     const parts = lines[i].split(",");
     const d = parts[idxDate];
+    the:
     const c = parseFloat(parts[idxClose]);
     if (d && Number.isFinite(c)) { dates.push(d); closes.push(c); }
   }
@@ -368,7 +418,16 @@ async function fetchFromSEC_US_IfPossible(ticker: string, lastPrice: number | nu
     const facts = await r.json();
     usgaap = (facts?.facts?.["us-gaap"] as Taxo) || {};
     ifrs   = (facts?.facts?.["ifrs-full"] as Taxo) || {};
-  } catch { return { fundamentals: fund }; }
+
+    // métadonnées
+    fund.__taxonomies = [
+      Object.keys(usgaap).length ? "us-gaap" : null,
+      Object.keys(ifrs).length ? "ifrs-full" : null,
+    ].filter(Boolean) as string[];
+    fund.__note = "TTM si disponible, sinon dernière période disponible";
+  } catch {
+    return { fundamentals: fund };
+  }
 
   // Operating margin (TTM si possible)
   const revUSD  = usgaap.RevenueFromContractWithCustomerExcludingAssessedTax?.units?.USD
