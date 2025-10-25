@@ -164,8 +164,10 @@ export async function GET(req: Request, { params }: { params: { ticker: string }
 
     // Couverture par PILIERS
     const qualityPresent   = typeof fundamentals.op_margin.value === "number";
-    const safetyPresent    = typeof fundamentals.current_ratio.value === "number" || typeof fundamentals.net_cash.value === "number";
-    const valuationPresent = typeof fundamentals.fcf_yield.value === "number" || typeof fundamentals.earnings_yield.value === "number";
+    const safetyPresent    =
+      typeof fundamentals.current_ratio.value === "number" || typeof fundamentals.net_cash.value === "number";
+    const valuationPresent =
+      typeof fundamentals.fcf_yield.value === "number" || typeof fundamentals.earnings_yield.value === "number";
     const momentumPresent  = typeof priceFeed.px_vs_200dma.value === "number";
 
     const coveragePoints =
@@ -177,13 +179,14 @@ export async function GET(req: Request, { params }: { params: { ticker: string }
     const total = subscores.quality + subscores.safety + subscores.valuation + subscores.momentum;
     const raw = Math.max(0, Math.min(100, Math.round(total)));
 
-    const coverage = coveragePoints; // déjà sur 100
+    const coverage = coveragePoints; // déjà 0..100
     const score_adj = coverage > 0 ? Math.round((total / coverage) * 100) : 0;
 
-    // Couleur & verdict basés sur le score ajusté (shown)
+    // >>> Changement demandé : couleur basée sur le score affiché
     const shown = score_adj ?? raw;
-    const color: ScorePayload["color"] = shown >= 60 ? "green" : shown >= 45 ? "orange" : "red";
-    const { verdict, reason } = makeVerdict({ coverage, total, momentumPresent, score_adj: shown });
+    const color: ScorePayload["color"] = shown >= 65 ? "green" : shown >= 50 ? "orange" : "red";
+
+    const { verdict, reason } = makeVerdict({ coverage, total, momentumPresent, score_adj });
 
     const reasons = buildReasons(bundle, subscores);
 
@@ -341,7 +344,6 @@ async function fetchYahooV10(ticker: string, sess: YSession, retryOnce: boolean)
   throw new Error("QuoteSummary indisponible");
 }
 
-/* ============================== Fundamentals + Ratios (light sanitize) ============================== */
 function computeFundamentalsFromV10(r: any): Fundamentals {
   // --- existants ---
   const price = num(r?.price?.regularMarketPrice?.raw ?? r?.price?.regularMarketPrice);
@@ -354,68 +356,64 @@ function computeFundamentalsFromV10(r: any): Fundamentals {
   const cash = num(r?.financialData?.totalCash?.raw ?? r?.financialData?.totalCash);
   const debt = num(r?.financialData?.totalDebt?.raw ?? r?.financialData?.totalDebt);
 
-  // --- historiques annuels (pour ROE/ROA/ROIC) ---
+  // --- nouveaux (annual) ---
   const ishs: any[] = r?.incomeStatementHistory?.incomeStatementHistory || [];
-  const bsh:  any[] = r?.balanceSheetHistory?.balanceSheetStatements || [];
+  const bsh: any[] = r?.balanceSheetHistory?.balanceSheetStatements || [];
 
-  const ni0     = num(ishs?.[0]?.netIncome?.raw ?? ishs?.[0]?.netIncome);
-  const opInc0  = num(ishs?.[0]?.operatingIncome?.raw ?? ishs?.[0]?.operatingIncome);
+  const ni0 = num(ishs?.[0]?.netIncome?.raw ?? ishs?.[0]?.netIncome);
+  const opInc0 = num(ishs?.[0]?.operatingIncome?.raw ?? ishs?.[0]?.operatingIncome);
   const taxExp0 = num(ishs?.[0]?.incomeTaxExpense?.raw ?? ishs?.[0]?.incomeTaxExpense);
   const preTax0 = num(ishs?.[0]?.incomeBeforeTax?.raw ?? ishs?.[0]?.incomeBeforeTax);
 
-  const eq0     = num(bsh?.[0]?.totalStockholderEquity?.raw ?? bsh?.[0]?.totalStockholderEquity);
-  const eq1     = num(bsh?.[1]?.totalStockholderEquity?.raw ?? bsh?.[1]?.totalStockholderEquity);
+  const eq0 = num(bsh?.[0]?.totalStockholderEquity?.raw ?? bsh?.[0]?.totalStockholderEquity);
+  const eq1 = num(bsh?.[1]?.totalStockholderEquity?.raw ?? bsh?.[1]?.totalStockholderEquity);
   const assets0 = num(bsh?.[0]?.totalAssets?.raw ?? bsh?.[0]?.totalAssets);
 
-  // ========== EY & FCFY ==========
+  // EY & FCFY
   const ey = trailingPE && trailingPE > 0 ? 1 / trailingPE : null;
   const mc = price && shares ? price * shares : null;
   const fcfy = mc && fcf != null ? fcf / mc : null;
 
-  // ========== Net cash (proxy) ==========
+  // net_cash proxy
   let netCash: number | null = null;
   if (cash != null && debt != null) netCash = cash - debt > 0 ? 1 : 0;
   else if (priceToBook && priceToBook > 0) netCash = priceToBook < 1.2 ? 1 : 0;
 
-  // ========== ROE ==========
+  // ROE (direct si dispo, sinon calc NI / avg equity)
   const roe_direct = num(r?.financialData?.returnOnEquity?.raw ?? r?.financialData?.returnOnEquity);
-  const avgEq = (eq0 != null && eq1 != null) ? (eq0 + eq1) / 2 : eq0 ?? null;
-  let roe_calc: number | null = null;
-  if (ni0 != null && avgEq != null && avgEq > 0) {
-    roe_calc = ni0 / avgEq;
-  }
-  // Yahoo renvoie déjà des ratios en décimal (0.33 = 33%). On se contente d’une borne large.
-  const roe = clamp( (roe_direct ?? roe_calc) ?? null, -2, 2 );
+  const avgEq = eq0 != null && eq1 != null ? (eq0 + eq1) / 2 : eq0 ?? null;
+  const roe_calc = ni0 != null && avgEq ? (avgEq !== 0 ? ni0 / avgEq : null) : null;
+  const roe = roe_direct ?? roe_calc;
 
-  // ========== ROA ==========
+  // ROA (direct si dispo, sinon NI / Assets)
   const roa_direct = num(r?.financialData?.returnOnAssets?.raw ?? r?.financialData?.returnOnAssets);
-  let roa_calc: number | null = null;
-  if (ni0 != null && assets0 != null && assets0 > 0) {
-    roa_calc = ni0 / assets0;
-  }
-  const roa = clamp( (roa_direct ?? roa_calc) ?? null, -2, 2 );
+  const roa = roa_direct ?? (ni0 != null && assets0 ? (assets0 !== 0 ? ni0 / assets0 : null) : null);
 
-  // ========== FCF / Net Income ==========
-  const fcf_over_ni = (fcf != null && ni0 != null && ni0 !== 0) ? fcf / ni0 : null;
+  // FCF / Net Income
+  const fcf_over_ni = fcf != null && ni0 != null && ni0 !== 0 ? fcf / ni0 : null;
 
-  // ========== ROIC (NOPAT / (Debt + Equity - Cash)) ==========
+  // ROIC ~ NOPAT / (Debt + Equity - Cash)
+  // - NOPAT ≈ operatingIncome * (1 - taxRate)
+  // - Fallback si operatingIncome manquant: NOPAT ≈ netIncome (proxy prudente)
   const taxRate =
     preTax0 && taxExp0 != null && preTax0 !== 0 ? Math.min(0.5, Math.max(0, taxExp0 / preTax0)) : 0.21;
-  const nopat = (opInc0 != null ? opInc0 * (1 - taxRate) : (ni0 ?? null));
-  const invested = (debt ?? null) != null || (eq0 ?? null) != null ? ((debt ?? 0) + (eq0 ?? 0) - (cash ?? 0)) : null;
-  const roic = (nopat != null && invested != null && invested > 0) ? clamp(nopat / invested, -1, 1) : null;
+  const nopat =
+    opInc0 != null ? opInc0 * (1 - taxRate) : (ni0 != null ? ni0 : null);
+  const invested =
+    (debt ?? null) != null || (eq0 ?? null) != null ? ((debt ?? 0) + (eq0 ?? 0) - (cash ?? 0)) : null;
+  const roic = nopat != null && invested && invested !== 0 ? nopat / invested : null;
 
   return {
-    op_margin:      asMetric(opm, opm != null ? 0.45 : 0, "yahoo-v10"),
-    current_ratio:  asMetric(currentRatio, currentRatio != null ? 0.4 : 0, "yahoo-v10"),
-    fcf_yield:      asMetric(fcfy != null ? clampFcfy(fcfy) : null, fcfy != null ? 0.45 : 0, "yahoo-v10"),
-    earnings_yield: asMetric(ey,  ey  != null ? 0.45 : 0, "yahoo-v10"),
-    net_cash:       asMetric(netCash, netCash != null ? 0.35 : 0, "yahoo-v10"),
+    op_margin: asMetric(opm, opm != null ? 0.45 : 0, "yahoo-v10"),
+    current_ratio: asMetric(currentRatio, currentRatio != null ? 0.4 : 0, "yahoo-v10"),
+    fcf_yield: asMetric(fcfy != null ? clampFcfy(fcfy) : null, fcfy != null ? 0.45 : 0, "yahoo-v10"),
+    earnings_yield: asMetric(ey, ey != null ? 0.45 : 0, "yahoo-v10"),
+    net_cash: asMetric(netCash, netCash != null ? 0.35 : 0, "yahoo-v10"),
 
-    roe:                asMetric(roe,  roe  != null ? 0.45 : 0, roe_direct != null ? "yahoo-v10" : "calc"),
-    roa:                asMetric(roa,  roa  != null ? 0.40 : 0, roa_direct != null ? "yahoo-v10" : "calc"),
+    roe: asMetric(roe ?? null, roe != null ? 0.45 : 0, roe_direct != null ? "yahoo-v10" : "calc"),
+    roa: asMetric(roa ?? null, roa != null ? 0.4 : 0, roa_direct != null ? "yahoo-v10" : "calc"),
     fcf_over_netincome: asMetric(fcf_over_ni, fcf_over_ni != null ? 0.35 : 0, "calc"),
-    roic:               asMetric(roic, roic != null ? 0.30 : 0, "calc"),
+    roic: asMetric(roic, roic != null ? 0.3 : 0, "calc"),
   };
 }
 const clampFcfy = (y: number) => Math.max(-0.05, Math.min(0.08, y));
@@ -498,10 +496,10 @@ function buildReasons(_d: DataBundle, subs: Record<string, number>) {
 
 function makeVerdict(args: { coverage: number; total: number; momentumPresent: boolean; score_adj: number }) {
   const { coverage, momentumPresent, score_adj } = args;
-  const coverageOk = coverage >= 60; // seuil assoupli via couverture par piliers
+  const coverageOk = coverage >= 40; // assoupli pour éviter “À SURVEILLER” partout
   if (score_adj >= 70 && coverageOk && momentumPresent) return { verdict: "sain" as const, reason: "Score élevé et couverture suffisante" };
-  if (score_adj >= 40 || momentumPresent) return { verdict: "a_surveiller" as const, reason: "Signal positif mais incomplet" + (coverageOk ? "" : " (couverture limitée)") };
-  return { verdict: "fragile" as const, reason: "Signal faible et données limitées" };
+  if (score_adj >= 50 || momentumPresent) return { verdict: "a_surveiller" as const, reason: "Signal positif mais incomplet" + (coverageOk ? "" : " (couverture limitée)") };
+  return { verdict: "fragile" as const, reason: "Signal faible" + (coverageOk ? "" : " (données partielles)") };
 }
 
 /* ============================== Fetch util ============================== */
