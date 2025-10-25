@@ -1,7 +1,6 @@
 "use client";
 import { useEffect, useMemo, useRef, useState } from "react";
 
-/* ================== Types côté score ================== */
 type ScoreResponse = {
   ticker: string;
   score: number;
@@ -25,15 +24,11 @@ type ScoreResponse = {
   };
 };
 
-/* ================== Types côté suggest ================== */
-type Suggest = {
+type Suggestion = {
   symbol: string;
-  name?: string | null;
+  name: string;
   exchange?: string | null;
   type?: string | null;
-  score?: number | null;
-  region?: string | null;
-  currency?: string | null;
 };
 
 const SUGGESTIONS = ["AAPL", "MSFT", "NVDA", "TSLA", "RMS.PA", "MC.PA", "ASML.AS"];
@@ -44,12 +39,12 @@ export default function Page() {
   const [data, setData] = useState<ScoreResponse | null>(null);
   const [error, setError] = useState<string | null>(null);
 
-  // Autocomplete state
+  // autosuggest state
+  const [items, setItems] = useState<Suggestion[]>([]);
   const [open, setOpen] = useState(false);
-  const [items, setItems] = useState<Suggest[]>([]);
   const [highlight, setHighlight] = useState(0);
   const abortRef = useRef<AbortController | null>(null);
-  const debouncedQ = useDebouncedValue(q, 200);
+  const containerRef = useRef<HTMLDivElement | null>(null);
 
   // Pré-remplir depuis URL ?ticker=...
   useEffect(() => {
@@ -62,7 +57,18 @@ export default function Page() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
-  /* ================== Lookup score ================== */
+  // Click-away: fermer le dropdown si clic hors du conteneur
+  useEffect(() => {
+    const onDown = (e: PointerEvent) => {
+      if (!containerRef.current) return;
+      if (!containerRef.current.contains(e.target as Node)) {
+        setOpen(false);
+      }
+    };
+    window.addEventListener("pointerdown", onDown, { capture: true });
+    return () => window.removeEventListener("pointerdown", onDown, { capture: true } as any);
+  }, []);
+
   async function lookup(ticker?: string) {
     const sym = (ticker ?? q).trim();
     if (!sym) return;
@@ -87,43 +93,60 @@ export default function Page() {
     }
   }
 
-  /* ================== Fetch suggestions ================== */
+  // Fetch suggestions (debounced-ish via AbortController)
   useEffect(() => {
-    if (!debouncedQ || debouncedQ.trim().length < 2) {
+    const term = q.trim();
+    if (term.length < 2) {
       setItems([]);
       setOpen(false);
+      setHighlight(0);
       return;
     }
-    // Annuler la requête précédente si nécessaire
-    if (abortRef.current) abortRef.current.abort();
+    abortRef.current?.abort();
     const ac = new AbortController();
     abortRef.current = ac;
 
     const run = async () => {
       try {
-        const url = `/api/suggest?q=${encodeURIComponent(debouncedQ.trim())}`;
-        const r = await fetch(url, { signal: ac.signal, cache: "no-store" });
-        if (!r.ok) return;
-        const js = await r.json();
-        const list: Suggest[] = Array.isArray(js?.suggestions) ? js.suggestions : [];
-        setItems(list);
-        setOpen(list.length > 0);
+        const res = await fetch(`/api/suggest?q=${encodeURIComponent(term)}`, {
+          cache: "no-store",
+          signal: ac.signal,
+        });
+        if (!res.ok) throw new Error("suggest failed");
+        const json = await res.json();
+        const arr = (json?.suggestions || []) as Suggestion[];
+        setItems(arr.slice(0, 8));
+        setOpen(arr.length > 0);
         setHighlight(0);
       } catch {
-        // ignoré (abort / net)
+        if (!ac.signal.aborted) {
+          setItems([]);
+          setOpen(false);
+        }
       }
     };
-    run();
+    // petite latence pour taper
+    const id = setTimeout(run, 120);
+    return () => {
+      clearTimeout(id);
+      ac.abort();
+    };
+  }, [q]);
 
-    return () => ac.abort();
-  }, [debouncedQ]);
+  const onSelect = (s: Suggestion) => {
+    setQ(s.symbol);
+    setOpen(false);
+    setItems([]);
+    setHighlight(0);
+    void lookup(s.symbol);
+  };
 
   const onEnter = (e: React.KeyboardEvent<HTMLInputElement>) => {
     if (e.key === "Enter") {
-      // si le menu est ouvert, Enter valide la sélection en surbrillance
       if (open && items.length > 0) {
         onSelect(items[highlight]);
       } else {
+        setOpen(false);
         lookup();
       }
     } else if (e.key === "ArrowDown" && open && items.length > 0) {
@@ -137,12 +160,6 @@ export default function Page() {
     }
   };
 
-  const onSelect = (s: Suggest) => {
-    setQ(s.symbol);
-    setOpen(false);
-    setTimeout(() => lookup(s.symbol), 0);
-  };
-
   const verdictBadge = useMemo(() => {
     if (!data) return null;
     const map = {
@@ -151,11 +168,7 @@ export default function Page() {
       fragile: { label: "FRAGILE", classes: "bg-rose-500/10 text-rose-300 border-rose-600/50" },
     } as const;
     const v = map[data.verdict];
-    return (
-      <span className={`px-2.5 py-1 rounded-full text-xs border ${v.classes}`}>
-        {v.label}
-      </span>
-    );
+    return <span className={`px-2.5 py-1 rounded-full text-xs border ${v.classes}`}>{v.label}</span>;
   }, [data]);
 
   function barColor(score: number) {
@@ -186,7 +199,10 @@ export default function Page() {
       <section className="max-w-6xl mx-auto px-5 pt-8">
         <div className="grid gap-4 md:grid-cols-[1fr_auto]">
           {/* Input + dropdown */}
-          <div className="relative flex rounded-2xl border border-slate-800 bg-slate-900/40 focus-within:ring-2 focus-within:ring-sky-500">
+          <div
+            ref={containerRef}
+            className="relative flex rounded-2xl border border-slate-800 bg-slate-900/40 focus-within:ring-2 focus-within:ring-sky-500"
+          >
             <input
               value={q}
               onChange={(e) => {
@@ -195,6 +211,10 @@ export default function Page() {
               }}
               onKeyDown={onEnter}
               onFocus={() => items.length && setOpen(true)}
+              onBlur={() => {
+                // petite latence pour laisser un clic sur un item se propager
+                setTimeout(() => setOpen(false), 80);
+              }}
               placeholder="Tapez un ticker… (AAPL, TSLA, RMS.PA, ASML.AS)"
               className="flex-1 px-4 py-3.5 bg-transparent outline-none placeholder:text-slate-500"
               aria-autocomplete="list"
@@ -206,23 +226,33 @@ export default function Page() {
             {open && items.length > 0 && (
               <ul
                 id="suggest-list"
-                className="absolute top-[105%] left-0 z-20 mt-1 max-h-80 w-full overflow-auto rounded-xl border border-slate-800 bg-slate-900 shadow-xl"
                 role="listbox"
+                className="absolute left-0 right-0 top-full mt-1 z-40 rounded-xl border border-slate-800 bg-slate-900/95 backdrop-blur max-h-72 overflow-auto shadow-xl"
               >
                 {items.map((s, i) => (
                   <li
                     key={`${s.symbol}-${i}`}
                     role="option"
                     aria-selected={i === highlight}
-                    onMouseDown={(e) => { e.preventDefault(); onSelect(s); }}
+                    onMouseDown={(e) => {
+                      e.preventDefault(); // empêche blur immédiat
+                      setOpen(false);
+                      onSelect(s);
+                    }}
                     onMouseEnter={() => setHighlight(i)}
-                    className={`cursor-pointer px-4 py-2 ${i === highlight ? "bg-slate-800/70" : ""}`}
+                    className={`cursor-pointer px-4 py-2 border-b border-slate-800/50 last:border-0 ${
+                      i === highlight ? "bg-slate-800/70" : "hover:bg-slate-800/40"
+                    }`}
                   >
-                    <div className="flex items-center justify-between">
-                      <div className="font-medium">{s.symbol}</div>
-                      <div className="text-xs text-slate-400">{s.exchange ?? s.type ?? ""}</div>
+                    <div className="flex items-center gap-2">
+                      <span className="font-mono text-sm text-sky-300">{s.symbol}</span>
+                      <span className="text-sm text-slate-200 truncate">{s.name}</span>
                     </div>
-                    <div className="text-sm text-slate-300/90 truncate">{s.name ?? ""}</div>
+                    {(s.exchange || s.type) && (
+                      <div className="text-[11px] text-slate-400 mt-0.5">
+                        {s.exchange || "—"} {s.type ? `· ${s.type}` : ""}
+                      </div>
+                    )}
                   </li>
                 ))}
               </ul>
@@ -230,7 +260,10 @@ export default function Page() {
           </div>
 
           <button
-            onClick={() => lookup()}
+            onClick={() => {
+              setOpen(false);
+              lookup();
+            }}
             disabled={!q || loading}
             className="px-6 py-3.5 rounded-2xl bg-sky-600 hover:bg-sky-500 disabled:opacity-50 font-medium"
           >
@@ -243,7 +276,10 @@ export default function Page() {
           {SUGGESTIONS.map((t) => (
             <button
               key={t}
-              onClick={() => lookup(t)}
+              onClick={() => {
+                setOpen(false);
+                lookup(t);
+              }}
               className="text-xs px-2.5 py-1.5 rounded-full border border-slate-800 bg-slate-900/30 hover:bg-slate-800/50 text-slate-300"
             >
               {t}
@@ -289,9 +325,7 @@ export default function Page() {
                       </span>
                     </div>
 
-                    <p className="mt-1 text-slate-400">
-                      {data.verdict_reason}
-                    </p>
+                    <p className="mt-1 text-slate-400">{data.verdict_reason}</p>
                   </div>
 
                   <div className="w-36 shrink-0">
@@ -301,9 +335,7 @@ export default function Page() {
                     </div>
                     <div className="mt-2 h-2 rounded-full bg-slate-800 overflow-hidden">
                       <div
-                        className={`h-full ${barColor(
-                          data.score_adj ?? data.score
-                        )}`}
+                        className={`h-full ${barColor(data.score_adj ?? data.score)}`}
                         style={{ width: `${Math.min(100, data.score_adj ?? data.score)}%` }}
                       />
                     </div>
@@ -316,9 +348,7 @@ export default function Page() {
                 {/* Reasons */}
                 <div className="mt-6 grid md:grid-cols-2 gap-5">
                   <div className="p-4 rounded-2xl bg-slate-900/50 border border-slate-800">
-                    <h3 className="text-sm uppercase tracking-wide text-slate-400">
-                      Raisons principales
-                    </h3>
+                    <h3 className="text-sm uppercase tracking-wide text-slate-400">Raisons principales</h3>
                     <ul className="mt-2 space-y-1.5">
                       {(data.reasons_positive || []).map((r, i) => (
                         <li key={i} className="flex items-start gap-2">
@@ -329,9 +359,7 @@ export default function Page() {
                     </ul>
                   </div>
                   <div className="p-4 rounded-2xl bg-slate-900/50 border border-slate-800">
-                    <h3 className="text-sm uppercase tracking-wide text-slate-400">
-                      Drapeaux rouges
-                    </h3>
+                    <h3 className="text-sm uppercase tracking-wide text-slate-400">Drapeaux rouges</h3>
                     <ul className="mt-2 space-y-1.5">
                       {data.red_flags?.length ? (
                         data.red_flags.map((r, i) => (
@@ -352,21 +380,12 @@ export default function Page() {
 
                 {/* Subscores */}
                 <div className="mt-6">
-                  <h3 className="text-sm uppercase tracking-wide text-slate-400">
-                    Sous-scores
-                  </h3>
+                  <h3 className="text-sm uppercase tracking-wide text-slate-400">Sous-scores</h3>
                   <div className="mt-2 grid grid-cols-2 sm:grid-cols-4 gap-3">
                     {Object.entries(data.subscores || {}).map(([k, v]) => (
-                      <div
-                        key={k}
-                        className="p-4 rounded-2xl bg-slate-900/40 border border-slate-800"
-                      >
-                        <div className="text-xs text-slate-400 capitalize">
-                          {k}
-                        </div>
-                        <div className="text-2xl font-semibold tabular-nums">
-                          {Math.round(v)}
-                        </div>
+                      <div key={k} className="p-4 rounded-2xl bg-slate-900/40 border border-slate-800">
+                        <div className="text-xs text-slate-400 capitalize">{k}</div>
+                        <div className="text-2xl font-semibold tabular-nums">{Math.round(v)}</div>
                       </div>
                     ))}
                   </div>
@@ -375,17 +394,13 @@ export default function Page() {
             </div>
 
             {/* Disclaimer */}
-            <p className="mt-3 text-xs text-slate-500">
-              Pas un conseil en investissement. Sources publiques, sans clé.
-            </p>
+            <p className="mt-3 text-xs text-slate-500">Pas un conseil en investissement. Sources publiques, sans clé.</p>
           </div>
 
           {/* Right: Proofs */}
           <aside className="lg:col-span-1">
             <div className="rounded-3xl border border-slate-800 bg-slate-900/40 p-5">
-              <h3 className="text-sm uppercase tracking-wide text-slate-400">
-                Preuves (sources &amp; fraîcheur)
-              </h3>
+              <h3 className="text-sm uppercase tracking-wide text-slate-400">Preuves (sources &amp; fraîcheur)</h3>
 
               {/* Price block */}
               <div className="mt-3 p-3 rounded-2xl bg-slate-950/40 border border-slate-800">
@@ -396,9 +411,7 @@ export default function Page() {
                   </span>
                 </div>
                 <div className="mt-2 flex flex-wrap gap-2 text-xs">
-                  {typeof data.proof?.price_points === "number" && (
-                    <Badge>Points : {data.proof?.price_points}</Badge>
-                  )}
+                  {typeof data.proof?.price_points === "number" && <Badge>Points : {data.proof?.price_points}</Badge>}
                   {data.proof?.price_has_200dma && <Badge variant="ok">200DMA OK</Badge>}
                   {typeof data.proof?.price_recency_days === "number" && (
                     <Badge>Fraîcheur : {data.proof?.price_recency_days} j</Badge>
@@ -416,9 +429,7 @@ export default function Page() {
                     <Badge variant="muted">—</Badge>
                   )}
                 </div>
-                {data.proof?.sec_note && (
-                  <div className="mt-1 text-xs text-slate-400">{data.proof.sec_note}</div>
-                )}
+                {data.proof?.sec_note && <div className="mt-1 text-xs text-slate-400">{data.proof.sec_note}</div>}
               </div>
 
               {/* Valuation */}
@@ -463,11 +474,7 @@ function Badge({
     warn: "border-amber-700/50 bg-amber-500/10 text-amber-300",
     muted: "border-slate-800 bg-slate-900/40 text-slate-400",
   };
-  return (
-    <span className={`text-xs px-2 py-0.5 rounded-full border ${map[variant]}`}>
-      {children}
-    </span>
-  );
+  return <span className={`text-xs px-2 py-0.5 rounded-full border ${map[variant]}`}>{children}</span>;
 }
 
 function SourceChip({ src }: { src: string }) {
@@ -478,14 +485,4 @@ function SourceChip({ src }: { src: string }) {
     /wikipedia/.test(src) ? "muted" :
     "default";
   return <Badge variant={variant as any}>{label}</Badge>;
-}
-
-/* ---------------- Small hooks ---------------- */
-function useDebouncedValue<T>(value: T, delay = 200) {
-  const [v, setV] = useState(value);
-  useEffect(() => {
-    const id = setTimeout(() => setV(value), delay);
-    return () => clearTimeout(id);
-  }, [value, delay]);
-  return v;
 }
