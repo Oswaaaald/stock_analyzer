@@ -1,3 +1,4 @@
+// app/page.tsx
 "use client";
 import { useEffect, useMemo, useRef, useState } from "react";
 
@@ -55,7 +56,11 @@ export default function Page() {
   const debounceId = useRef<ReturnType<typeof setTimeout> | null>(null);
   const inputRef = useRef<HTMLInputElement | null>(null);
   const sugRef = useRef<HTMLDivElement | null>(null);
-  const suppressSuggestRef = useRef<boolean>(false); // évite réouverture auto
+  const suppressSuggestRef = useRef<boolean>(false);
+
+  // meta pour affichage "Nom — EXCHANGE"
+  const [fullName, setFullName] = useState<string | null>(null);
+  const [exchange, setExchange] = useState<string | null>(null);
 
   /* ========= URL param -> auto lookup ========= */
   useEffect(() => {
@@ -77,6 +82,8 @@ export default function Page() {
     setLoading(true);
     setError(null);
     setData(null);
+    setFullName(null);
+    setExchange(null);
     try {
       const res = await fetch(`/api/score/${encodeURIComponent(sym)}`, { cache: "no-store" });
       if (!res.ok) {
@@ -86,15 +93,39 @@ export default function Page() {
       const json: ScoreResponse = await res.json();
       setData(json);
 
+      // update URL
       const url = new URL(location.href);
       url.searchParams.set("ticker", sym);
       history.replaceState(null, "", url.toString());
+
+      // Résoudre le nom complet + exchange via suggest
+      void resolveMeta(sym);
     } catch (e: any) {
       setError(e?.message || "Erreur inconnue");
     } finally {
       setLoading(false);
       setShowSug(false);
       inputRef.current?.blur();
+    }
+  }
+
+  async function resolveMeta(sym: string) {
+    try {
+      const r = await fetch(`/api/suggest?q=${encodeURIComponent(sym)}`, { cache: "no-store" });
+      if (!r.ok) return;
+      const j = (await r.json()) as { suggestions?: SuggestItem[] };
+      const list = j?.suggestions || [];
+      if (!list.length) return;
+
+      // Cherche correspondance exacte par symbole (case-insensitive), sinon premier résultat
+      const exact =
+        list.find((it) => it.symbol?.toUpperCase() === sym.toUpperCase()) ??
+        list[0];
+
+      setFullName(exact?.name || null);
+      setExchange(exact?.exchange || null);
+    } catch {
+      // silencieux
     }
   }
 
@@ -179,21 +210,27 @@ export default function Page() {
     return <span className={`px-2.5 py-1 rounded-full text-xs border ${v.classes}`}>{v.label}</span>;
   }, [data]);
 
-  // === couleur unique pilotée par le verdict (ruban + barre) ===
-  function verdictColor(v: "sain" | "a_surveiller" | "fragile") {
-    switch (v) {
-      case "sain":
-        return "bg-emerald-500";
-      case "a_surveiller":
-        return "bg-amber-500";
-      case "fragile":
-        return "bg-rose-500";
-    }
+  function verdictPillColor(score: number) {
+    if (score >= 70) return "bg-emerald-500/15 text-emerald-300 border-emerald-700/40";
+    if (score >= 50) return "bg-amber-500/15 text-amber-300 border-amber-700/40";
+    return "bg-rose-500/15 text-rose-300 border-rose-700/40";
+  }
+
+  function barColor(score: number) {
+    if (score >= 70) return "bg-emerald-500";
+    if (score >= 50) return "bg-amber-500";
+    return "bg-rose-500";
   }
 
   function fmtPct(x?: number | null) {
     return typeof x === "number" ? `${(x * 100).toFixed(1)}%` : "—";
   }
+
+  const headerSubtitle = useMemo(() => {
+    if (!fullName && !exchange) return null;
+    const right = [fullName, exchange ? exchange.toUpperCase() : null].filter(Boolean).join(" — ");
+    return right || null;
+  }, [fullName, exchange]);
 
   /* ====================== Render ====================== */
   return (
@@ -319,36 +356,43 @@ export default function Page() {
         <section className="max-w-6xl mx-auto px-5 py-8 grid lg:grid-cols-3 gap-6">
           {/* Left: Score & reasons */}
           <div className="lg:col-span-2">
-            <div className="relative overflow-hidden rounded-3xl border border-slate-800 bg-gradient-to-b from-slate-900/60 to-slate-900/30">
-              {/* Ribbon */}
-              <div className="absolute -right-14 top-6 rotate-45">
-                <div className={`px-16 py-1 text-xs tracking-wider text-white/90 ${verdictColor(data.verdict)}`}>
-                  {data.verdict.toUpperCase()}
-                </div>
-              </div>
-
+            <div className="overflow-hidden rounded-3xl border border-slate-800 bg-gradient-to-b from-slate-900/60 to-slate-900/30">
               <div className="p-6 md:p-7">
                 <div className="flex items-start gap-4">
                   <div className="flex-1">
-                    <div className="flex items-center gap-3">
+                    {/* Header titre + verdict pill */}
+                    <div className="flex flex-wrap items-center gap-3">
                       <h2 className="text-2xl font-semibold tracking-tight">{data.ticker.toUpperCase()}</h2>
-                      {verdictBadge}
+                      {/* Verdict-colored pill (remplace le ruban) */}
+                      <span
+                        className={`px-2.5 py-1 rounded-full text-xs border ${verdictPillColor(
+                          data.score_adj ?? data.score
+                        )}`}
+                      >
+                        {data.verdict.toUpperCase()}
+                      </span>
+                      {/* Badge couverture */}
                       <span className="text-xs px-2 py-0.5 rounded-full border border-slate-700 text-slate-300">
                         Fiabilité {data.coverage}%
                       </span>
                     </div>
-
-                    <p className="mt-1 text-slate-400">{data.verdict_reason}</p>
+                    {/* Sous-titre: Nom — EXCHANGE */}
+                    {headerSubtitle && (
+                      <div className="mt-0.5 text-slate-400 text-sm">{headerSubtitle}</div>
+                    )}
+                    {/* Raison */}
+                    <p className="mt-2 text-slate-400">{data.verdict_reason}</p>
                   </div>
 
-                  <div className="w-36 shrink-0">
+                  {/* Score à droite */}
+                  <div className="w-40 shrink-0">
                     <div className="text-4xl font-extrabold tabular-nums text-right">
                       {data.score_adj ?? data.score}
                       <span className="text-lg text-slate-400">/100</span>
                     </div>
                     <div className="mt-2 h-2 rounded-full bg-slate-800 overflow-hidden">
                       <div
-                        className={`h-full ${verdictColor(data.verdict)}`}
+                        className={`h-full ${barColor(data.score_adj ?? data.score)}`}
                         style={{ width: `${Math.min(100, data.score_adj ?? data.score)}%` }}
                       />
                     </div>
@@ -489,7 +533,7 @@ function Badge({
 function SourceChip({ src }: { src: string }) {
   const label = src.replace(/^price:/, "price · ").replace(/^sec:/, "sec · ");
   const variant =
-    /fin-html/.test(src) ? "ok" : /yahoo:html|yahoo:v7|yahoo:summary|yahoo:v10/.test(src) ? "default" : /wikipedia/.test(src) ? "muted" : "default";
+    /fin-html/.test(src) ? "ok" : /yahoo:html|yahoo:v7|yahoo:summary/.test(src) ? "default" : /wikipedia/.test(src) ? "muted" : "default";
   return <Badge variant={variant as any}>{label}</Badge>;
 }
 
