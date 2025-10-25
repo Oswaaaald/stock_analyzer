@@ -162,39 +162,56 @@ export async function GET(req: Request, { params }: { params: { ticker: string }
     const bundle: DataBundle = { ticker: t, fundamentals, prices: priceFeed, sources_used };
     const { subscores, maxes } = computeScore(bundle);
 
-    // ===== Fiabilité (UI) : par présence des PILIERS =====
-    const qualityPresent =
-      typeof fundamentals.op_margin.value === "number";
-    const safetyPresent =
-      typeof fundamentals.current_ratio.value === "number" ||
-      typeof fundamentals.net_cash.value === "number";
-    const valuationPresent =
-      typeof fundamentals.fcf_yield.value === "number" ||
-      typeof fundamentals.earnings_yield.value === "number";
-    // Momentum “présent” seulement si la 200DMA est calculable (≥200 points)
-    const momentumPresent =
-      typeof priceFeed.px_vs_200dma.value === "number";
-
-    const coverage_display =
-      (qualityPresent ? 35 : 0) +
-      (safetyPresent ? 25 : 0) +
-      (valuationPresent ? 25 : 0) +
-      (momentumPresent ? 15 : 0); // 0..100
-
-    // ===== Couverture pour la normalisation du score (dénominateur) =====
+    // ===== Dénominateur réel (ce qui est disponible) : 0..39 =====
     const denom = Math.max(
       1,
       Math.round(maxes.quality + maxes.safety + maxes.valuation + maxes.momentum)
     );
 
-    // ===== Scores =====
+    // ===== Score bruts / normalisés =====
     const total = subscores.quality + subscores.safety + subscores.valuation + subscores.momentum;
     const raw = Math.max(0, Math.min(100, Math.round(total)));
-    const score_adj = Math.round((total / denom) * 100); // normalisé sur ce qui est réellement disponible
+    const score_adj = Math.round((total / denom) * 100); // 0..100 (normalisé sur "dispo")
+
+    // ===== Fiabilité (UI) =====
+    // Base = proportion de briques réellement disponibles (denom/39), puis pénalités “richesse” douces.
+    let coverage_display = Math.round((denom / 39) * 100); // 0..100
+
+    // Pénalités de richesse/fraîcheur (n’affecte pas le score, juste la fiabilité affichée)
+    let penalty = 0;
+
+    // Prix pas assez dense / pas assez frais
+    const pts = priceFeed.meta?.points ?? 0;
+    const recency = priceFeed.meta?.recency_days ?? 999;
+    if (pts < 240) penalty += 8;                // pas ~1 an de données “pleines”
+    if (recency > 7) penalty += 8;              // données trop anciennes (> 7 j)
+
+    // Valorisation basée uniquement sur EY (pas de FCFY)
+    const hasFCFY = fundamentals.fcf_yield.value != null;
+    const hasEY   = fundamentals.earnings_yield.value != null;
+    if (!hasFCFY && hasEY) penalty += 7;
+
+    // Sécurité basée uniquement sur "net_cash" (pas de current ratio)
+    const hasCR = fundamentals.current_ratio.value != null;
+    const hasNC = fundamentals.net_cash.value != null;
+    if (!hasCR && hasNC) penalty += 5;
+
+    // Ratios avancés manquants → chaque absence retire un peu de confiance
+    const missingRatios =
+      (fundamentals.roe?.value == null ? 1 : 0) +
+      (fundamentals.roa?.value == null ? 1 : 0) +
+      (fundamentals.roic?.value == null ? 1 : 0) +
+      (fundamentals.fcf_over_netincome?.value == null ? 1 : 0);
+    penalty += missingRatios * 3; // max -12
+
+    coverage_display = Math.round(Math.max(5, Math.min(100, coverage_display - penalty)));
 
     // Couleur & verdict basés sur le score affiché (shown)
     const shown = score_adj ?? raw;
     const color: ScorePayload["color"] = shown >= 65 ? "green" : shown >= 50 ? "orange" : "red";
+
+    // Momentum considéré “présent” si la 200DMA est calculable
+    const momentumPresent = typeof priceFeed.px_vs_200dma.value === "number";
 
     const { verdict, reason } = makeVerdict({
       coverage: coverage_display,
@@ -215,7 +232,7 @@ export async function GET(req: Request, { params }: { params: { ticker: string }
       reasons_positive: reasons.slice(0, 3),
       red_flags: [],
       subscores,
-      coverage: coverage_display, // pour l’UI
+      coverage: coverage_display, // ← nouvelle fiabilité
       proof: {
         price_source: priceFeed.meta?.source_primary,
         price_points: priceFeed.meta?.points,
@@ -233,7 +250,9 @@ export async function GET(req: Request, { params }: { params: { ticker: string }
     };
 
     if (!isDebug) MEM[cacheKey] = { expires: now + TTL_MS, data: payload };
-    return NextResponse.json(payload, { headers: { "Cache-Control": "s-maxage=600, stale-while-revalidate=1200" } });
+    return NextResponse.json(payload, {
+      headers: { "Cache-Control": "s-maxage=600, stale-while-revalidate=1200" },
+    });
   } catch (e: any) {
     const msg = typeof e?.message === "string" ? e.message : e?.toString?.() || "Erreur provider";
     return NextResponse.json({ error: msg }, { status: 500 });
