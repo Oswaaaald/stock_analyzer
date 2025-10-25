@@ -1,4 +1,4 @@
-// Exécuter sur runtime Node.js
+// Exécuter sur runtime Node.js (Edge peut bloquer certaines requêtes)
 export const runtime = "nodejs";
 
 import { NextResponse } from "next/server";
@@ -26,8 +26,8 @@ type Fundamentals = {
   dilution_3y: Metric;          // variation actions 3 ans
   fcf_positive_last4: Metric;   // 0..4
   fcf_yield: Metric;            // FCF / MarketCap
-  earnings_yield: Metric;       // 1 / (Trailing P/E) ou EPS_TTM / Price
-  net_cash: Metric;             // cash - debt (positif => 1, sinon 0)
+  earnings_yield: Metric;       // 1 / (Trailing P/E)
+  net_cash: Metric;             // cash - debt (positif => 1, sinon 0, proxy)
 };
 
 type Prices = {
@@ -37,7 +37,11 @@ type Prices = {
   max_dd_1y: Metric;
   ret_20d: Metric;
   ret_60d: Metric;
-  meta?: { source_primary?: "yahoo" | "stooq.com" | "stooq.pl"; points?: number; recency_days?: number };
+  meta?: {
+    source_primary?: "yahoo" | "stooq.com" | "stooq.pl";
+    points?: number;
+    recency_days?: number;
+  };
 };
 
 type DataBundle = {
@@ -90,17 +94,15 @@ export async function GET(req: Request, { params }: { params: { ticker: string }
     const priceFeed = await fetchPricesBestOf(t);
 
     // Fondamentaux (toutes les sources)
-    const sec  = await fetchFromSEC_US_IfPossible(t, priceFeed.px.value);
-    const fmp  = await fetchFmpRatiosIfPossible(t);
-    const ySum = await fetchYahooSummaryIfPossible(t);
-    const yV7  = await fetchYahooQuoteV7(t);
-    const yHtml= await fetchYahooKeyStatsHtml(t);
-    const wiki = await fetchWikipediaOpMargin(t);
+    const sec   = await fetchFromSEC_US_IfPossible(t, priceFeed.px.value);
+    const fmp   = await fetchFmpRatiosIfPossible(t);
+    const ySum  = await fetchYahooSummaryIfPossible(t);
+    const yV7   = await fetchYahooQuoteV7(t);
+    const yHtml = await fetchYahooKeyStatsHtml(t);
+    const yFts  = await fetchYahooFtsTimeseries(t); // <— nouveau
+    const wiki  = await fetchWikipediaOpMargin(t);
 
-    // >>> [NEW] Fallback valuation via SEC (EPS_TTM & FCF_TTM)
-    const secVal = await secValuationFallback(t, priceFeed.px.value);
-    // <<< [END]
-
+    // Mode debug : snapshot des fetchers
     if (isDebug) {
       return NextResponse.json({
         ticker: t,
@@ -135,8 +137,11 @@ export async function GET(req: Request, { params }: { params: { ticker: string }
           fcf_yield: (yHtml.fundamentals as any)?.fcf_yield?.value ?? null,
           net_cash: (yHtml.fundamentals as any)?.net_cash?.value ?? null,
         },
-        yahoo_fin_html: {
-          used: false, // si tu as un fetcher root.App.main, remonte-le ici
+        yahoo_fts: {
+          used: yFts.used,
+          earnings_yield: (yFts.fundamentals as any)?.earnings_yield?.value ?? null,
+          fcf_yield: (yFts.fundamentals as any)?.fcf_yield?.value ?? null,
+          net_cash: (yFts.fundamentals as any)?.net_cash?.value ?? null,
         },
         wikipedia: {
           used: wiki.used,
@@ -153,11 +158,6 @@ export async function GET(req: Request, { params }: { params: { ticker: string }
           earnings_yield: sec.fundamentals.earnings_yield.value,
           net_cash: sec.fundamentals.net_cash.value,
         },
-        sec_valuation_fallback: {
-          used: Boolean(secVal.fundamentals.earnings_yield?.value != null || secVal.fundamentals.fcf_yield?.value != null),
-          earnings_yield: secVal.fundamentals.earnings_yield?.value ?? null,
-          fcf_yield: secVal.fundamentals.fcf_yield?.value ?? null,
-        },
         fmp_demo: {
           used: fmp.used,
           op_margin: (fmp.fundamentals as any)?.op_margin?.value ?? null,
@@ -165,29 +165,19 @@ export async function GET(req: Request, { params }: { params: { ticker: string }
           fcf_yield: (fmp.fundamentals as any)?.fcf_yield?.value ?? null,
           earnings_yield: (fmp.fundamentals as any)?.earnings_yield?.value ?? null,
         },
-      }, {
-        headers: { "Cache-Control": "no-store" },
-      });
+      }, { headers: { "Cache-Control": "no-store" } });
     }
 
-    // Merge (pondéré), puis injection du fallback SEC si valuation absente
-    let fundamentals = mergeFundamentalsWeighted({
-      sec: sec.fundamentals,
-      fmp: fmp.fundamentals,
+    // Fusion pondérée (SEC/IFRS > Yahoo FTS > Yahoo JSON > v7 > HTML > FMP > Wikipedia)
+    const fundamentals = mergeFundamentalsWeighted({
+      sec:  sec.fundamentals,
+      fmp:  fmp.fundamentals,
       ysum: ySum,
-      yhtml: yHtml,
+      yhtml:yHtml,
       wiki: wiki,
       yv7:  yV7,
+      yfts: yFts, // <— nouveau
     });
-
-    if ((fundamentals.earnings_yield.value == null) && (secVal.fundamentals.earnings_yield?.value != null)) {
-      fundamentals.earnings_yield = secVal.fundamentals.earnings_yield!;
-    }
-    if ((fundamentals.fcf_yield.value == null) && (secVal.fundamentals.fcf_yield?.value != null)) {
-      fundamentals.fcf_yield = secVal.fundamentals.fcf_yield!;
-    }
-
-    const usedSecVal = Boolean(secVal.fundamentals.earnings_yield?.value != null || secVal.fundamentals.fcf_yield?.value != null);
 
     const bundle: DataBundle = {
       ticker: t,
@@ -196,11 +186,11 @@ export async function GET(req: Request, { params }: { params: { ticker: string }
       sources_used: [
         priceFeed.meta?.source_primary ? `price:${priceFeed.meta.source_primary}` : "price:unknown",
         ...(sec.used?.length ? sec.used.map((x: string) => `sec:${x}`) : []),
-        ...(usedSecVal ? ["sec:valuation"] : []),
         ...(fmp.used ? ["fmp:ratios"] : []),
         ...(ySum.used ? ["yahoo:summary"] : []),
         ...(yV7.used ? ["yahoo:v7"] : []),
         ...(yHtml.used ? ["yahoo:html"] : []),
+        ...(yFts.used ? ["yahoo:fts"] : []),
         ...(wiki.used ? ["wikipedia"] : []),
       ],
     };
@@ -237,11 +227,11 @@ export async function GET(req: Request, { params }: { params: { ticker: string }
         sources_used: [
           priceFeed.meta?.source_primary ? `price:${priceFeed.meta.source_primary}` : "price:unknown",
           ...(sec.used?.length ? sec.used.map((x: string) => `sec:${x}`) : []),
-          ...(usedSecVal ? ["sec:valuation"] : []),
           ...(fmp.used ? ["fmp:ratios"] : []),
           ...(ySum.used ? ["yahoo:summary"] : []),
           ...(yV7.used ? ["yahoo:v7"] : []),
           ...(yHtml.used ? ["yahoo:html"] : []),
+          ...(yFts.used ? ["yahoo:fts"] : []),
           ...(wiki.used ? ["wikipedia"] : []),
         ],
       },
@@ -390,7 +380,7 @@ function enrichCloses(closes: number[]) {
 }
 
 /* ======================================================================================
- *  SEC (US-GAAP + IFRS) — principaux ratios
+ *  SEC (US-GAAP + IFRS)
  * ====================================================================================*/
 let TICKER_MAP: Record<string, { cik_str: number; ticker: string; title: string }> = {};
 let TICKER_MAP_EXP = 0;
@@ -412,7 +402,7 @@ async function loadTickerMap(): Promise<typeof TICKER_MAP> {
 function pickBestUnit(units?: FactUnits, preferUSD = true): FactPoint[] | undefined {
   if (!units) return undefined;
   if (preferUSD && units.USD && units.USD.length) return sortByEnd(units.USD);
-  let best: FactPoint[] | undefined;
+  let best: FactPoint[] | undefined = undefined;
   for (const arr of Object.values(units)) {
     const valid = Array.isArray(arr) ? arr.filter(p => typeof p?.val === "number") : [];
     if (!valid.length) continue;
@@ -514,7 +504,7 @@ async function fetchFromSEC_US_IfPossible(ticker: string, lastPrice: number | nu
     }
   }
 
-  // CFO & Capex → fcf_positive_last4
+  // CFO & Capex → fcf_positive_last4 + fcf_yield
   const cfoUnits =
     usgaap.NetCashProvidedByUsedInOperatingActivities?.units ||
     usgaap.NetCashProvidedByUsedInOperatingActivitiesContinuingOperations?.units ||
@@ -543,103 +533,25 @@ async function fetchFromSEC_US_IfPossible(ticker: string, lastPrice: number | nu
     fund.fcf_positive_last4 = asMetric(countPos, 0.7, "sec");
   }
 
-  return { fundamentals: fund, used, note };
-}
-
-/* ======================================================================================
- *  [NEW] SEC valuation fallback (EPS_TTM & FCF_TTM)
- * ====================================================================================*/
-async function secValuationFallback(ticker: string, lastPrice: number | null) {
-  const out: Partial<Fundamentals> = {};
-  let used = false;
-
-  if (!(typeof lastPrice === "number" && lastPrice > 0)) {
-    return { fundamentals: out, used };
-  }
-
-  let cik: string | null = null;
-  try {
-    const map = await loadTickerMap();
-    const hit = map[ticker.toUpperCase()];
-    if (hit?.cik_str) cik = String(hit.cik_str).padStart(10, "0");
-  } catch {}
-
-  if (!cik) return { fundamentals: out, used };
-
-  try {
-    const factsUrl = `https://data.sec.gov/api/xbrl/companyfacts/CIK${cik}.json`;
-    const factsDoc = await fetchJsonSafe(factsUrl, {
-      "User-Agent": `StockAnalyzer/1.0 (${CONTACT_EMAIL})`,
-      "Accept": "application/json",
-    });
-    const facts = factsDoc?.facts?.["us-gaap"];
-    if (!facts) return { fundamentals: out, used };
-
-    const takeLastNQuarterlySum = (arr?: any[], n = 4): number | null => {
-      if (!arr || !Array.isArray(arr)) return null;
-      const q = arr.filter(v => (v?.fp || "").toUpperCase().startsWith("Q"))
-                   .sort((a,b) => (a.end || "").localeCompare(b.end || ""));
-      if (q.length < n) return null;
-      let s = 0;
-      for (let i = q.length - n; i < q.length; i++) {
-        const v = +q[i].val;
-        if (!Number.isFinite(v)) return null;
-        s += v;
-      }
-      return s;
-    };
-    const lastShares = (arr?: any[]): number | null => {
-      if (!arr || !Array.isArray(arr) || !arr.length) return null;
-      const sorted = [...arr].sort((a,b) => (a.end || "").localeCompare(b.end || ""));
-      const v = +sorted[sorted.length - 1].val;
-      return Number.isFinite(v) ? v : null;
-    };
-
-    // EPS diluted TTM (USD/shares)
-    const epsArr = facts?.EarningsPerShareDiluted?.units?.["USD/shares"];
-    const epsTTM = takeLastNQuarterlySum(epsArr, 4);
-    if (typeof epsTTM === "number" && lastPrice > 0) {
-      const y = epsTTM / lastPrice;
-      if (Number.isFinite(y) && y > 0) {
-        out.earnings_yield = { value: y, confidence: 0.75, source: "sec" };
-        used = true;
-      }
-    }
-
-    // CFO & Capex TTM → FCF yield
-    const cfoArr =
-      facts?.NetCashProvidedByUsedInOperatingActivities?.units?.USD ||
-      facts?.NetCashProvidedByUsedInOperatingActivitiesContinuingOperations?.units?.USD || [];
-    const capexArr =
-      facts?.PaymentsToAcquireProductiveAssets?.units?.USD ||
-      facts?.PurchasesOfPropertyPlantAndEquipment?.units?.USD ||
-      facts?.PurchaseOfPropertyPlantAndEquipment?.units?.USD || [];
-
-    const cfoTTM = takeLastNQuarterlySum(cfoArr, 4);
-    const capTTM = takeLastNQuarterlySum(capexArr, 4);
-
-    const shArr =
-      facts?.EntityCommonStockSharesOutstanding?.units?.shares ||
-      facts?.CommonStockSharesOutstanding?.units?.shares || [];
-    const shares = lastShares(shArr);
-
-    if (typeof cfoTTM === "number" && typeof capTTM === "number" && typeof shares === "number" && shares > 0) {
-      const fcf = cfoTTM - Math.abs(capTTM);
-      const mcap = lastPrice * shares;
+  const isUS = used.includes("us-gaap");
+  const cfoTTM = sumLastNQuarterly(cfoSeries, 4) ?? lastAnnual(cfoSeries);
+  const capTTM = sumLastNQuarterly(capSeries, 4) ?? lastAnnual(capSeries);
+  if (isUS && typeof lastPrice === "number" && typeof cfoTTM === "number" && typeof capTTM === "number") {
+    const shLast = lastVal(shSeries);
+    if (typeof shLast === "number" && shLast > 0) {
+      const mcap = lastPrice * shLast;
       if (mcap > 0) {
+        const fcf = cfoTTM - Math.abs(capTTM);
         let y = fcf / mcap;
-        y = Math.max(-0.05, Math.min(0.08, y)); // clamp conservateur
-        if (Number.isFinite(y) && y > 0) {
-          out.fcf_yield = { value: y, confidence: 0.70, source: "sec" };
-          used = true;
+        y = Math.max(-0.05, Math.min(0.08, y));
+        if (typeof fund.fcf_positive_last4.value === "number" && fund.fcf_positive_last4.value >= 2) {
+          fund.fcf_yield = asMetric(y, 0.7, "sec");
         }
       }
     }
-
-    return { fundamentals: out, used };
-  } catch {
-    return { fundamentals: out, used };
   }
+
+  return { fundamentals: fund, used, note };
 }
 
 /* ======================================================================================
@@ -679,7 +591,7 @@ async function fetchFmpRatiosIfPossible(ticker: string) {
 }
 
 /* ======================================================================================
- *  Yahoo SUMMARY (JSON) – best effort
+ *  Yahoo SUMMARY (JSON) — best effort (401 fréquent)
  * ====================================================================================*/
 async function fetchYahooSummaryIfPossible(ticker: string) {
   const headers = { "User-Agent": "Mozilla/5.0 (compatible; StockAnalyzer/1.0)", "Accept": "application/json, text/plain, */*" };
@@ -729,7 +641,7 @@ async function fetchYahooSummaryIfPossible(ticker: string) {
 }
 
 /* ======================================================================================
- *  Yahoo QUOTE v7 — trailingPE, priceToBook (souvent dispo en Europe)
+ *  Yahoo QUOTE v7 — trailingPE, priceToBook (souvent vide ici)
  * ====================================================================================*/
 async function fetchYahooQuoteV7(ticker: string) {
   const headers = { "User-Agent": "Mozilla/5.0 (compatible; StockAnalyzer/1.0)", "Accept": "application/json, text/plain, */*" };
@@ -755,6 +667,65 @@ async function fetchYahooQuoteV7(ticker: string) {
     if (typeof r.priceToBook === "number" && r.priceToBook > 0) {
       out.net_cash = { value: r.priceToBook < 1.2 ? 1 : 0, confidence: 0.25, source: "yahoo-v7" };
     }
+  } catch {}
+  return { fundamentals: out, used };
+}
+
+/* ======================================================================================
+ *  Yahoo FUNDAMENTALS-TIMESERIES (v1) — P/E TTM, P/FCF TTM, P/B
+ * ====================================================================================*/
+async function fetchYahooFtsTimeseries(ticker: string) {
+  const base = `https://query2.finance.yahoo.com/ws/fundamentals-timeseries/v1/finance/timeseries/${encodeURIComponent(ticker)}`;
+  const qs = `types=trailingPeTTM,priceToFreeCashFlowTTM,priceToBook&padTimeSeries=true&lang=en-US&region=US&corsDomain=finance.yahoo.com`;
+  const url = `${base}?${qs}`;
+  const headers = {
+    "User-Agent": "Mozilla/5.0 (compatible; StockAnalyzer/1.0)",
+    "Accept": "application/json, text/plain, */*",
+  };
+
+  const js = await fetchJsonSafe(url, headers);
+  const out: Partial<Fundamentals> = {};
+  let used = false;
+
+  try {
+    const arr = js?.timeseries?.result;
+    if (!Array.isArray(arr) || !arr.length) return { fundamentals: out, used };
+
+    const pickLast = (series: any[]): number | null => {
+      if (!Array.isArray(series)) return null;
+      for (let i = series.length - 1; i >= 0; i--) {
+        const row = series[i];
+        const v =
+          (typeof row?.reportedValue?.raw === "number" && Number.isFinite(row.reportedValue.raw))
+            ? row.reportedValue.raw
+            : (typeof row?.value === "number" && Number.isFinite(row.value))
+              ? row.value
+              : null;
+        if (v !== null) return v;
+      }
+      return null;
+    };
+
+    const bag: Record<string, number | null> = {};
+    for (const node of arr) {
+      for (const key of Object.keys(node || {})) {
+        if (key === "meta") continue;
+        const val = pickLast((node as any)[key]);
+        if (val !== null && typeof bag[key] !== "number") bag[key] = val;
+      }
+    }
+
+    const pe = typeof bag.trailingPeTTM === "number" && bag.trailingPeTTM > 0 ? bag.trailingPeTTM : null;
+    if (pe) { out.earnings_yield = asMetric(1 / pe, 0.55, "yahoo-fts"); used = true; }
+
+    const pfcf = typeof bag.priceToFreeCashFlowTTM === "number" && bag.priceToFreeCashFlowTTM > 0 ? bag.priceToFreeCashFlowTTM : null;
+    if (pfcf) {
+      const y = Math.max(-0.05, Math.min(0.08, 1 / pfcf));
+      out.fcf_yield = asMetric(y, 0.55, "yahoo-fts"); used = true;
+    }
+
+    const ptb = typeof bag.priceToBook === "number" && bag.priceToBook > 0 ? bag.priceToBook : null;
+    if (ptb) { out.net_cash = asMetric(ptb < 1.2 ? 1 : 0, 0.22, "yahoo-fts"); used = true; }
   } catch {}
   return { fundamentals: out, used };
 }
@@ -837,7 +808,7 @@ async function fetchYahooKeyStatsHtml(ticker: string) {
 }
 
 /* ======================================================================================
- *  Wikipedia (EN/FR) : op_margin via revenue & operating income
+ *  Wikipedia (EN/FR) : op_margin via revenue & op income
  * ====================================================================================*/
 async function fetchWikipediaOpMargin(ticker: string) {
   const search = await fetchJsonSafe(`https://query2.finance.yahoo.com/v1/finance/search?q=${encodeURIComponent(ticker)}`);
@@ -914,20 +885,22 @@ async function fetchWikipediaOpMargin(ticker: string) {
 }
 
 /* ======================================================================================
- *  MERGE pondéré : SEC/IFRS > Yahoo JSON > Yahoo v7 > Yahoo HTML > FMP > Wikipedia
+ *  MERGE pondéré : SEC/IFRS > Yahoo FTS > Yahoo JSON > v7 > HTML > FMP > Wikipedia
  * ====================================================================================*/
 function mergeFundamentalsWeighted(src: {
   sec: Fundamentals;
   fmp: Partial<Fundamentals>;
   ysum: { fundamentals: Partial<Fundamentals>; used: boolean };
-  yhtml: { fundamentals: Partial<Fundamentals>; used: boolean };
+  yhtml:{ fundamentals: Partial<Fundamentals>; used: boolean };
   wiki: { fundamentals: Partial<Fundamentals>; used: boolean };
   yv7:  { fundamentals: Partial<Fundamentals>; used: boolean };
+  yfts: { fundamentals: Partial<Fundamentals>; used: boolean };
 }): Fundamentals {
   const pick = (key: keyof Fundamentals): Metric => {
     const candidates: Metric[] = [];
     const pushIf = (m?: Metric | null) => { if (m && m.value !== null) candidates.push(m); };
     pushIf(src.sec[key]);
+    pushIf(src.yfts.fundamentals[key] as any);  // <— prioritaire après SEC
     pushIf(src.ysum.fundamentals[key] as any);
     pushIf(src.yv7.fundamentals[key] as any);
     pushIf(src.yhtml.fundamentals[key] as any);
