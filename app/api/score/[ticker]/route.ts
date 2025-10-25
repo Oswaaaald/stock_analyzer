@@ -496,10 +496,20 @@ function buildReasons(_d: DataBundle, subs: Record<string, number>) {
 
 function makeVerdict(args: { coverage: number; total: number; momentumPresent: boolean; score_adj: number }) {
   const { coverage, momentumPresent, score_adj } = args;
-  const coverageOk = coverage >= 40; // assoupli pour éviter “À SURVEILLER” partout
-  if (score_adj >= 70 && coverageOk && momentumPresent) return { verdict: "sain" as const, reason: "Score élevé et couverture suffisante" };
-  if (score_adj >= 50 || momentumPresent) return { verdict: "a_surveiller" as const, reason: "Signal positif mais incomplet" + (coverageOk ? "" : " (couverture limitée)") };
-  return { verdict: "fragile" as const, reason: "Signal faible" + (coverageOk ? "" : " (données partielles)") };
+
+  // On considère la couverture suffisante dès 50 %
+  const coverageOk = coverage >= 50;
+
+  if (score_adj >= 70 && coverageOk)
+    return { verdict: "sain" as const, reason: "Entreprise globalement solide" };
+
+  if (score_adj >= 55)
+    return { verdict: "a_surveiller" as const, reason: "Signal positif mais à confirmer" };
+
+  if (score_adj >= 40)
+    return { verdict: "fragile" as const, reason: "Données mixtes ou incomplètes" };
+
+  return { verdict: "fragile" as const, reason: "Signal faible ou données partielles" };
 }
 
 /* ============================== Fetch util ============================== */
