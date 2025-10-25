@@ -9,11 +9,10 @@ import { NextResponse } from "next/server";
 const MEM: Record<string, { expires: number; data: any }> = {};
 const TTL_MS = 30 * 60 * 1000; // 30 min
 
-// Email SEC (facultatif mais recommandé pour la politesse User-Agent)
 const CONTACT_EMAIL = process.env.CONTACT_EMAIL || "contact@example.com";
 
 /* ======================================================================================
- *  TYPES SIMPLES
+ *  TYPES
  * ====================================================================================*/
 type FactPoint = { val: number; fy?: string; fp?: string; end?: string };
 type FactUnits = { [unit: string]: FactPoint[] };
@@ -22,26 +21,21 @@ type Taxo = { [tag: string]: { units: FactUnits } };
 type Metric = { value: number | null; confidence: number; source?: string };
 
 type Fundamentals = {
-  op_margin: Metric;           // marge opé (0..1)
-  current_ratio: Metric;       // CA/CL
-  dilution_3y: Metric;         // ∆ actions 3 ans
-  fcf_positive_last4: Metric;  // 0..4
-  fcf_yield: Metric;           // FCF/MarketCap (clampé & conservateur)
+  op_margin: Metric;
+  current_ratio: Metric;
+  dilution_3y: Metric;
+  fcf_positive_last4: Metric;
+  fcf_yield: Metric;
 };
 
 type Prices = {
   px: Metric;
   px_vs_200dma: Metric;
-  pct_52w: Metric;      // 0..1 position entre plus bas/haut 52w
-  max_dd_1y: Metric;    // max drawdown sur 1 an (négatif)
+  pct_52w: Metric;
+  max_dd_1y: Metric;
   ret_20d: Metric;
   ret_60d: Metric;
-
-  meta?: {
-    source_primary?: "yahoo" | "stooq.com" | "stooq.pl";
-    points?: number;
-    recency_days?: number;
-  };
+  meta?: { source_primary?: "yahoo" | "stooq.com" | "stooq.pl"; points?: number; recency_days?: number };
 };
 
 type DataBundle = {
@@ -53,17 +47,15 @@ type DataBundle = {
 
 type ScorePayload = {
   ticker: string;
-  score: number;                 // /100 (brut)
-  score_adj?: number;            // /coverage
+  score: number;
+  score_adj?: number;
   color: "green" | "orange" | "red";
   verdict: "sain" | "a_surveiller" | "fragile";
   verdict_reason: string;
-
   reasons_positive: string[];
   red_flags: string[];
   subscores: Record<string, number>;
-  coverage: number;              // 0..100
-
+  coverage: number;
   proof?: {
     price_source?: string;
     price_points?: number;
@@ -89,15 +81,32 @@ export async function GET(_req: Request, { params }: { params: { ticker: string 
   if (hit && hit.expires > now) return NextResponse.json(hit.data);
 
   try {
-    // 1) PRIX (Yahoo -> Stooq), sélection meilleure source par fraicheur/densité
+    // Prix (Yahoo → Stooq)
     const priceFeed = await fetchPricesBestOf(t);
 
-    // 2) FONDAMENTAUX (SEC us-gaap / ifrs-full) + FMP ratios (demo) en fallback
+    // Fondamentaux : SEC/IFRS
     const sec = await fetchFromSEC_US_IfPossible(t, priceFeed.px.value);
+
+    // FMP ratios (demo)
     const fmp = await fetchFmpRatiosIfPossible(t);
 
-    // 3) Fusion “giga couverture” (priorité SEC/IFRS, sinon FMP)
-    const fundamentals = mergeFundamentals(sec.fundamentals, fmp);
+    // Yahoo JSON summary (souvent 401, on tente query1/2)
+    const ySum = await fetchYahooSummaryIfPossible(t);
+
+    // Yahoo HTML Key Statistics (scraping léger)
+    const yHtml = await fetchYahooKeyStatsHtml(t);
+
+    // Wikipedia infobox (dernier filet pour op_margin via revenue & operating income)
+    const wiki = await fetchWikipediaOpMargin(t);
+
+    // Fusion pondérée des fondamentaux
+    const fundamentals = mergeFundamentalsWeighted({
+      sec: sec.fundamentals,
+      fmp: fmp.fundamentals,
+      ysum: ySum,
+      yhtml: yHtml,
+      wiki: wiki,
+    });
 
     const bundle: DataBundle = {
       ticker: t,
@@ -107,16 +116,18 @@ export async function GET(_req: Request, { params }: { params: { ticker: string 
         priceFeed.meta?.source_primary ? `price:${priceFeed.meta.source_primary}` : "price:unknown",
         ...(sec.used?.length ? sec.used.map((x) => `sec:${x}`) : []),
         ...(fmp.used ? ["fmp:ratios"] : []),
+        ...(ySum.used ? ["yahoo:summary"] : []),
+        ...(yHtml.used ? ["yahoo:html"] : []),
+        ...(wiki.used ? ["wikipedia"] : []),
       ],
     };
 
-    // 4) SCORE + COUVERTURE
+    // SCORE
     const { subscores, malus, maxes } = computeScore(bundle);
     const total = subscores.quality + subscores.safety + subscores.valuation + subscores.momentum;
     const raw = Math.max(0, Math.min(100, Math.round(total) - malus));
     const coverage = Math.max(0, Math.min(100, Math.round(maxes.quality + maxes.safety + maxes.valuation + maxes.momentum)));
     const score_adj = coverage > 0 ? Math.round((total / coverage) * 100) : 0;
-
     const color: ScorePayload["color"] = raw >= 70 ? "green" : raw >= 50 ? "orange" : "red";
     const { verdict, reason } = makeVerdict(bundle, subscores, coverage);
     const reasons = buildReasons(bundle, subscores);
@@ -156,14 +167,14 @@ export async function GET(_req: Request, { params }: { params: { ticker: string 
 }
 
 /* ======================================================================================
- *  UTILS
+ *  HELPERS GÉNÉRAUX
  * ====================================================================================*/
 const asMetric = (v: number | null, conf = 0, source?: string): Metric => ({ value: v, confidence: conf, source });
 const clip = (x: number, lo: number, hi: number) => Math.max(lo, Math.min(hi, x));
 const safeNum = (x: any) => (typeof x === "number" && Number.isFinite(x) ? x : null);
 
 /* ======================================================================================
- *  PRIX : Yahoo Chart v8 + Stooq (.com/.pl)
+ *  PRIX (Yahoo + Stooq)
  * ====================================================================================*/
 type OHLCFeed = { dates: number[]; closes: number[]; source: "yahoo" | "stooq.com" | "stooq.pl" };
 
@@ -172,10 +183,8 @@ async function fetchPricesBestOf(ticker: string): Promise<Prices> {
   try { const y = await fetchYahooChart(ticker); if (y) feeds.push(y); } catch {}
   try { const s1 = await fetchStooq(ticker, "https://stooq.com"); if (s1) feeds.push(s1); } catch {}
   try { const s2 = await fetchStooq(ticker, "https://stooq.pl"); if (s2) feeds.push(s2); } catch {}
-
   if (!feeds.length) throw new Error(`Aucune donnée de prix pour ${ticker}`);
 
-  // Tri par récence puis densité
   feeds.sort((a, b) => {
     const ra = a.dates.at(-1) ?? 0;
     const rb = b.dates.at(-1) ?? 0;
@@ -227,12 +236,12 @@ async function fetchYahooChart(ticker: string): Promise<OHLCFeed | null> {
   return null;
 }
 async function fetchStooq(ticker: string, origin: "https://stooq.com" | "https://stooq.pl"): Promise<OHLCFeed | null> {
-  const candidates = makeStooqCandidates(ticker);
-  for (const sym of candidates) {
-    const urlDaily = `${origin}/q/d/l/?s=${encodeURIComponent(sym)}&i=d`;
-    const csvDaily = await fetchTextSafe(urlDaily, "text/csv");
-    const parsedDaily = csvDaily ? parseStooqCsv(csvDaily) : null;
-    if (parsedDaily?.closes?.length) return { ...parsedDaily, source: origin.endsWith(".pl") ? "stooq.pl" : "stooq.com" };
+  const cands = makeStooqCandidates(ticker);
+  for (const sym of cands) {
+    const url = `${origin}/q/d/l/?s=${encodeURIComponent(sym)}&i=d`;
+    const csv = await fetchTextSafe(url, "text/csv");
+    const parsed = csv ? parseStooqCsv(csv) : null;
+    if (parsed?.closes?.length) return { ...parsed, source: origin.endsWith(".pl") ? "stooq.pl" : "stooq.com" };
   }
   return null;
 }
@@ -254,10 +263,7 @@ function parseStooqCsv(csv: string): { dates: number[]; closes: number[] } {
     const parts = lines[i].split(",");
     const d = parts[idxDate];
     const c = parseFloat(parts[idxClose]);
-    if (d && Number.isFinite(c)) {
-      dates.push(new Date(d).getTime());
-      closes.push(c);
-    }
+    if (d && Number.isFinite(c)) { dates.push(new Date(d).getTime()); closes.push(c); }
   }
   return { dates, closes };
 }
@@ -276,7 +282,7 @@ function enrichCloses(closes: number[]) {
   let pct_52w: number | null = null;
   let max_dd_1y: number | null = null;
   if (last252.length >= 30 && typeof px === "number") {
-    const hi = Math.max(...last252); const lo = Math.min(...last252);
+    const hi = Math.max(...last252), lo = Math.min(...last252);
     if (hi > lo) pct_52w = (px - lo) / (hi - lo);
     let peak = last252[0]; let mdd = 0;
     for (const c of last252) { peak = Math.max(peak, c); mdd = Math.min(mdd, (c - peak) / peak); }
@@ -293,7 +299,7 @@ function enrichCloses(closes: number[]) {
 }
 
 /* ======================================================================================
- *  SEC (US-GAAP + IFRS) : giga-fallback de tags
+ *  SEC (US-GAAP + IFRS)
  * ====================================================================================*/
 let TICKER_MAP: Record<string, { cik_str: number; ticker: string; title: string }> = {};
 let TICKER_MAP_EXP = 0;
@@ -356,8 +362,7 @@ async function fetchFromSEC_US_IfPossible(ticker: string, lastPrice: number | nu
   // CIK
   let cik: string | null = null;
   try {
-    const map = await loadTickerMap();
-    const hit = map[ticker.toUpperCase()];
+    const map = await loadTickerMap(); const hit = map[ticker.toUpperCase()];
     if (hit) cik = String(hit.cik_str).padStart(10, "0");
   } catch {}
 
@@ -375,9 +380,7 @@ async function fetchFromSEC_US_IfPossible(ticker: string, lastPrice: number | nu
     if (Object.keys(usgaap).length) used.push("us-gaap");
     if (Object.keys(ifrs).length) used.push("ifrs-full");
     note = "TTM si disponible (somme Q), sinon dernier annuel.";
-  } catch {
-    return { fundamentals: fund, used, note };
-  }
+  } catch { return { fundamentals: fund, used, note }; }
 
   // Revenue & Operating Income
   const revUnits =
@@ -403,9 +406,7 @@ async function fetchFromSEC_US_IfPossible(ticker: string, lastPrice: number | nu
   const caSeries = pickBestUnit(usgaap.AssetsCurrent?.units || (ifrs as any).CurrentAssets?.units);
   const clSeries = pickBestUnit(usgaap.LiabilitiesCurrent?.units || (ifrs as any).CurrentLiabilities?.units);
   const ca = lastVal(caSeries), cl = lastVal(clSeries);
-  if (typeof ca === "number" && typeof cl === "number" && cl !== 0) {
-    fund.current_ratio = asMetric(ca / cl, 0.8, "sec");
-  }
+  if (typeof ca === "number" && typeof cl === "number" && cl !== 0) fund.current_ratio = asMetric(ca / cl, 0.8, "sec");
 
   // Shares (dilution 3y)
   const sharesUnits =
@@ -441,7 +442,6 @@ async function fetchFromSEC_US_IfPossible(ticker: string, lastPrice: number | nu
   const cfoSeries = pickBestUnit(cfoUnits);
   const capSeries = pickBestUnit(capUnits);
 
-  // fcf_positive_last4
   if (cfoSeries && capSeries) {
     let countPos = 0;
     const n = Math.min(4, Math.min(cfoSeries.length, capSeries.length));
@@ -456,7 +456,7 @@ async function fetchFromSEC_US_IfPossible(ticker: string, lastPrice: number | nu
     fund.fcf_positive_last4 = asMetric(countPos, 0.7, "sec");
   }
 
-  // fcf_yield (US-GAAP uniquement, si signal crédible)
+  // fcf_yield (US-GAAP uniquement, crédible)
   const isUS = used.includes("us-gaap");
   const cfoTTM = sumLastNQuarterly(cfoSeries, 4) ?? lastAnnual(cfoSeries);
   const capTTM = sumLastNQuarterly(capSeries, 4) ?? lastAnnual(capSeries);
@@ -467,7 +467,7 @@ async function fetchFromSEC_US_IfPossible(ticker: string, lastPrice: number | nu
       if (mcap > 0) {
         const fcf = cfoTTM - Math.abs(capTTM);
         let y = fcf / mcap;
-        y = Math.max(-0.05, Math.min(0.08, y)); // clamp conservateur
+        y = Math.max(-0.05, Math.min(0.08, y));
         if (typeof fund.fcf_positive_last4.value === "number" && fund.fcf_positive_last4.value >= 2) {
           fund.fcf_yield = asMetric(y, 0.7, "sec");
         }
@@ -479,10 +479,9 @@ async function fetchFromSEC_US_IfPossible(ticker: string, lastPrice: number | nu
 }
 
 /* ======================================================================================
- *  FMP RATIOS (fallback mondial, mode demo sans clé)
+ *  FMP ratios (demo)
  * ====================================================================================*/
 async function fetchFmpRatiosIfPossible(ticker: string) {
-  // endpoints “demo” sans clé (peuvent ne pas couvrir tout le monde)
   const urls = [
     `https://financialmodelingprep.com/api/v3/ratios-ttm/${encodeURIComponent(ticker)}?apikey=demo`,
     `https://financialmodelingprep.com/api/v3/ratios/${encodeURIComponent(ticker)}?period=quarter&limit=12&apikey=demo`,
@@ -505,33 +504,177 @@ async function fetchFmpRatiosIfPossible(ticker: string) {
     const cr = safeNum(r0.currentRatioTTM ?? r0.currentRatio);
     if (cr !== null) out.current_ratio = asMetric(cr, 0.5, "fmp");
 
-    // FCF yield approximé via P/FCF (si dispo)
     const pfcf = safeNum(r0.priceToFreeCashFlowsRatioTTM ?? r0.priceToFreeCashFlowTTM ?? r0.priceToFreeCashFlowsRatio);
-    if (pfcf && pfcf > 0) {
-      const y = 1 / pfcf; // approx FCF yield
-      out.fcf_yield = asMetric(Math.max(-0.05, Math.min(0.08, y)), 0.4, "fmp");
-    }
+    if (pfcf && pfcf > 0) out.fcf_yield = asMetric(Math.max(-0.05, Math.min(0.08, 1 / pfcf)), 0.4, "fmp");
   }
 
   return { fundamentals: out, used };
 }
 
 /* ======================================================================================
- *  FUSION FONDAMENTAUX (SEC/IFRS prioritaire -> FMP fallback)
+ *  Yahoo SUMMARY (JSON) – best effort
  * ====================================================================================*/
-function mergeFundamentals(sec: Fundamentals, fmp: { fundamentals: Partial<Fundamentals>, used: boolean }): Fundamentals {
-  const pick = (a?: Metric, b?: Metric): Metric => {
-    // priorité SEC (a) si présent; sinon FMP (b)
-    if (a && a.value !== null) return a;
-    if (b && b.value !== null) return b;
-    return asMetric(null, 0);
+async function fetchYahooSummaryIfPossible(ticker: string) {
+  const headers = { "User-Agent": "Mozilla/5.0 (compatible; StockAnalyzer/1.0)", "Accept": "application/json, text/plain, */*" };
+  const urls = [
+    `https://query1.finance.yahoo.com/v10/finance/quoteSummary/${encodeURIComponent(ticker)}?modules=financialData,defaultKeyStatistics,price`,
+    `https://query2.finance.yahoo.com/v10/finance/quoteSummary/${encodeURIComponent(ticker)}?modules=financialData,defaultKeyStatistics,price`,
+  ];
+  let js: any = null;
+  for (const u of urls) {
+    js = await fetchJsonSafe(u, headers);
+    if (js?.quoteSummary?.result?.[0]) break;
+  }
+  const out: Partial<Fundamentals> = {};
+  let used = false;
+  try {
+    const r = js?.quoteSummary?.result?.[0];
+    if (!r) return { fundamentals: out, used: false };
+    used = true;
+
+    const opm = safeNum(r?.financialData?.operatingMargins);
+    if (opm !== null) out.op_margin = asMetric(opm, 0.45, "yahoo");
+
+    const cr = safeNum(r?.financialData?.currentRatio);
+    if (cr !== null) out.current_ratio = asMetric(cr, 0.4, "yahoo");
+
+    // Approx FCF via operatingCashflow - capex
+    const ocf = safeNum(r?.financialData?.operatingCashflow);
+    const capex = safeNum(r?.financialData?.capitalExpenditures);
+    const price = safeNum(r?.price?.regularMarketPrice ?? r?.price?.postMarketPrice);
+    const shares = safeNum(r?.defaultKeyStatistics?.sharesOutstanding);
+    if (price !== null && shares !== null && ocf !== null && capex !== null && shares > 0) {
+      const mcap = price * shares;
+      if (mcap > 0) {
+        let y = (ocf - Math.abs(capex)) / mcap;
+        y = Math.max(-0.05, Math.min(0.08, y));
+        out.fcf_yield = asMetric(y, 0.35, "yahoo");
+      }
+    }
+  } catch {}
+  return { fundamentals: out, used };
+}
+
+/* ======================================================================================
+ *  Yahoo HTML Key Statistics (scrape léger)
+ * ====================================================================================*/
+async function fetchYahooKeyStatsHtml(ticker: string) {
+  const url = `https://finance.yahoo.com/quote/${encodeURIComponent(ticker)}/key-statistics`;
+  const html = await fetchTextSafe(url, "text/html");
+  const out: Partial<Fundamentals> = {};
+  let used = false;
+  if (!html || html.includes('Rate Limited') || html.includes('error-title')) {
+    return { fundamentals: out, used };
+  }
+  used = true;
+
+  // Operating Margin
+  const m = html.match(/Operating\s+Margin\s*\(ttm\)\s*<\/span>.*?([\d.,\-]+)%/i);
+  if (m) {
+    const v = parseFloat(m[1].replace(/[^\d.-]/g, "")) / 100;
+    if (Number.isFinite(v)) out.op_margin = asMetric(v, 0.35, "yahoo-html");
+  }
+
+  // Current Ratio
+  const c = html.match(/Current\s+Ratio\s*\(mrq\)\s*<\/span>.*?([\d.,\-]+)/i);
+  if (c) {
+    const v = parseFloat(c[1].replace(/[^\d.-]/g, ""));
+    if (Number.isFinite(v)) out.current_ratio = asMetric(v, 0.3, "yahoo-html");
+  }
+
+  // Price to Free Cash Flow → approx fcf_yield
+  const pfcf = html.match(/Price\s*to\s*Free\s*Cash\s*Flow.*?([\d.,\-]+)/i);
+  if (pfcf) {
+    const ratio = parseFloat(pfcf[1].replace(/[^\d.-]/g, ""));
+    if (Number.isFinite(ratio) && ratio > 0) out.fcf_yield = asMetric(Math.max(-0.05, Math.min(0.08, 1 / ratio)), 0.3, "yahoo-html");
+  }
+
+  return { fundamentals: out, used };
+}
+
+/* ======================================================================================
+ *  Wikipedia infobox (op_margin via revenue & operating income)
+ * ====================================================================================*/
+async function fetchWikipediaOpMargin(ticker: string) {
+  // Utilise l'autocomplete Yahoo pour récupérer le nom de la société
+  const search = await fetchJsonSafe(`https://query2.finance.yahoo.com/v1/finance/search?q=${encodeURIComponent(ticker)}`);
+  const name: string | null =
+    search?.quotes?.[0]?.shortname || search?.quotes?.[0]?.longname || null;
+
+  if (!name) return { used: false, fundamentals: {} as Partial<Fundamentals> };
+
+  // Page EN si possible
+  const page = encodeURIComponent(name);
+  const api = await fetchJsonSafe(`https://en.wikipedia.org/w/api.php?action=parse&page=${page}&prop=wikitext&format=json&redirects=1&origin=*`);
+  const wikitext: string | null = api?.parse?.wikitext?.["*"] || null;
+  const out: Partial<Fundamentals> = {};
+  let used = false;
+
+  if (!wikitext) return { used, fundamentals: out };
+
+  // Cherche les lignes "revenue" et "operating_income" dans l’infobox
+  const revLine = wikitext.match(/\|\s*revenue\s*=\s*([^\n]+)/i);
+  const opLine = wikitext.match(/\|\s*operating_income\s*=\s*([^\n]+)/i);
+
+  function extractNumberUSD(s?: string | null): number | null {
+    if (!s) return null;
+    // simpliste : récupère un nombre en milliards/millions si présent
+    const bn = s.match(/([\d.,]+)\s*(billion|bn)/i);
+    if (bn) return parseFloat(bn[1].replace(/[^\d.]/g, "")) * 1e9;
+    const mn = s.match(/([\d.,]+)\s*(million|mn)/i);
+    if (mn) return parseFloat(mn[1].replace(/[^\d.]/g, "")) * 1e6;
+    // valeur brute
+    const raw = s.match(/([\d.,]+)/);
+    if (raw) return parseFloat(raw[1].replace(/[^\d.]/g, ""));
+    return null;
+  }
+
+  const rev = extractNumberUSD(revLine?.[1]);
+  const op  = extractNumberUSD(opLine?.[1]);
+
+  if (rev && op && rev !== 0) {
+    used = true;
+    const margin = op / rev;
+    out.op_margin = asMetric(Math.max(-0.5, Math.min(0.6, margin)), 0.25, "wikipedia");
+  }
+
+  return { used, fundamentals: out };
+}
+
+/* ======================================================================================
+ *  MERGE pondéré : SEC/IFRS > Yahoo JSON > Yahoo HTML > FMP > Wikipedia
+ * ====================================================================================*/
+function mergeFundamentalsWeighted(src: {
+  sec: Fundamentals;
+  fmp: Partial<Fundamentals>;
+  ysum: { fundamentals: Partial<Fundamentals>; used: boolean };
+  yhtml: { fundamentals: Partial<Fundamentals>; used: boolean };
+  wiki: { fundamentals: Partial<Fundamentals>; used: boolean };
+}): Fundamentals {
+  const pick = (key: keyof Fundamentals): Metric => {
+    const candidates: Metric[] = [];
+
+    const pushIf = (m?: Metric | null) => { if (m && m.value !== null) candidates.push(m); };
+
+    pushIf(src.sec[key]);
+    pushIf(src.ysum.fundamentals[key] as any);
+    pushIf(src.yhtml.fundamentals[key] as any);
+    pushIf(src.fmp[key] as any);
+    pushIf(src.wiki.fundamentals[key] as any);
+
+    if (!candidates.length) return asMetric(null, 0);
+
+    // Choix : meilleur score de confiance ; s’il y a égalité, priorité SEC > Yahoo JSON > Yahoo HTML > FMP > Wiki
+    candidates.sort((a, b) => (b.confidence - a.confidence));
+    return candidates[0];
   };
+
   return {
-    op_margin: pick(sec.op_margin, fmp.fundamentals.op_margin),
-    current_ratio: pick(sec.current_ratio, fmp.fundamentals.current_ratio),
-    dilution_3y: pick(sec.dilution_3y, fmp.fundamentals.dilution_3y),
-    fcf_positive_last4: pick(sec.fcf_positive_last4, fmp.fundamentals.fcf_positive_last4),
-    fcf_yield: pick(sec.fcf_yield, fmp.fundamentals.fcf_yield),
+    op_margin: pick("op_margin"),
+    current_ratio: pick("current_ratio"),
+    dilution_3y: pick("dilution_3y"),
+    fcf_positive_last4: pick("fcf_positive_last4"),
+    fcf_yield: pick("fcf_yield"),
   };
 }
 
@@ -562,7 +705,7 @@ function computeScore(d: DataBundle) {
     sMax += 4; s += f.fcf_positive_last4.value >= 3 ? 4 : 0;
   }
 
-  // Valorisation (25) — seulement si fcf_yield présent
+  // Valorisation (25)
   let v = 0, vMax = 0;
   if (typeof f.fcf_yield.value === "number") {
     vMax += 10;
@@ -603,18 +746,14 @@ function buildReasons(_d: DataBundle, subs: Record<string, number>) {
   if (!out.length) out.push("Données limitées (mode gratuit) : vérifiez les détails");
   return out;
 }
-function detectRedFlags(_d: DataBundle) {
-  return [] as string[];
-}
+function detectRedFlags(_d: DataBundle) { return [] as string[]; }
 function makeVerdict(d: DataBundle, subs: Record<string, number>, coverage: number) {
   const momentumOk =
     (typeof d.prices.px_vs_200dma.value === "number" && d.prices.px_vs_200dma.value >= 0) ||
     (typeof d.prices.ret_60d.value === "number" && d.prices.ret_60d.value > 0);
-
   const total = subs.quality + subs.safety + subs.valuation + subs.momentum;
   const score_adj = coverage > 0 ? Math.round((total / coverage) * 100) : 0;
   const coverageOk = coverage >= 40;
-
   if (score_adj >= 70 && coverageOk && momentumOk) return { verdict: "sain" as const, reason: "Score élevé et couverture suffisante" };
   if (score_adj >= 40 || momentumOk) return { verdict: "a_surveiller" as const, reason: "Signal positif mais incomplet" + (coverageOk ? "" : " (couverture limitée)") };
   return { verdict: "fragile" as const, reason: "Signal faible et données limitées" };
@@ -624,16 +763,8 @@ function makeVerdict(d: DataBundle, subs: Record<string, number>, coverage: numb
  *  FETCH HELPERS
  * ====================================================================================*/
 async function fetchJsonSafe(url: string, headers?: Record<string, string>) {
-  try {
-    const r = await fetch(url, { headers });
-    if (!r.ok) return null;
-    return await r.json();
-  } catch { return null; }
+  try { const r = await fetch(url, { headers }); if (!r.ok) return null; return await r.json(); } catch { return null; }
 }
 async function fetchTextSafe(url: string, accept = "*/*") {
-  try {
-    const r = await fetch(url, { headers: { "User-Agent": "Mozilla/5.0", "Accept": accept } });
-    if (!r.ok) return null;
-    return await r.text();
-  } catch { return null; }
+  try { const r = await fetch(url, { headers: { "User-Agent": "Mozilla/5.0", "Accept": accept } }); if (!r.ok) return null; return await r.text(); } catch { return null; }
 }
