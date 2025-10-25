@@ -3,12 +3,14 @@ import { useState } from "react";
 
 type ScoreResponse = {
   ticker: string;
-  score: number;
+  score: number;                 // score brut /100 (échelle officielle 35+25+25+15)
+  score_adj?: number;            // score ajusté à la couverture (0..100), optionnel
   color: "green" | "orange" | "red";
   reasons_positive: string[];
   red_flags: string[];
   subscores: Record<string, number>;
-  coverage?: number; // 0..100 — fourni par l'API adaptative
+  coverage?: number;             // points max “disponibles” (0..100)
+  debug?: Record<string, any>;   // optionnel, si tu l’actives côté API
 };
 
 export default function Page() {
@@ -55,7 +57,7 @@ export default function Page() {
           value={q}
           onChange={(e) => setQ(e.target.value)}
           onKeyDown={onEnter}
-          placeholder="AAPL, MSFT, NVDA, OR.PA…"
+          placeholder="AAPL, MSFT, NVDA, RACE, OR.PA…"
           className="flex-1 px-4 py-3 rounded-xl bg-slate-900 border border-slate-700 focus:outline-none focus:ring-2 focus:ring-sky-500"
         />
         <button
@@ -97,6 +99,12 @@ export default function Page() {
             {"coverage" in data && typeof data.coverage === "number" && (
               <div className="text-xs text-slate-400 mt-1">
                 Couverture des données : {data.coverage}% (mode gratuit)
+              </div>
+            )}
+
+            {"score_adj" in data && typeof data.score_adj === "number" && (
+              <div className="text-xs text-slate-400">
+                Score ajusté (selon couverture) : {data.score_adj}/100
               </div>
             )}
 
@@ -143,6 +151,16 @@ export default function Page() {
                 ))}
               </div>
             </div>
+
+            {/* DEBUG optionnel */}
+            {"debug" in (data as any) && data.debug && (
+              <details className="mt-4 text-xs text-slate-400">
+                <summary className="cursor-pointer">Debug</summary>
+                <pre className="mt-2 whitespace-pre-wrap">
+{JSON.stringify((data as any).debug, null, 2)}
+                </pre>
+              </details>
+            )}
           </div>
 
           <div className="text-xs text-slate-400">
