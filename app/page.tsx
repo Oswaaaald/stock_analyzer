@@ -8,6 +8,7 @@ type ScoreResponse = {
   reasons_positive: string[];
   red_flags: string[];
   subscores: Record<string, number>;
+  coverage?: number; // 0..100 — fourni par l'API adaptative
 };
 
 export default function Page() {
@@ -92,6 +93,12 @@ export default function Page() {
                 </span>
               </div>
             </div>
+
+            {"coverage" in data && typeof data.coverage === "number" && (
+              <div className="text-xs text-slate-400 mt-1">
+                Couverture des données : {data.coverage}% (mode gratuit)
+              </div>
+            )}
 
             <div className="mt-4 grid grid-cols-2 gap-4">
               <div>

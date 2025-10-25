@@ -25,6 +25,7 @@ type ScorePayload = {
   reasons_positive: string[];
   red_flags: string[];
   subscores: Record<string, number>;
+  coverage: number; // 0..100 — part des points “disponibles” (ex: 15 => 15%)
 };
 
 export async function GET(
@@ -43,21 +44,24 @@ export async function GET(
 
   try {
     const bundle = await fetchAllNoKeyStooq(t);
-const { subscores, malus } = computeScore(bundle);
 
-// ❌ avant (bug) : on re-pondérait des sous-scores déjà pondérés
-// const raw = Math.round(
-//   0.35*subscores.quality + 0.25*subscores.safety + 0.25*subscores.valuation + 0.15*subscores.momentum
-// );
+    // ----- scoring adaptatif -----
+    const { subscores, malus, maxes } = computeScore(bundle);
 
-// ✅ après : on additionne (max = 35+25+25+15 = 100)
-const raw = Math.round(
-  subscores.quality + subscores.safety + subscores.valuation + subscores.momentum
-);
+    const total =
+      subscores.quality +
+      subscores.safety +
+      subscores.valuation +
+      subscores.momentum;
 
-const final = Math.max(0, Math.min(100, raw - malus));
-const color: ScorePayload["color"] =
-  final >= 70 ? "green" : final >= 50 ? "orange" : "red";
+    const maxPossible =
+      maxes.quality + maxes.safety + maxes.valuation + maxes.momentum;
+
+    const raw = maxPossible > 0 ? Math.round((total / maxPossible) * 100) : 0;
+    const final = Math.max(0, Math.min(100, raw)); // malus = 0 en stooq-only
+
+    const color: ScorePayload["color"] =
+      final >= 70 ? "green" : final >= 50 ? "orange" : "red";
 
     const reasons = buildReasons(bundle, subscores);
     const flags = detectRedFlags(bundle);
@@ -69,6 +73,10 @@ const color: ScorePayload["color"] =
       reasons_positive: reasons.slice(0, 3),
       red_flags: flags.slice(0, 2),
       subscores,
+      coverage: Math.max(
+        0,
+        Math.min(100, Math.round(maxPossible)) // ex: 15 -> 15%
+      ),
     };
 
     MEM[key] = { expires: now + TTL_MS, data: payload };
@@ -76,7 +84,10 @@ const color: ScorePayload["color"] =
       headers: { "Cache-Control": "s-maxage=600, stale-while-revalidate=1200" },
     });
   } catch (e: any) {
-    const msg = typeof e?.message === "string" ? e.message : (e?.toString?.() || "Erreur provider");
+    const msg =
+      typeof e?.message === "string"
+        ? e.message
+        : e?.toString?.() || "Erreur provider";
     return NextResponse.json({ error: msg }, { status: 500 });
   }
 }
@@ -85,7 +96,7 @@ const color: ScorePayload["color"] =
    Provider no-key via Stooq (CSV public)
    - URL jour: https://stooq.com/q/d/l/?s=<symbol>&i=d
    - On teste plusieurs variantes de symbole (aapl, aapl.us, or.pa, etc.)
-   - On parse le CSV à la main (pas de lib) et on calcule la 200DMA
+   - On parse le CSV à la main et on calcule la 200DMA
 ======================================================================================= */
 
 async function fetchAllNoKeyStooq(ticker: string): Promise<DataBundle> {
@@ -95,7 +106,9 @@ async function fetchAllNoKeyStooq(ticker: string): Promise<DataBundle> {
   let closes: number[] | null = null;
   for (const sym of candidates) {
     try {
-      const csv = await fetchCsv(`https://stooq.com/q/d/l/?s=${encodeURIComponent(sym)}&i=d`);
+      const csv = await fetchCsv(
+        `https://stooq.com/q/d/l/?s=${encodeURIComponent(sym)}&i=d`
+      );
       const parsed = parseStooqCsv(csv); // { dates: string[], closes: number[] }
       if (parsed.closes.length > 0) {
         closes = parsed.closes;
@@ -107,7 +120,9 @@ async function fetchAllNoKeyStooq(ticker: string): Promise<DataBundle> {
   }
 
   if (!closes || closes.length === 0) {
-    throw new Error(`Aucune donnée Stooq pour ${ticker} (essais: ${candidates.join(", ")})`);
+    throw new Error(
+      `Aucune donnée Stooq pour ${ticker} (essais: ${candidates.join(", ")})`
+    );
   }
 
   // prix = dernier close connu
@@ -124,7 +139,7 @@ async function fetchAllNoKeyStooq(ticker: string): Promise<DataBundle> {
   return {
     ticker,
     fundamentals: {
-      // Sans états financiers publics fiables/no-key, on laisse à null pour MVP
+      // Sans états financiers publics no-key, on laisse à null pour MVP
       op_margin: null,
       fcf_yield: null,
     },
@@ -139,7 +154,6 @@ async function fetchAllNoKeyStooq(ticker: string): Promise<DataBundle> {
 
 function makeStooqCandidates(ticker: string): string[] {
   // Stooq utilise des symboles lowercase, souvent suffixés .us pour US.
-  // Heuristiques simples :
   const t = ticker.toLowerCase();
   const out = new Set<string>();
 
@@ -153,8 +167,7 @@ function makeStooqCandidates(ticker: string): string[] {
   out.add(`${t.replace(/\./g, "-")}.us`);
   out.add(t.replace(/\./g, "-"));
 
-  // 4) cas Euronext/PA déjà suffixé
-  // (si l'utilisateur tape OR.PA, garde "or.pa")
+  // 4) cas Euronext déjà suffixé (ex: or.pa)
   if (/\.[a-z]{2,3}$/.test(t)) out.add(t);
 
   return Array.from(out);
@@ -164,7 +177,7 @@ async function fetchCsv(url: string): Promise<string> {
   const r = await fetch(url, {
     headers: {
       "User-Agent": "Mozilla/5.0 (compatible; StockAnalyzer/1.0)",
-      "Accept": "text/csv, text/plain, */*",
+      Accept: "text/csv, text/plain, */*",
       "Cache-Control": "no-cache",
     },
   });
@@ -197,7 +210,7 @@ function parseStooqCsv(csv: string): { dates: string[]; closes: number[] } {
 }
 
 /* =======================================================================================
-   Scoring minimal (tolérant aux nulls)
+   Scoring adaptatif (tolérant aux nulls)
 ======================================================================================= */
 function clip(x: number, lo: number, hi: number) {
   return Math.max(lo, Math.min(hi, x));
@@ -207,25 +220,30 @@ function computeScore(data: DataBundle) {
   const f = data.fundamentals;
   const p = data.prices;
 
-  // Qualité (0..35) — pas de data fiable => 0
+  // ---- Qualité (max effectif selon métriques dispo)
   let q = 0;
+  let qMax = 0;
   if (typeof f.op_margin === "number") {
+    // Si on a la marge op, Qualité max 8 pts dans ce mode (sur 35 dans le design complet)
+    qMax += 8;
     q += f.op_margin >= 0.25 ? 8 : f.op_margin >= 0.15 ? 6 : f.op_margin >= 0.05 ? 3 : 0;
   }
 
-  // Sécurité (0..25) — inconnu => 0
+  // ---- Sécurité (rien de fiable en no-key stooq)
   let s = 0;
+  let sMax = 0;
 
-  // Valorisation (0..25) — inconnu => 0
+  // ---- Valorisation (rien de fiable en no-key stooq)
   let v = 0;
-  if (typeof f.fcf_yield === "number") {
-    v += f.fcf_yield > 0.06 ? 10 : f.fcf_yield >= 0.04 ? 7 : f.fcf_yield >= 0.02 ? 4 : 1;
-  }
+  let vMax = 0;
 
-  // Momentum (0..15)
+  // ---- Momentum (on a la 200DMA via Stooq)
   let m = 0;
+  let mMax = 0;
   if (typeof p.px_vs_200dma === "number") {
-    m += p.px_vs_200dma >= 0.05 ? 6 : p.px_vs_200dma > -0.05 ? 3 : 1;
+    // Échelle officielle Momentum = 15 pts max
+    mMax = 15;
+    m = p.px_vs_200dma >= 0.05 ? 15 : p.px_vs_200dma > -0.05 ? 8 : 3;
   }
 
   const subscores = {
@@ -235,16 +253,27 @@ function computeScore(data: DataBundle) {
     momentum: clip(m, 0, 15),
   };
 
-  const malus = 0;
-  return { subscores, malus };
+  const maxes = {
+    quality: qMax,
+    safety: sMax,
+    valuation: vMax,
+    momentum: mMax,
+  };
+
+  const malus = 0; // pas de red flags fiables en stooq-only
+  return { subscores, malus, maxes };
 }
 
 function buildReasons(_data: DataBundle, subs: Record<string, number>) {
   const reasons: string[] = [];
-  if (isHigh(subs.momentum, 6)) reasons.push("Cours au-dessus de la moyenne 200 jours");
-  if (isHigh(subs.valuation, 7)) reasons.push("Valorisation potentiellement attractive (proxy)");
-  if (isHigh(subs.quality, 20)) reasons.push("Qualité opérationnelle décente (proxy)");
-  if (!reasons.length) reasons.push("Données limitées (mode gratuit) : vérifiez les détails");
+  if (isHigh(subs.momentum, 6))
+    reasons.push("Cours au-dessus de la moyenne 200 jours");
+  if (isHigh(subs.valuation, 7))
+    reasons.push("Valorisation potentiellement attractive (proxy)");
+  if (isHigh(subs.quality, 20))
+    reasons.push("Qualité opérationnelle décente (proxy)");
+  if (!reasons.length)
+    reasons.push("Données limitées (mode gratuit) : vérifiez les détails");
   return reasons;
 
   function isHigh(val: number, thr: number) {
