@@ -95,6 +95,9 @@ export async function GET(_req: Request, { params }: { params: { ticker: string 
     // Yahoo JSON summary (best effort)
     const ySum = await fetchYahooSummaryIfPossible(t);
 
+    // Yahoo v7/quote (souvent riche en Europe)
+    const yV7 = await fetchYahooQuoteV7(t);
+
     // Yahoo HTML Key Statistics (scrape permissif)
     const yHtml = await fetchYahooKeyStatsHtml(t);
 
@@ -108,6 +111,7 @@ export async function GET(_req: Request, { params }: { params: { ticker: string 
       ysum: ySum,
       yhtml: yHtml,
       wiki: wiki,
+      yv7: yV7,
     });
 
     const bundle: DataBundle = {
@@ -119,6 +123,7 @@ export async function GET(_req: Request, { params }: { params: { ticker: string 
         ...(sec.used?.length ? sec.used.map((x) => `sec:${x}`) : []),
         ...(fmp.used ? ["fmp:ratios"] : []),
         ...(ySum.used ? ["yahoo:summary"] : []),
+        ...(yV7.used ? ["yahoo:v7"] : []),
         ...(yHtml.used ? ["yahoo:html"] : []),
         ...(wiki.used ? ["wikipedia"] : []),
       ],
@@ -564,6 +569,39 @@ async function fetchYahooSummaryIfPossible(ticker: string) {
 }
 
 /* ======================================================================================
+ *  Yahoo QUOTE v7 — trailingPE, priceToBook (souvent dispo en Europe)
+ * ====================================================================================*/
+async function fetchYahooQuoteV7(ticker: string) {
+  const headers = { "User-Agent": "Mozilla/5.0 (compatible; StockAnalyzer/1.0)", "Accept": "application/json, text/plain, */*" };
+  const urls = [
+    `https://query1.finance.yahoo.com/v7/finance/quote?symbols=${encodeURIComponent(ticker)}`,
+    `https://query2.finance.yahoo.com/v7/finance/quote?symbols=${encodeURIComponent(ticker)}`,
+  ];
+  let js: any = null;
+  for (const u of urls) {
+    js = await fetchJsonSafe(u, headers);
+    if (js?.quoteResponse?.result?.length) break;
+  }
+  const out: Partial<Fundamentals> = {};
+  let used = false;
+  try {
+    const r = js?.quoteResponse?.result?.[0];
+    if (!r) return { fundamentals: out, used: false };
+    used = true;
+
+    // Valo proxy : Earnings Yield = 1/PE si PE > 0
+    const pe = typeof r.trailingPE === "number" ? r.trailingPE : (typeof r.peRatio === "number" ? r.peRatio : null);
+    if (pe && pe > 0) out.earnings_yield = { value: 1 / pe, confidence: 0.45, source: "yahoo-v7" };
+
+    // Sécurité proxy (faible poids) : Price/Book bas → petit bonus sécurité (approx)
+    if (typeof r.priceToBook === "number" && r.priceToBook > 0) {
+      out.net_cash = { value: r.priceToBook < 1.2 ? 1 : 0, confidence: 0.25, source: "yahoo-v7" };
+    }
+  } catch {}
+  return { fundamentals: out, used };
+}
+
+/* ======================================================================================
  *  Yahoo HTML Key Statistics (scrape permissif) — +Trailing P/E, Cash/Debt
  * ====================================================================================*/
 async function fetchYahooKeyStatsHtml(ticker: string) {
@@ -629,7 +667,7 @@ async function fetchYahooKeyStatsHtml(ticker: string) {
     }
   }
 
-  // Total Cash (mrq) & Total Debt (mrq) → net_cash boolean
+  // Total Cash (mrq) & Total Debt (mrq) → net_cash booléen
   const cashRe = /Total\s*Cash\s*\(mrq\)[^<]*?<\/span>[^<]*?([\d.,\-]+)\s*[MBT]?/i;
   const debtRe = /Total\s*Debt\s*\(mrq\)[^<]*?<\/span>[^<]*?([\d.,\-]+)\s*[MBT]?/i;
   const cm = html.match(cashRe);
@@ -723,7 +761,7 @@ async function fetchWikipediaOpMargin(ticker: string) {
 }
 
 /* ======================================================================================
- *  MERGE pondéré : SEC/IFRS > Yahoo JSON > Yahoo HTML > FMP > Wikipedia
+ *  MERGE pondéré : SEC/IFRS > Yahoo JSON > Yahoo v7 > Yahoo HTML > FMP > Wikipedia
  * ====================================================================================*/
 function mergeFundamentalsWeighted(src: {
   sec: Fundamentals;
@@ -731,12 +769,14 @@ function mergeFundamentalsWeighted(src: {
   ysum: { fundamentals: Partial<Fundamentals>; used: boolean };
   yhtml: { fundamentals: Partial<Fundamentals>; used: boolean };
   wiki: { fundamentals: Partial<Fundamentals>; used: boolean };
+  yv7:  { fundamentals: Partial<Fundamentals>; used: boolean };
 }): Fundamentals {
   const pick = (key: keyof Fundamentals): Metric => {
     const candidates: Metric[] = [];
     const pushIf = (m?: Metric | null) => { if (m && m.value !== null) candidates.push(m); };
     pushIf(src.sec[key]);
     pushIf(src.ysum.fundamentals[key] as any);
+    pushIf(src.yv7.fundamentals[key] as any);
     pushIf(src.yhtml.fundamentals[key] as any);
     pushIf(src.fmp[key] as any);
     pushIf(src.wiki.fundamentals[key] as any);
