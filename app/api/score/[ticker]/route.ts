@@ -30,30 +30,54 @@ type Prices = {
   max_dd_1y: Metric;
   ret_20d: Metric;
   ret_60d: Metric;
-  meta?: { source_primary: "yahoo"; points: number; recency_days: number };
+  meta?: {
+    source_primary: "yahoo";
+    points: number;
+    recency_days: number;
+    last_ts_ms?: number;
+    last_date_iso?: string;
+  };
 };
 
-type DataBundle = { ticker: string; fundamentals: Fundamentals; prices: Prices; sources_used: string[] };
+type DataBundle = {
+  ticker: string;
+  fundamentals: Fundamentals;
+  prices: Prices;
+  sources_used: string[];
+  company_name?: string | null;
+  exchange?: string | null;
+};
 
 type ScorePayload = {
   ticker: string;
-  score: number;
-  score_adj?: number;
+  company_name?: string | null;
+  exchange?: string | null;
+
+  score: number;          // brut 0..100
+  score_adj?: number;     // normalisé 0..100 (affiché)
   color: "green" | "orange" | "red";
   verdict: "sain" | "a_surveiller" | "fragile";
   verdict_reason: string;
+
   reasons_positive: string[];
   red_flags: string[];
-  subscores: Record<string, number>;
-  coverage: number; // 0..100 pour l'UI (piliers)
+
+  subscores: Record<string, number>; // { quality:0..35, safety:0..25, valuation:0..25, momentum:0..15 }
+  coverage: number;       // "Couverture des données" (0..100)
+
   proof?: {
     price_source?: string;
     price_points?: number;
     price_has_200dma: boolean;
     price_recency_days?: number | null;
+    price_last_date?: string | null;
+
     valuation_used?: boolean;
+    valuation_metric?: "FCFY" | "EY" | null; // NEW
+
     sources_used?: string[];
   };
+
   ratios?: {
     roe?: number | null;
     roa?: number | null;
@@ -159,33 +183,41 @@ export async function GET(req: Request, { params }: { params: { ticker: string }
     const fundamentals = computeFundamentalsFromV10(v10);
     const sources_used = ["price:yahoo(v8)", "yahoo:v10"];
 
-    const bundle: DataBundle = { ticker: t, fundamentals, prices: priceFeed, sources_used };
+    const company_name: string | null =
+      v10?.price?.longName ?? v10?.price?.shortName ?? null;
+    const exchange: string | null =
+      v10?.price?.exchangeName ?? v10?.price?.market ?? null;
+
+    const bundle: DataBundle = {
+      ticker: t,
+      fundamentals,
+      prices: priceFeed,
+      sources_used,
+      company_name,
+      exchange,
+    };
+
     const { subscores, maxes } = computeScore(bundle);
 
-    // ===== Fiabilité (UI) = par PILIERS réellement présents =====
+    // ===== Couverture (0..100) basée sur piliers réellement disponibles =====
     const covQuality = Math.min(1, (maxes.quality || 0) / 8) * 35;   // 0..35
     const covSafety  = Math.min(1, (maxes.safety  || 0) / 6) * 25;   // 0..25
     const covVal     = Math.min(1, (maxes.valuation|| 0) / 10) * 25; // 0..25
     const covMom     = Math.min(1, (maxes.momentum || 0) / 15) * 15; // 0..15
     const coverage_display = Math.round(covQuality + covSafety + covVal + covMom); // 0..100
 
-    // ===== Dénominateur de normalisation (ce qui est *vraiment* dispo) =====
-    const denom = Math.max(
-      1,
-      Math.round(maxes.quality + maxes.safety + maxes.valuation + maxes.momentum)
-    );
-
+    // ===== Score =====
     const total = subscores.quality + subscores.safety + subscores.valuation + subscores.momentum;
+    const denom = Math.max(1, Math.round(maxes.quality + maxes.safety + maxes.valuation + maxes.momentum));
     const raw = Math.max(0, Math.min(100, Math.round(total)));
     const score_adj = Math.round((total / denom) * 100);
 
-    // Couleur & verdict basés sur le score affiché (shown)
+    // Couleur
     const shown = score_adj ?? raw;
     const color: ScorePayload["color"] = shown >= 65 ? "green" : shown >= 50 ? "orange" : "red";
 
-    // Momentum présent si la 200DMA est réellement calculable (≥200 pts)
+    // Momentum présent si 200DMA calculable (≥200 points)
     const momentumPresent = typeof priceFeed.px_vs_200dma.value === "number";
-
     const { verdict, reason } = makeVerdict({
       coverage: coverage_display,
       total,
@@ -193,26 +225,43 @@ export async function GET(req: Request, { params }: { params: { ticker: string }
       score_adj: shown,
     });
 
+    // Raisons / Risques (vulgarisés)
     const reasons = buildReasons(bundle, subscores);
-    const red_flags = buildRedFlags(bundle); // <<< NOUVEAU
+    const risks = buildRisks(bundle);
+
+    // Valuation metric
+    const valuation_metric: "FCFY" | "EY" | null =
+      typeof fundamentals.fcf_yield.value === "number"
+        ? "FCFY"
+        : typeof fundamentals.earnings_yield.value === "number"
+        ? "EY"
+        : null;
 
     const payload: ScorePayload = {
       ticker: t,
+      company_name,
+      exchange,
+
       score: raw,
       score_adj,
       color,
       verdict,
       verdict_reason: reason,
+
       reasons_positive: reasons.slice(0, 3),
-      red_flags, // <<< NOUVEAU
+      red_flags: risks.slice(0, 3),
+
       subscores,
-      coverage: coverage_display, // UI
+      coverage: coverage_display,
       proof: {
         price_source: priceFeed.meta?.source_primary,
         price_points: priceFeed.meta?.points,
         price_has_200dma: priceFeed.px_vs_200dma.value !== null,
         price_recency_days: priceFeed.meta?.recency_days ?? null,
-        valuation_used: (fundamentals.fcf_yield.value ?? fundamentals.earnings_yield.value) != null,
+        price_last_date: priceFeed.meta?.last_date_iso ?? null,
+
+        valuation_used: valuation_metric !== null,
+        valuation_metric,
         sources_used,
       },
       ratios: {
@@ -259,6 +308,9 @@ async function fetchYahooChartAndEnrich(ticker: string): Promise<Prices> {
   if (!arr.length) throw new Error("Clôtures vides (v8)");
 
   const enriched = enrichCloses(arr);
+  const lastMs = ts.at(-1) ?? null;
+  const lastIso = lastMs ? new Date(lastMs).toISOString().slice(0, 10) : undefined;
+
   return {
     px: asMetric(enriched.px, confFromPts(arr.length), "yahoo"),
     px_vs_200dma: asMetric(enriched.px_vs_200dma, confFromPts(arr.length), "yahoo"),
@@ -270,9 +322,12 @@ async function fetchYahooChartAndEnrich(ticker: string): Promise<Prices> {
       source_primary: "yahoo",
       points: arr.length,
       recency_days: Math.round((Date.now() - (ts.at(-1) ?? Date.now())) / (1000 * 3600 * 24)),
+      last_ts_ms: lastMs ?? undefined,
+      last_date_iso: lastIso ?? undefined,
     },
   };
 }
+
 function enrichCloses(closes: number[]) {
   const last = closes.at(-1) ?? null;
   let px_vs_200dma: number | null = null;
@@ -398,7 +453,7 @@ function computeFundamentalsFromV10(r: any): Fundamentals {
   // FCF / Net Income
   const fcf_over_ni = fcf != null && ni0 != null && ni0 !== 0 ? fcf / ni0 : null;
 
-  // ROIC ~ NOPAT / (Debt + Equity - Cash)
+  // ROIC ~ NOPAT / (Debt + Equity - Cash) — proxy
   const taxRate =
     preTax0 && taxExp0 != null && preTax0 !== 0 ? Math.min(0.5, Math.max(0, taxExp0 / preTax0)) : 0.21;
   const nopat = opInc0 != null ? opInc0 * (1 - taxRate) : (ni0 != null ? ni0 : null);
@@ -470,9 +525,7 @@ function computeScore(d: DataBundle) {
     mMax += 2;
     m += p.ret_60d.value > 0.06 ? 2 : p.ret_60d.value > 0 ? 1 : 0;
   }
-  // borne logique côté score
   m = Math.min(m, 15);
-  // mMax reste ce qui est réellement disponible (0..15)
 
   const subscores = {
     quality: clip(q, 0, 35),
@@ -484,63 +537,56 @@ function computeScore(d: DataBundle) {
   return { subscores, maxes };
 }
 
-/* ============================== Explications (forces/faiblesses) ============================== */
-function buildReasons(_d: DataBundle, subs: Record<string, number>) {
+/* ============================== Reasons & Risks (vulgarisés) ============================== */
+function buildReasons(d: DataBundle, subs: Record<string, number>) {
   const out: string[] = [];
-  if (subs.quality >= 6) out.push("Marge opérationnelle décente");
-  if (subs.safety >= 4) out.push("Bilans plutôt sains");
-  if (subs.valuation >= 7) out.push("Valorisation potentiellement attractive");
-  if (subs.momentum >= 8) out.push("Cours au-dessus de la MM200 et dynamique récente positive");
-  if (!out.length) out.push("Données limitées : vérifiez les détails");
+  const f = d.fundamentals, p = d.prices;
+
+  if (subs.quality >= 6) out.push("Entreprise rentable et efficace");
+  if (subs.safety >= 4) out.push("Structure financière plutôt saine");
+  if (typeof p.px_vs_200dma.value === "number" && p.px_vs_200dma.value >= 0)
+    out.push("Cours au-dessus de la MM200");
+  if (typeof p.ret_20d.value === "number" && p.ret_20d.value > 0)
+    out.push("Tendance positive à court terme");
+
+  if (!out.length) out.push("Données partielles : à confirmer");
   return out;
 }
 
-// NOUVEAU : risques/limites symétriques aux forces
-function buildRedFlags(d: DataBundle): string[] {
-  const out: string[] = [];
-  const f = d.fundamentals;
-  const p = d.prices;
+function buildRisks(d: DataBundle): string[] {
+  const f = d.fundamentals, p = d.prices;
+  const risks: string[] = [];
 
-  // --- Qualité ---
-  if (typeof f.op_margin.value === "number" && f.op_margin.value < 0.05) {
-    out.push("Marge opérationnelle faible (< 5 %)");
-  }
-
-  // --- Sécurité ---
-  if (typeof f.current_ratio.value === "number" && f.current_ratio.value < 1) {
-    out.push("Liquidité tendue (ratio courant < 1)");
-  }
-  if (typeof f.net_cash.value === "number" && f.net_cash.value <= 0) {
-    out.push("Endettement net (dette > trésorerie)");
+  // Valorisation
+  if (typeof f.fcf_yield.value === "number") {
+    if (f.fcf_yield.value < 0.02) risks.push("Faible rendement du cash-flow (< 2 %)");
+  } else if (typeof f.earnings_yield.value === "number") {
+    if (f.earnings_yield.value < 0.03) risks.push("Rendement des bénéfices faible (< 3 %)");
   }
 
-  // --- Valorisation ---
-  if (typeof f.fcf_yield.value === "number" && f.fcf_yield.value < 0.02) {
-    out.push("Rendement FCF faible (< 2 %)");
-  } else if (typeof f.earnings_yield.value === "number" && f.earnings_yield.value < 0.03) {
-    out.push("Rendement des bénéfices faible (< 3 %)");
-  }
+  // Sécurité
+  if (typeof f.current_ratio.value === "number" && f.current_ratio.value < 1)
+    risks.push("Liquidité tendue (ratio courant < 1)");
+  if (typeof f.net_cash.value === "number" && f.net_cash.value <= 0)
+    risks.push("Endettement net (dette > trésorerie)");
 
-  // --- Momentum ---
-  if (typeof p.px_vs_200dma.value === "number" && p.px_vs_200dma.value < -0.05) {
-    out.push("Cours sous la moyenne mobile 200 jours");
-  }
-  const neg20 = typeof p.ret_20d.value === "number" && p.ret_20d.value < 0;
-  const neg60 = typeof p.ret_60d.value === "number" && p.ret_60d.value < 0;
-  if (neg20 && neg60) {
-    out.push("Tendance baissière courte (20–60 jours)");
-  }
+  // Momentum
+  if (typeof p.px_vs_200dma.value === "number" && p.px_vs_200dma.value < 0)
+    risks.push("Cours sous la MM200");
+  if (
+    typeof p.ret_20d.value === "number" && p.ret_20d.value <= 0 &&
+    typeof p.ret_60d.value === "number" && p.ret_60d.value <= 0
+  ) risks.push("Tendance négative récente");
 
-  if (!out.length) out.push("Aucune limite majeure détectée");
-  return out.slice(0, 4);
+  return risks;
 }
 
 function makeVerdict(args: { coverage: number; total: number; momentumPresent: boolean; score_adj: number }) {
   const { coverage, momentumPresent, score_adj } = args;
-  const coverageOk = coverage >= 40; // assoupli pour éviter “À SURVEILLER” partout
-  if (score_adj >= 70 && coverageOk && momentumPresent) return { verdict: "sain" as const, reason: "Score élevé et couverture suffisante" };
-  if (score_adj >= 50 || momentumPresent) return { verdict: "a_surveiller" as const, reason: "Signal positif mais incomplet" + (coverageOk ? "" : " (couverture limitée)") };
-  return { verdict: "fragile" as const, reason: "Signal faible" + (coverageOk ? "" : " (données partielles)") };
+  const coverageOk = coverage >= 40; // assoupli
+  if (score_adj >= 70 && coverageOk && momentumPresent) return { verdict: "sain" as const, reason: "Profil globalement solide sur les piliers clés." };
+  if (score_adj >= 50 || momentumPresent) return { verdict: "a_surveiller" as const, reason: "Profil correct avec des points à surveiller." };
+  return { verdict: "fragile" as const, reason: "Profil fragile ou données partielles." };
 }
 
 /* ============================== Fetch util ============================== */
