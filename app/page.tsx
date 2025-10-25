@@ -55,13 +55,16 @@ export default function Page() {
   const debounceId = useRef<ReturnType<typeof setTimeout> | null>(null);
   const inputRef = useRef<HTMLInputElement | null>(null);
   const sugRef = useRef<HTMLDivElement | null>(null);
+  const suppressSuggestRef = useRef<boolean>(false); // NEW: supprime l'ouverture auto
 
   /* ========= URL param -> auto lookup ========= */
   useEffect(() => {
     const sp = new URLSearchParams(location.search);
     const t = sp.get("ticker");
     if (t) {
+      suppressSuggestRef.current = true; // ne pas ouvrir de suggestions lors du setQ programmatique
       setQ(t);
+      setShowSug(false);
       void lookup(t);
     }
     // eslint-disable-next-line react-hooks/exhaustive-deps
@@ -91,6 +94,8 @@ export default function Page() {
       setError(e?.message || "Erreur inconnue");
     } finally {
       setLoading(false);
+      setShowSug(false); // ferme les suggestions après requête
+      inputRef.current?.blur();
     }
   }
 
@@ -101,6 +106,12 @@ export default function Page() {
       setShowSug(false);
       return;
     }
+    // Empêche l'ouverture après setQ programmatique (URL, chip, suggestion)
+    if (suppressSuggestRef.current) {
+      suppressSuggestRef.current = false;
+      return;
+    }
+
     if (debounceId.current) clearTimeout(debounceId.current);
     debounceId.current = setTimeout(async () => {
       setSugLoading(true);
@@ -240,6 +251,7 @@ export default function Page() {
                     key={`${it.symbol}-${i}`}
                     role="option"
                     onClick={() => {
+                      suppressSuggestRef.current = true; // évite réouverture au setQ
                       setQ(it.symbol);
                       setShowSug(false);
                       void lookup(it.symbol);
@@ -260,6 +272,7 @@ export default function Page() {
 
           <button
             onClick={() => {
+              suppressSuggestRef.current = true;
               setShowSug(false);
               lookup();
               inputRef.current?.blur();
@@ -277,6 +290,7 @@ export default function Page() {
             <button
               key={t}
               onClick={() => {
+                suppressSuggestRef.current = true;
                 setQ(t);
                 setShowSug(false);
                 void lookup(t);
@@ -306,9 +320,13 @@ export default function Page() {
               {/* Ribbon */}
               <div className="absolute -right-14 top-6 rotate-45">
                 <div
-                  className={`px-16 py-1 text-xs tracking-wider text-white/90 ${barColor(
-                    data.score_adj ?? data.score
-                  )}`}
+                  className={`px-16 py-1 text-xs tracking-wider text-white/90 ${
+                    (data.score_adj ?? data.score) >= 70
+                      ? "bg-emerald-500"
+                      : (data.score_adj ?? data.score) >= 50
+                      ? "bg-amber-500"
+                      : "bg-rose-500"
+                  }`}
                 >
                   {data.verdict.toUpperCase()}
                 </div>

@@ -45,7 +45,7 @@ type ScorePayload = {
   reasons_positive: string[];
   red_flags: string[];
   subscores: Record<string, number>;
-  coverage: number;
+  coverage: number; // 0..100 (par piliers)
   proof?: {
     price_source?: string;
     price_points?: number;
@@ -160,13 +160,34 @@ export async function GET(req: Request, { params }: { params: { ticker: string }
     const sources_used = ["price:yahoo(v8)", "yahoo:v10"];
 
     const bundle: DataBundle = { ticker: t, fundamentals, prices: priceFeed, sources_used };
-    const { subscores, malus, maxes } = computeScore(bundle);
+    const { subscores, maxes } = computeScore(bundle);
+
+    // Couverture par PILIERS (non plus par granularité intrapilier)
+    // - Qualité présente si op_margin est dispo -> +35
+    // - Sécurité présente si current_ratio OU net_cash -> +25
+    // - Valorisation présente si FCFY OU EY -> +25
+    // - Momentum présent si px_vs_200dma -> +15
+    const qualityPresent = typeof fundamentals.op_margin.value === "number";
+    const safetyPresent =
+      typeof fundamentals.current_ratio.value === "number" || typeof fundamentals.net_cash.value === "number";
+    const valuationPresent =
+      typeof fundamentals.fcf_yield.value === "number" || typeof fundamentals.earnings_yield.value === "number";
+    const momentumPresent = typeof priceFeed.px_vs_200dma.value === "number";
+
+    const coveragePoints =
+      (qualityPresent ? 35 : 0) +
+      (safetyPresent ? 25 : 0) +
+      (valuationPresent ? 25 : 0) +
+      (momentumPresent ? 15 : 0);
     const total = subscores.quality + subscores.safety + subscores.valuation + subscores.momentum;
-    const raw = Math.max(0, Math.min(100, Math.round(total) - malus));
-    const coverage = Math.max(0, Math.min(100, Math.round(maxes.quality + maxes.safety + maxes.valuation + maxes.momentum)));
+    const raw = Math.max(0, Math.min(100, Math.round(total)));
+
+    const coverage = coveragePoints; // déjà sur 100
     const score_adj = coverage > 0 ? Math.round((total / coverage) * 100) : 0;
+
     const color: ScorePayload["color"] = raw >= 70 ? "green" : raw >= 50 ? "orange" : "red";
-    const { verdict, reason } = makeVerdict(bundle, subscores, coverage);
+    const { verdict, reason } = makeVerdict({ coverage, total, momentumPresent, score_adj });
+
     const reasons = buildReasons(bundle, subscores);
 
     const payload: ScorePayload = {
@@ -336,11 +357,10 @@ function computeFundamentalsFromV10(r: any): Fundamentals {
   const debt = num(r?.financialData?.totalDebt?.raw ?? r?.financialData?.totalDebt);
 
   // --- nouveaux (annual) ---
-  const ishs = r?.incomeStatementHistory?.incomeStatementHistory || [];
+  const ishs: any[] = r?.incomeStatementHistory?.incomeStatementHistory || [];
   const bsh: any[] = r?.balanceSheetHistory?.balanceSheetStatements || [];
 
   const ni0 = num(ishs?.[0]?.netIncome?.raw ?? ishs?.[0]?.netIncome);
-  const ni1 = num(ishs?.[1]?.netIncome?.raw ?? ishs?.[1]?.netIncome);
   const opInc0 = num(ishs?.[0]?.operatingIncome?.raw ?? ishs?.[0]?.operatingIncome);
   const taxExp0 = num(ishs?.[0]?.incomeTaxExpense?.raw ?? ishs?.[0]?.incomeTaxExpense);
   const preTax0 = num(ishs?.[0]?.incomeBeforeTax?.raw ?? ishs?.[0]?.incomeBeforeTax);
@@ -373,9 +393,12 @@ function computeFundamentalsFromV10(r: any): Fundamentals {
   const fcf_over_ni = fcf != null && ni0 != null && ni0 !== 0 ? fcf / ni0 : null;
 
   // ROIC ~ NOPAT / (Debt + Equity - Cash)
+  // - NOPAT ≈ operatingIncome * (1 - taxRate)
+  // - Fallback si operatingIncome manquant: NOPAT ≈ netIncome (proxy prudente)
   const taxRate =
     preTax0 && taxExp0 != null && preTax0 !== 0 ? Math.min(0.5, Math.max(0, taxExp0 / preTax0)) : 0.21;
-  const nopat = opInc0 != null ? opInc0 * (1 - taxRate) : null;
+  const nopat =
+    opInc0 != null ? opInc0 * (1 - taxRate) : (ni0 != null ? ni0 : null);
   const invested =
     (debt ?? null) != null || (eq0 ?? null) != null ? ((debt ?? 0) + (eq0 ?? 0) - (cash ?? 0)) : null;
   const roic = nopat != null && invested && invested !== 0 ? nopat / invested : null;
@@ -458,9 +481,9 @@ function computeScore(d: DataBundle) {
     momentum: clip(m, 0, 15),
   };
   const maxes = { quality: qMax, safety: sMax, valuation: vMax, momentum: mMax };
-  const malus = 0;
-  return { subscores, malus, maxes };
+  return { subscores, maxes };
 }
+
 function buildReasons(_d: DataBundle, subs: Record<string, number>) {
   const out: string[] = [];
   if (subs.quality >= 6) out.push("Marge opérationnelle décente");
@@ -470,16 +493,12 @@ function buildReasons(_d: DataBundle, subs: Record<string, number>) {
   if (!out.length) out.push("Données limitées : vérifiez les détails");
   return out;
 }
-function makeVerdict(d: DataBundle, subs: Record<string, number>, coverage: number) {
-  const momentumOk =
-    (typeof d.prices.px_vs_200dma.value === "number" && d.prices.px_vs_200dma.value >= 0) ||
-    (typeof d.prices.ret_60d.value === "number" && d.prices.ret_60d.value > 0);
-  const total = subs.quality + subs.safety + subs.valuation + subs.momentum;
-  const score_adj = coverage > 0 ? Math.round((total / coverage) * 100) : 0;
-  const coverageOk = coverage >= 40;
-  if (score_adj >= 70 && coverageOk && momentumOk) return { verdict: "sain" as const, reason: "Score élevé et couverture suffisante" };
-  if (score_adj >= 40 || momentumOk)
-    return { verdict: "a_surveiller" as const, reason: "Signal positif mais incomplet" + (coverageOk ? "" : " (couverture limitée)") };
+
+function makeVerdict(args: { coverage: number; total: number; momentumPresent: boolean; score_adj: number }) {
+  const { coverage, momentumPresent, score_adj } = args;
+  const coverageOk = coverage >= 60; // seuil assoupli via couverture par piliers
+  if (score_adj >= 70 && coverageOk && momentumPresent) return { verdict: "sain" as const, reason: "Score élevé et couverture suffisante" };
+  if (score_adj >= 40 || momentumPresent) return { verdict: "a_surveiller" as const, reason: "Signal positif mais incomplet" + (coverageOk ? "" : " (couverture limitée)") };
   return { verdict: "fragile" as const, reason: "Signal faible et données limitées" };
 }
 
