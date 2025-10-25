@@ -162,69 +162,31 @@ export async function GET(req: Request, { params }: { params: { ticker: string }
     const bundle: DataBundle = { ticker: t, fundamentals, prices: priceFeed, sources_used };
     const { subscores, maxes } = computeScore(bundle);
 
-    // ===== Dénominateur réel (ce qui est disponible) : 0..39 =====
+    // ===== Fiabilité (UI) basée sur les *maxes* réellement disponibles =====
+    // Chaque pilier est ramené à son plafond interne (8/6/10/15) puis mappé sur (35/25/25/15).
+    const covQuality = Math.min(1, (maxes.quality || 0) / 8) * 35;   // 0..35
+    const covSafety  = Math.min(1, (maxes.safety  || 0) / 6) * 25;   // 0..25
+    const covVal     = Math.min(1, (maxes.valuation|| 0) / 10) * 25; // 0..25
+    const covMom     = Math.min(1, (maxes.momentum || 0) / 15) * 15; // 0..15
+    const coverage_display = Math.round(covQuality + covSafety + covVal + covMom); // 0..100
+
+    // ===== Couverture pour la normalisation du score (dénominateur) =====
+    // Somme des maxes effectivement disponibles (0..39)
     const denom = Math.max(
       1,
       Math.round(maxes.quality + maxes.safety + maxes.valuation + maxes.momentum)
     );
 
-    // ===== Score bruts / normalisés =====
     const total = subscores.quality + subscores.safety + subscores.valuation + subscores.momentum;
     const raw = Math.max(0, Math.min(100, Math.round(total)));
-    const score_adj = Math.round((total / denom) * 100); // 0..100 (normalisé sur "dispo")
-
-    // ===== Fiabilité (UI) par pilier avec poids internes =====
-    // Qualité: op_margin (0.5), ROE (0.25), ROA (0.15), ROIC (0.10)
-    const q_w =
-      (typeof fundamentals.op_margin.value === "number" ? 0.5 : 0) +
-      (fundamentals.roe?.value != null ? 0.25 : 0) +
-      (fundamentals.roa?.value != null ? 0.15 : 0) +
-      (fundamentals.roic?.value != null ? 0.10 : 0);
-    const covQuality = Math.min(1, q_w) * 35;
-
-    // Sécurité: current_ratio (0.7), net_cash (0.3)
-    const s_w =
-      (fundamentals.current_ratio.value != null ? 0.7 : 0) +
-      (fundamentals.net_cash.value != null ? 0.3 : 0);
-    const covSafety = Math.min(1, s_w) * 25;
-
-    // Valorisation: fcf_yield (0.7), earnings_yield (0.3)
-    const v_w =
-      (fundamentals.fcf_yield.value != null ? 0.7 : 0) +
-      (fundamentals.earnings_yield.value != null ? 0.3 : 0);
-    const covVal = Math.min(1, v_w) * 25;
-
-    // Momentum: px_vs_200dma (0.6 si >=200 pts), ret_20d (0.2), ret_60d (0.2)
-    const pts = priceFeed.meta?.points ?? 0;
-    const has200 = typeof priceFeed.px_vs_200dma.value === "number" && pts >= 200;
-    const m_w =
-      (has200 ? 0.6 : 0) +
-      (priceFeed.ret_20d.value != null ? 0.2 : 0) +
-      (priceFeed.ret_60d.value != null ? 0.2 : 0);
-    const covMom = Math.min(1, m_w) * 15;
-
-    let coverage_display = Math.round(covQuality + covSafety + covVal + covMom); // 0..100
-
-    // ===== Pénalités (fraîcheur & densité de prix) =====
-    const recency = priceFeed.meta?.recency_days ?? 999;
-
-    // densité
-    if (pts < 120) coverage_display -= 10;
-    else if (pts < 240) coverage_display -= 5;
-
-    // fraîcheur
-    if (recency > 14) coverage_display -= 10;
-    else if (recency > 7) coverage_display -= 5;
-
-    // borne finale
-    coverage_display = Math.max(5, Math.min(100, coverage_display));
+    const score_adj = Math.round((total / denom) * 100); // normalisation → 0..100
 
     // Couleur & verdict basés sur le score affiché (shown)
     const shown = score_adj ?? raw;
     const color: ScorePayload["color"] = shown >= 65 ? "green" : shown >= 50 ? "orange" : "red";
 
-    // Momentum “présent” si la 200DMA est calculable
-    const momentumPresent = has200;
+    // Momentum “présent” uniquement si la 200DMA est vraiment calculable (≥200 points)
+    const momentumPresent = typeof priceFeed.px_vs_200dma.value === "number";
 
     const { verdict, reason } = makeVerdict({
       coverage: coverage_display,
@@ -245,7 +207,7 @@ export async function GET(req: Request, { params }: { params: { ticker: string }
       reasons_positive: reasons.slice(0, 3),
       red_flags: [],
       subscores,
-      coverage: coverage_display, // ← nouvelle fiabilité
+      coverage: coverage_display, // UI
       proof: {
         price_source: priceFeed.meta?.source_primary,
         price_points: priceFeed.meta?.points,
@@ -263,9 +225,7 @@ export async function GET(req: Request, { params }: { params: { ticker: string }
     };
 
     if (!isDebug) MEM[cacheKey] = { expires: now + TTL_MS, data: payload };
-    return NextResponse.json(payload, {
-      headers: { "Cache-Control": "s-maxage=600, stale-while-revalidate=1200" },
-    });
+    return NextResponse.json(payload, { headers: { "Cache-Control": "s-maxage=600, stale-while-revalidate=1200" } });
   } catch (e: any) {
     const msg = typeof e?.message === "string" ? e.message : e?.toString?.() || "Erreur provider";
     return NextResponse.json({ error: msg }, { status: 500 });
