@@ -253,7 +253,7 @@ export default function Page() {
     <main className="min-h-screen bg-slate-950 text-slate-100">
       {/* Top bar */}
       <header className="sticky top-0 z-30 backdrop-blur supports-[backdrop-filter]:bg-slate-950/60 bg-slate-950/90 border-b border-slate-800">
-        <div className="max-w-6xl mx-auto px-5 py-3 flex items-center gap-3">
+        <div className="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8 py-3 flex items-center gap-3">
           <div className="w-2.5 h-2.5 rounded-full bg-sky-500 shadow-[0_0_18px] shadow-sky-500/70" />
           <h1 className="text-lg md:text-xl font-semibold">Stock Analyzer</h1>
           <span className="ml-2 text-xs px-2 py-0.5 rounded-full border border-slate-700 text-slate-300">
@@ -268,7 +268,7 @@ export default function Page() {
       </header>
 
       {/* Search */}
-      <section className="max-w-6xl mx-auto px-5 pt-8">
+      <section className="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8 pt-8">
         <div className="grid gap-4 md:grid-cols-[1fr_auto] relative">
           <div className="flex relative rounded-2xl border border-slate-800 bg-slate-900/40 focus-within:ring-2 focus-within:ring-sky-500">
             <input
@@ -372,7 +372,7 @@ export default function Page() {
 
       {/* Result */}
       {data && (
-        <section className="max-w-6xl mx-auto px-5 py-8 grid lg:grid-cols-3 gap-6">
+        <section className="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8 py-8 grid lg:grid-cols-3 gap-6">
           {/* Left: Score & pillars */}
           <div className="lg:col-span-2">
             <div className="rounded-3xl border border-slate-800 bg-gradient-to-b from-slate-900/60 to-slate-900/30 p-6 md:p-7">
