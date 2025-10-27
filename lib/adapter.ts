@@ -48,31 +48,6 @@ export function bundleToMetrics(d: DataBundle): Metrics {
 
   const m: Metrics = {};
 
-  // --- DEBUG: adapter metrics snapshot ---
-try {
-  console.log("[metrics][DEBUG]", {
-    roe: m.roe,
-    roic: m.roic,
-    netMargin: m.netMargin,
-    fcfOverNetIncome: m.fcfOverNetIncome,
-    currentRatio: m.currentRatio,
-    debtToEquity: m.debtToEquity,
-    netDebtToEbitda: m.netDebtToEbitda,
-    interestCoverage: m.interestCoverage,
-    fcfYield: m.fcfYield,
-    earningsYield: m.earningsYield,
-    pe: m.pe,
-    evToEbitda: m.evToEbitda,
-    forwardRevGrowth: m.forwardRevGrowth,
-    cagrEps3y: m.cagrEps3y,
-    perf6m: m.perf6m,
-    perf12m: m.perf12m,
-    above200dma: m.above200dma
-  });
-} catch (e) {
-  console.warn("[metrics][DEBUG] logging failed:", e);
-}
-
   // --- Quality ---
   m.roe = f.roe?.value ?? null;
   m.roic = f.roic?.value ?? null;
