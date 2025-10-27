@@ -585,14 +585,14 @@ export default function Page() {
 function OpportunityChart({ rows }: { rows: { t: number; close: number; opp: number }[] }) {
   // --- Dimensions & mise en page -------------------------------------------
   const W = 760;                  // largeur logique du SVG
-  const H = 290;                  // ↑ un peu plus haut pour laisser de la place
-  const M = { top: 16, right: 48, bottom: 16, left: 56 };
+  const H = 260;                  // ↑ un peu plus haut pour laisser de la place
+  const M = { top: 16, right: 48, bottom: 52, left: 56 };
   const innerW = W - M.left - M.right;
   const priceH = 150;             // zone prix
   const bandH = 20;               // bande "opportunité"
   const gap = 22;                 // ↑ espace entre la courbe et la bande
   const bandY = priceH + gap;     // position verticale de la bande
-  const axisY = bandY + bandH + 12; // position de l’axe X sous la bande
+  const axisY = bandY + bandH + 8; // position de l’axe X sous la bande
 
   const n = rows.length || 0;
   if (n === 0) {
@@ -669,7 +669,7 @@ function OpportunityChart({ rows }: { rows: { t: number; close: number; opp: num
     <div className="mt-3 rounded-2xl border border-slate-800 bg-slate-900/40 overflow-hidden">
       <svg
         viewBox={`0 0 ${W} ${H}`}
-        className="w-full h-[290px]" // ↑ hauteur tailwind alignée avec H
+        className="w-full h-[260px]" // ↑ hauteur tailwind alignée avec H
         onMouseMove={onMove}
         onMouseLeave={onLeave}
       >
