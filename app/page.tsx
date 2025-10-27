@@ -677,21 +677,16 @@ function OpportunityChart({ rows }: { rows: { t: number; close: number; opp: num
   const placeLeft  = (xx: number, needed = 72) => xx >= needed;
 
   return (
-    <div className="mt-3 rounded-2xl overflow-hidden mx-auto w-full border border-slate-800 bg-slate-900/40">
+    <div className="mt-3 rounded-2xl overflow-hidden mx-auto w-full border border-slate-800">
       <svg
         viewBox={`0 0 ${W} ${H}`}
         preserveAspectRatio="xMidYMid meet"
-        className="w-full block rounded-2xl border border-slate-800"
-        style={{
-          display: "block",
-          borderRadius: "inherit",
-          border: "1px solid rgba(30,41,59,0.8)", // renforce la cohérence avec les autres cartes
-        }}
+        className="w-full block"
+        style={{ borderRadius: "inherit" }}
         onMouseMove={onMove}
         onMouseLeave={onLeave}
       >
-        {/* Background */}
-        <rect x={0} y={0} width={W} height={H} fill="rgb(2,6,23)" />
+        <rect x={0} y={0} width={W} height={H} fill="rgb(2,6,23)" stroke="rgba(30,41,59,0.8)" />
 
         <g transform={`translate(${M.left},${M.top})`}>
           {/* Grid */}
