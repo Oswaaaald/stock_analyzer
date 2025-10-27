@@ -585,15 +585,15 @@ export default function Page() {
 /* ---------------- Opportunity Chart ---------------- */
 function OpportunityChart({ rows }: { rows: { t: number; close: number; opp: number }[] }) {
   // --- Dimensions & mise en page -------------------------------------------
-  const W = 760;                 // largeur logique du SVG
-  const H = 260;                 // hauteur totale compacte
-  const M = { top: 16, right: 48, bottom: 34, left: 56 }; // marges pour axes/labels
+  const W = 760;
+  const H = 268;                         // légèrement compact
+  const M = { top: 16, right: 48, bottom: 40, left: 56 };
   const innerW = W - M.left - M.right;
-  const priceH = 150;            // hauteur de la zone prix
-  const bandH = 20;              // hauteur de la bande "opportunité"
-  const gap = 8;                 // petit espace entre la courbe et la bande
-  const bandY = priceH + gap;    // position verticale de la bande
-  const axisY = bandY + bandH + 8; // axe X juste sous la bande
+  const priceH = 150;
+  const bandH = 20;
+  const gap = 18;                        // espace entre courbe et bande
+  const bandY = priceH + gap;
+  const axisY = bandY + bandH + 8;
 
   const n = rows.length || 0;
   if (n === 0) {
@@ -610,27 +610,35 @@ function OpportunityChart({ rows }: { rows: { t: number; close: number; opp: num
   const pMax = Math.max(...closes);
 
   const x = (i: number) => (i * innerW) / Math.max(1, n - 1);
-  const y = (p: number) =>
-    priceH - ((p - pMin) * priceH) / Math.max(1e-9, pMax - pMin);
+  const y = (p: number) => priceH - ((p - pMin) * priceH) / Math.max(1e-9, pMax - pMin);
 
   // Chemin de la courbe
   const path = rows.map((r, i) => `${i === 0 ? "M" : "L"} ${x(i)} ${y(r.close)}`).join(" ");
 
-  // Recalibrage local de l’opportunité (couleurs rouge→vert)
-  const oppVals = rows.map(r => r.opp);
-  const oMin = Math.min(...oppVals), oMax = Math.max(...oppVals);
-  const scaleOpp01 = (v: number) => (oMax > oMin ? (v - oMin) / (oMax - oMin) : 0.5);
+  // === NOUVEAU : normalisation GLOBALE de l’opportunité ====================
+  // 1) opp ∈ [0..100] (ou [0..1] si backend en 0..1) → ramener en [0..1]
+  const oppNorm01 = (v: number) => {
+    if (!Number.isFinite(v)) return 0.5;
+    const p = v <= 1.2 ? v : v / 100;          // si >1.2 on considère que c’est du pourcentage (ex: 73)
+    return Math.max(0, Math.min(1, p));
+  };
+  // 2) Couleur rouge→vert sur échelle globale
   const oppColor = (v: number) => {
-    const s = Math.max(0, Math.min(1, scaleOpp01(v)));
-    const hue = 10 + s * 120; // 10=rouge → 130≈vert
+    const s = Math.pow(oppNorm01(v), 0.9);     // léger boost visuel
+    const hue = 10 + s * 120;                  // 10 (rouge) → 130 (vert)
     return `hsl(${hue} 85% 48%)`;
+  };
+  // 3) Affichage 0..100% cohérent
+  const fmtOppPct = (v: number) => {
+    const pct = v <= 1.2 ? v * 100 : v;
+    return Math.max(0, Math.min(100, pct)).toFixed(0) + "%";
   };
 
   // Axes X: ~5 ticks + première/dernière
   const tickCount = 5;
   const step = Math.max(1, Math.floor(n / (tickCount + 1)));
   const tickIdx = [0, ...Array.from({ length: tickCount }, (_, k) => Math.min(n - 1, (k + 1) * step)), n - 1]
-    .filter((v, i, arr) => i === 0 || v !== arr[i - 1]); // unique
+    .filter((v, i, arr) => i === 0 || v !== arr[i - 1]);
   const fmtDate = (ms: number) =>
     new Date(ms).toLocaleDateString("fr-FR", { year: "2-digit", month: "short" }).replace(".", "");
 
@@ -648,7 +656,7 @@ function OpportunityChart({ rows }: { rows: { t: number; close: number; opp: num
   const iMax = closes.indexOf(pMax);
 
   // --- Tooltip (survol) -----------------------------------------------------
-  const [hover, setHover] = React.useState<number | null>(null);
+  const [hover, setHover] = useState<number | null>(null);
   const onMove = (e: React.MouseEvent<SVGSVGElement>) => {
     const svg = e.currentTarget;
     const pt = svg.createSVGPoint();
@@ -670,7 +678,7 @@ function OpportunityChart({ rows }: { rows: { t: number; close: number; opp: num
     <div className="mt-3 rounded-2xl border border-slate-800 bg-slate-900/40 overflow-hidden">
       <svg
         viewBox={`0 0 ${W} ${H}`}
-        className="w-full h-[260px]"
+        className="w-full h-[268px]"
         onMouseMove={onMove}
         onMouseLeave={onLeave}
       >
@@ -702,18 +710,16 @@ function OpportunityChart({ rows }: { rows: { t: number; close: number; opp: num
           />
 
           {/* Repères min/max */}
-          {/* MAX */}
           <g transform={`translate(${x(iMax)}, ${y(pMax)})`}>
             <circle r={3.2} fill="rgba(34,197,94,0.9)" />
             <text x={6} y={-6} fontSize="10" fill="rgba(148,163,184,0.9)">Max {fmtPrice(pMax)}</text>
           </g>
-          {/* MIN */}
           <g transform={`translate(${x(iMin)}, ${y(pMin)})`}>
             <circle r={3.2} fill="rgba(244,63,94,0.9)" />
             <text x={6} y={12} fontSize="10" fill="rgba(148,163,184,0.9)">Min {fmtPrice(pMin)}</text>
           </g>
 
-          {/* Bande opportunité (heat strip) */}
+          {/* Bande opportunité */}
           <g transform={`translate(0, ${bandY})`}>
             <rect x={0} y={0} width={innerW} height={bandH} fill="rgba(2,6,23,0.6)" />
             <rect x={0} y={0} width={innerW} height={bandH} fill="url(#bandShine)" />
@@ -769,17 +775,14 @@ function OpportunityChart({ rows }: { rows: { t: number; close: number; opp: num
           {/* Crosshair + tooltip */}
           {hoverRow && (
             <g>
-              {/* vertical line jusqu’à l’axe */}
               <line
                 x1={hx} x2={hx}
                 y1={0} y2={axisY}
                 stroke="rgba(148,163,184,0.35)"
                 strokeDasharray="3 3"
               />
-              {/* point */}
               <circle cx={hx} cy={hy} r={3.8} fill="rgb(56,189,248)" stroke="white" strokeWidth={1} />
 
-              {/* tooltip card */}
               {(() => {
                 const pad = 8;
                 const w = 160, h = 64;
@@ -799,10 +802,7 @@ function OpportunityChart({ rows }: { rows: { t: number; close: number; opp: num
                       Prix: <tspan fontWeight={600}>{fmtPrice(hoverRow.close)}</tspan>
                     </text>
                     <text x={pad} y={pad + 42} fontSize="12" fill="white">
-                      Opportunité:{" "}
-                      <tspan fontWeight={600}>
-                        {(Math.max(0, Math.min(100, hoverRow.opp))).toFixed(0)}%
-                      </tspan>
+                      Opportunité: <tspan fontWeight={600}>{fmtOppPct(hoverRow.opp)}</tspan>
                     </text>
                   </g>
                 );
