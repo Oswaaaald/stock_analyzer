@@ -19,8 +19,8 @@ type ScoreResponse = {
   reasons_positive: string[];
   red_flags: string[];
 
-  subscores: Record<string, number>;
-  coverage: number;
+  subscores: Record<string, number>; // { quality:0..35, safety:0..25, valuation:0..25, momentum:0..15 }
+  coverage: number;       // "Couverture des données" (0..100)
 
   opportunity_series?: OppPoint[];
 
@@ -56,18 +56,7 @@ type SuggestItem = {
 
 type SelectedMeta = { symbol: string; name?: string | null; exchange?: string | null };
 
-/* ====================== Devise / FX helpers ====================== */
-const EXCHANGE_TO_CCY: Record<string, string> = {
-  NASDAQ: "USD", NASDAQGS: "USD", NASDAQGQS: "USD", NASDAQGM: "USD",
-  NYSE: "USD",
-  PARIS: "EUR", EURONEXT: "EUR", AMSTERDAM: "EUR", AMS: "EUR",
-  LSE: "GBP",
-  MEXICO: "MXN", BMV: "MXN", MEX: "MXN",
-};
-const CCY_OPTIONS = ["USD","EUR","GBP","JPY","CHF","CAD","AUD","MXN"] as const;
-const CCY_LABEL: Record<(typeof CCY_OPTIONS)[number],string> = {
-  USD:"$ USD", EUR:"€ EUR", GBP:"£ GBP", JPY:"¥ JPY", CHF:"CHF", CAD:"$ CAD", AUD:"$ AUD", MXN:"$ MXN",
-};
+const SUGGESTIONS = ["AAPL", "MSFT", "NVDA", "TSLA", "RMS.PA", "MC.PA", "ASML.AS"];
 
 /* ====================== Page ====================== */
 export default function Page() {
@@ -85,16 +74,8 @@ export default function Page() {
   const sugRef = useRef<HTMLDivElement | null>(null);
   const suppressSuggestRef = useRef<boolean>(false);
 
-  // sélection courante (affichage nom complet + place)
+  // sélection courante (pour afficher nom complet + place)
   const [selected, setSelected] = useState<SelectedMeta | null>(null);
-
-  // --- Devises / FX ---
-  const [baseCcy, setBaseCcy] = useState<(typeof CCY_OPTIONS)[number]>("USD");
-  const [ccy, setCcy] = useState<(typeof CCY_OPTIONS)[number]>("USD");
-  const [fx, setFx] = useState<number>(1);          // multiplicateur: prix_local * fx -> prix_en_ccy
-  const [fxInfo, setFxInfo] = useState<string>(""); // hint affiché
-  const prevBaseRef = useRef<string>("USD");
-  const userPickedRef = useRef<boolean>(false);     // évite d’écraser le choix utilisateur quand on change de ticker
 
   /* ========= URL param -> auto lookup ========= */
   useEffect(() => {
@@ -104,7 +85,7 @@ export default function Page() {
       suppressSuggestRef.current = true;
       setQ(t);
       setShowSug(false);
-      setSelected({ symbol: t });
+      setSelected({ symbol: t }); // pas de nom si chargé via URL
       void lookup(t);
     }
     // eslint-disable-next-line react-hooks/exhaustive-deps
@@ -141,18 +122,6 @@ export default function Page() {
           exchange: json.exchange ?? undefined,
         });
       }
-
-      // devise de base déduite de l'exchange
-      const ex = (json.exchange || selected?.exchange || "").toUpperCase();
-      const guessed = (EXCHANGE_TO_CCY[ex] || (ex.includes("PARIS") ? "EUR" : "USD")) as (typeof CCY_OPTIONS)[number];
-      setBaseCcy(guessed);
-
-      // si l’utilisateur n’a pas choisi lui-même, on suit la base
-      if (!userPickedRef.current || prevBaseRef.current === ccy) {
-        setCcy(guessed);
-      }
-      prevBaseRef.current = guessed;
-
     } catch (e: any) {
       setError(e?.message || "Erreur inconnue");
     } finally {
@@ -161,33 +130,6 @@ export default function Page() {
       inputRef.current?.blur();
     }
   }
-
-  /* ========= FX fetch (spot, sans clé) ========= */
-  useEffect(() => {
-    let abort = false;
-    async function loadFx() {
-      try {
-        if (!baseCcy || !ccy || baseCcy === ccy) {
-          if (!abort) { setFx(1); setFxInfo(""); }
-          return;
-        }
-        const r = await fetch(
-          `https://api.exchangerate.host/latest?base=${encodeURIComponent(baseCcy)}&symbols=${encodeURIComponent(ccy)}`,
-          { cache: "no-store" }
-        );
-        const j = (await r.json().catch(() => null)) as any;
-        const rate = j?.rates?.[ccy] ?? 1;
-        if (!abort) {
-          setFx(rate);
-          setFxInfo(`~ 1 ${baseCcy} ≈ ${rate.toFixed(4)} ${ccy}`);
-        }
-      } catch {
-        if (!abort) { setFx(1); setFxInfo(""); }
-      }
-    }
-    void loadFx();
-    return () => { abort = true; };
-  }, [baseCcy, ccy]);
 
   /* ========= Suggest: debounced fetch ========= */
   useEffect(() => {
@@ -276,6 +218,9 @@ export default function Page() {
     return "bg-rose-500";
   }
 
+  function fmtPct(x?: number | null) {
+    return typeof x === "number" ? `${(x * 100).toFixed(1)}%` : "—";
+  }
   function fmtPctClamped(x?: number | null, capAbs = 2.0) {
     if (typeof x !== "number") return "—";
     const capped = Math.max(-capAbs, Math.min(capAbs, x));
@@ -285,6 +230,7 @@ export default function Page() {
     return s;
   }
 
+  // libellés piliers + dénominateurs
   const PILLAR_MAX: Record<string, number> = { quality: 35, safety: 25, valuation: 25, momentum: 15 };
   const PILLAR_LABEL: Record<string, string> = {
     quality: "Qualité opérationnelle",
@@ -293,6 +239,7 @@ export default function Page() {
     momentum: "Momentum / Tendance",
   };
 
+  // texte d’interprétation sous le titre
   const interpretation = useMemo(() => {
     if (!data) return "";
     const shown = data.score_adj ?? data.score;
@@ -303,7 +250,7 @@ export default function Page() {
 
   /* ====================== Render ====================== */
   return (
-    <main className="min-h-screen bg-slate-950 text-slate-100">
+    <main className="min-h-screen bg-slate-950 text-slate-100 overflow-x-hidden">
       {/* Top bar */}
       <header className="sticky top-0 z-30 backdrop-blur supports-[backdrop-filter]:bg-slate-950/60 bg-slate-950/90 border-b border-slate-800">
         <div className="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8 py-3 flex items-center gap-3">
@@ -397,20 +344,23 @@ export default function Page() {
 
         {/* Chips */}
         <div className="flex flex-wrap gap-2 mt-3">
-          {CCY_OPTIONS.map((k) => (
+          {SUGGESTIONS.map((t) => (
             <button
-              key={`ccy-${k}`}
-              onClick={() => { userPickedRef.current = true; setCcy(k); }}
-              className={`text-xs px-2.5 py-1.5 rounded-full border ${ccy===k ? "border-sky-600 bg-sky-500/10 text-sky-300" : "border-slate-800 bg-slate-900/30 hover:bg-slate-800/50 text-slate-300"}`}
-              title="Changer la devise d'affichage"
+              key={t}
+              onClick={() => {
+                suppressSuggestRef.current = true;
+                setQ(t);
+                setShowSug(false);
+                setSelected({ symbol: t });
+                void lookup(t, { symbol: t });
+                inputRef.current?.blur();
+              }}
+              className="text-xs px-2.5 py-1.5 rounded-full border border-slate-800 bg-slate-900/30 hover:bg-slate-800/50 text-slate-300"
             >
-              {CCY_LABEL[k]}
+              {t}
             </button>
           ))}
         </div>
-
-        {/* FX info */}
-        {fxInfo && <div className="mt-2 text-xs text-slate-500">Taux spot : {fxInfo}</div>}
 
         {/* Errors */}
         {error && (
@@ -422,7 +372,7 @@ export default function Page() {
 
       {/* Result */}
       {data && (
-        <section className="max-w-7xl mx-auto px-5 sm:px-6 lg:px-8 py-8 grid lg:grid-cols-3 gap-6">
+        <section className="w-full max-w-7xl mx-auto px-5 sm:px-6 lg:px-8 py-8 grid lg:grid-cols-3 gap-6 overflow-hidden">
           {/* Left: Score & pillars */}
           <div className="lg:col-span-2 min-w-0">
             <div className="rounded-3xl border border-slate-800 bg-gradient-to-b from-slate-900/60 to-slate-900/30 p-6 md:p-7">
@@ -472,31 +422,16 @@ export default function Page() {
                 </div>
               </div>
 
-              {/* ======== Opportunity Chart + devise ======== */}
+              {/* ======== NEW: Opportunity Chart ======== */}
               {data.opportunity_series?.length ? (
                 <div className="mt-6">
-                  <div className="flex items-center justify-between">
-                    <h3 className="text-sm uppercase tracking-wide text-slate-400">
-                      Opportunité d’achat (passé & présent)
-                    </h3>
-                    {/* petit sélecteur mirroir (optionnel, les chips existent déjà) */}
-                    <div className="hidden sm:flex items-center gap-2 text-xs">
-                      <span className="text-slate-500">Devise :</span>
-                      <select
-                        value={ccy}
-                        onChange={(e) => { userPickedRef.current = true; setCcy(e.target.value as any); }}
-                        className="rounded-md border border-slate-700 bg-slate-900/60 px-2 py-1"
-                      >
-                        {CCY_OPTIONS.map(k => <option key={k} value={k}>{CCY_LABEL[k]}</option>)}
-                      </select>
-                    </div>
-                  </div>
-
-                  <OpportunityChart rows={data.opportunity_series} fx={fx} ccy={ccy} />
-
+                  <h3 className="text-sm uppercase tracking-wide text-slate-400">
+                    Opportunité d’achat (passé & présent)
+                  </h3>
+                  <OpportunityChart rows={data.opportunity_series} />
                   <p className="mt-2 text-xs text-slate-500">
-                    Bandeau rouge→vert : plus c’est vert, plus l’opportunité semblait favorable ce jour-là
-                    (mix qualité/sécurité, “prix attractif” vs 52s et momentum vs MM200).
+                    Bandeau rouge→vert : plus c’est vert, plus l’opportunité semblait favorable ce jour-là (mix
+                    qualité/sécurité, “prix attractif” vs 52s et momentum vs MM200).
                   </p>
                 </div>
               ) : null}
@@ -640,25 +575,19 @@ export default function Page() {
 }
 
 /* ---------------- Opportunity Chart ---------------- */
-function OpportunityChart({
-  rows,
-  fx = 1,
-  ccy = "USD",
-}: {
-  rows: { t: number; close: number; opp: number }[];
-  fx?: number;
-  ccy?: string;
-}) {
-  // --- Dimensions & mise en page -------------------------------------------
+/* ---------------- Opportunity Chart ---------------- */
+function OpportunityChart({ rows }: { rows: { t: number; close: number; opp: number }[] }) {
+  // --- Dimensions -----------------------------------------------------------
+  // A fixed logical viewBox (keeps aspect), but margins tuned for labels.
   const W = 760;
-  const M = { top: 8, right: 64, bottom: 28, left: 56 };
-  const innerW = W - M.left - M.right;
+  const M = { top: 14, right: 92, bottom: 28, left: 56 }; // ↑ more right & a bit more top
   const priceH = 154;
   const bandH = 22;
   const gap = 12;
   const bandY = priceH + gap;
   const axisY = bandY + bandH + 10;
   const H = M.top + axisY + M.bottom;
+  const innerW = W - M.left - M.right;
 
   const n = rows.length || 0;
   if (n === 0) {
@@ -669,18 +598,23 @@ function OpportunityChart({
     );
   }
 
-  // --- Scales (converti en devise choisie) ---------------------------------
-  const closes = rows.map(r => r.close * fx);
-  const pMin = Math.min(...closes);
-  const pMax = Math.max(...closes);
+  // --- Scales ---------------------------------------------------------------
+  const closes = rows.map(r => r.close);
+  let pMin = Math.min(...closes);
+  let pMax = Math.max(...closes);
+
+  // small headroom so markers/text never hit top/bottom
+  const pad = (pMax - pMin) * 0.04;
+  pMin = pMin - pad;
+  pMax = pMax + pad;
 
   const x = (i: number) => (i * innerW) / Math.max(1, n - 1);
   const y = (p: number) => priceH - ((p - pMin) * priceH) / Math.max(1e-9, pMax - pMin);
 
-  // Courbe
-  const path = rows.map((r, i) => `${i === 0 ? "M" : "L"} ${x(i)} ${y(r.close * fx)}`).join(" ");
+  // Price path
+  const path = rows.map((r, i) => `${i === 0 ? "M" : "L"} ${x(i)} ${y(r.close)}`).join(" ");
 
-  // Normalisation couleur opp (0..100 ou 0..1)
+  // --- Opportunity color (global normalization 0..100 or 0..1) --------------
   const oppNorm01 = (v: number) => {
     if (!Number.isFinite(v)) return 0.5;
     const p = v <= 1.2 ? v : v / 100;
@@ -701,17 +635,25 @@ function OpportunityChart({
   const step = Math.max(1, Math.floor(n / (tickCount + 1)));
   const tickIdx = [0, ...Array.from({ length: tickCount }, (_, k) => Math.min(n - 1, (k + 1) * step)), n - 1]
     .filter((v, i, arr) => i === 0 || v !== arr[i - 1]);
+
   const fmtDate = (ms: number) =>
     new Date(ms).toLocaleDateString("fr-FR", { year: "2-digit", month: "short" }).replace(".", "");
 
-  const yTicks = [0, 1 / 3, 2 / 3, 1].map(f => pMax - f * (pMax - pMin));
-  const fmtCurrency = (v: number) =>
-    new Intl.NumberFormat("fr-FR", { style: "currency", currency: ccy, maximumFractionDigits: 2 }).format(v);
+  const fmtPrice = (v: number) => {
+    const abs = Math.abs(v);
+    if (abs >= 1000) return v.toFixed(0);
+    if (abs >= 100) return v.toFixed(1);
+    return v.toFixed(2);
+  };
+  const yTicksVals = [0, 1 / 3, 2 / 3, 1].map(f => pMax - f * (pMax - pMin));
 
-  const iMin = closes.indexOf(pMin);
-  const iMax = closes.indexOf(pMax);
+  // Min/Max indices in the unpadded space (for markers position it’s ok)
+  const rawMin = Math.min(...rows.map(r => r.close));
+  const rawMax = Math.max(...rows.map(r => r.close));
+  const iMin = rows.findIndex(r => r.close === rawMin);
+  const iMax = rows.findIndex(r => r.close === rawMax);
 
-  // --- Tooltip --------------------------------------------------------------
+  // Tooltip state
   const [hover, setHover] = useState<number | null>(null);
   const onMove = (e: React.MouseEvent<SVGSVGElement>) => {
     const svg = e.currentTarget;
@@ -728,29 +670,31 @@ function OpportunityChart({
 
   const hoverRow = hover != null ? rows[hover] : null;
   const hx = hover != null ? x(hover) : 0;
-  const hy = hoverRow ? y(hoverRow.close * fx) : 0;
+  const hy = hoverRow ? y(hoverRow.close) : 0;
+
+  // Helpers for safe label placement near edges
+  const placeRight = (xx: number, needed = 72) => xx <= innerW - needed;
+  const placeLeft  = (xx: number, needed = 72) => xx >= needed;
 
   return (
-    <div className="mt-3 rounded-2xl border border-slate-800 bg-slate-900/40 overflow-hidden mx-auto w-full">
+    <div className="mt-3 rounded-2xl overflow-hidden mx-auto w-full border border-slate-800">
       <svg
         viewBox={`0 0 ${W} ${H}`}
         preserveAspectRatio="xMidYMid meet"
-        className="w-full"
-        style={{ height: H }}
+        className="w-full block"
+        style={{ borderRadius: "inherit" }}
         onMouseMove={onMove}
         onMouseLeave={onLeave}
       >
-        <rect x={0} y={0} width={W} height={H} fill="rgb(2,6,23)" />
+        <rect x={0} y={0} width={W} height={H} fill="rgb(2,6,23)" stroke="rgba(30,41,59,0.8)" />
 
         <g transform={`translate(${M.left},${M.top})`}>
-          {/* Grille horizontale */}
-          <g>
-            {yTicks.map((v, i) => (
-              <line key={i} x1={0} x2={innerW} y1={y(v)} y2={y(v)} stroke="rgba(148,163,184,0.18)" strokeWidth={1} />
-            ))}
-          </g>
+          {/* Grid */}
+          {yTicksVals.map((v, i) => (
+            <line key={i} x1={0} x2={innerW} y1={y(v)} y2={y(v)} stroke="rgba(148,163,184,0.18)" strokeWidth={1} />
+          ))}
 
-          {/* Courbe de prix */}
+          {/* Price path */}
           <path
             d={path}
             fill="none"
@@ -760,17 +704,35 @@ function OpportunityChart({
             strokeLinecap="round"
           />
 
-          {/* Repères min/max */}
-          <g transform={`translate(${x(iMax)}, ${y(pMax)})`}>
-            <circle r={3.2} fill="rgba(34,197,94,0.9)" />
-            <text x={6} y={-6} fontSize="10" fill="rgba(148,163,184,0.9)">Max {fmtCurrency(pMax)}</text>
-          </g>
-          <g transform={`translate(${x(iMin)}, ${y(pMin)})`}>
-            <circle r={3.2} fill="rgba(244,63,94,0.9)" />
-            <text x={6} y={12} fontSize="10" fill="rgba(148,163,184,0.9)">Min {fmtCurrency(pMin)}</text>
-          </g>
+          {/* Max marker with smart text anchoring */}
+          {iMax >= 0 && (
+            <g transform={`translate(${x(iMax)}, ${y(rawMax)})`}>
+              <circle r={3.2} fill="rgba(34,197,94,0.9)" />
+              {placeRight(x(iMax)) ? (
+                <text x={6} y={-6} fontSize="10" fill="rgba(148,163,184,0.9)">Max {fmtPrice(rawMax)}</text>
+              ) : (
+                <text x={-6} y={-6} textAnchor="end" fontSize="10" fill="rgba(148,163,184,0.9)">
+                  Max {fmtPrice(rawMax)}
+                </text>
+              )}
+            </g>
+          )}
 
-          {/* Bande opportunité */}
+          {/* Min marker with smart text anchoring */}
+          {iMin >= 0 && (
+            <g transform={`translate(${x(iMin)}, ${y(rawMin)})`}>
+              <circle r={3.2} fill="rgba(244,63,94,0.9)" />
+              {placeLeft(x(iMin)) ? (
+                <text x={6} y={12} fontSize="10" fill="rgba(148,163,184,0.9)">Min {fmtPrice(rawMin)}</text>
+              ) : (
+                <text x={-6} y={12} textAnchor="end" fontSize="10" fill="rgba(148,163,184,0.9)">
+                  Min {fmtPrice(rawMin)}
+                </text>
+              )}
+            </g>
+          )}
+
+          {/* Opportunity strip */}
           <g transform={`translate(0, ${bandY})`}>
             <rect x={0} y={0} width={innerW} height={bandH} fill="rgba(2,6,23,0.6)" />
             <rect x={0} y={0} width={innerW} height={bandH} fill="url(#bandShine)" />
@@ -783,16 +745,14 @@ function OpportunityChart({
             <rect x={0} y={0} width={innerW} height={bandH} fill="none" stroke="rgba(148,163,184,0.25)" />
           </g>
 
-          {/* Axe Y (prix) */}
-          <g>
-            {yTicks.map((v, i) => (
-              <text key={i} x={innerW + 6} y={y(v) + 3} fontSize="11" fill="rgba(148,163,184,0.75)">
-                {fmtCurrency(v)}
-              </text>
-            ))}
-          </g>
+          {/* Y labels (right) */}
+          {yTicksVals.map((v, i) => (
+            <text key={i} x={innerW + 6} y={y(v) + 3} fontSize="11" fill="rgba(148,163,184,0.75)">
+              {fmtPrice(v)}
+            </text>
+          ))}
 
-          {/* Axe X (dates) */}
+          {/* X axis (under strip) */}
           <g transform={`translate(0, ${axisY})`}>
             <line x1={0} x2={innerW} y1={0} y2={0} stroke="rgba(148,163,184,0.18)" />
             {tickIdx.map((idx, k) => (
@@ -811,17 +771,18 @@ function OpportunityChart({
               <line x1={hx} x2={hx} y1={0} y2={axisY} stroke="rgba(148,163,184,0.35)" strokeDasharray="3 3" />
               <circle cx={hx} cy={hy} r={3.8} fill="rgb(56,189,248)" stroke="white" strokeWidth={1} />
               {(() => {
-                const pad = 8, w = 180, h = 66;
+                const pad = 8, w = 160, h = 64;
                 const left = hx + 12 + w > innerW ? hx - 12 - w : hx + 12;
                 const top = Math.max(0, Math.min(priceH - h, hy - h / 2));
                 return (
                   <g transform={`translate(${left}, ${top})`}>
                     <rect width={w} height={h} rx={10} fill="rgba(2,6,23,0.92)" stroke="rgba(148,163,184,0.35)" />
                     <text x={pad} y={pad + 10} fontSize="11" fill="rgba(148,163,184,0.9)">
-                      {new Date(hoverRow.t).toLocaleDateString("fr-FR", { day: "2-digit", month: "short", year: "2-digit" }).replace(".", "")}
+                      {new Date(hoverRow.t).toLocaleDateString("fr-FR",
+                        { day: "2-digit", month: "short", year: "2-digit" }).replace(".", "")}
                     </text>
                     <text x={pad} y={pad + 26} fontSize="12" fill="white">
-                      Prix: <tspan fontWeight={600}>{fmtCurrency((hoverRow?.close || 0) * fx)}</tspan>
+                      Prix: <tspan fontWeight={600}>{fmtPrice(hoverRow.close)}</tspan>
                     </text>
                     <text x={pad} y={pad + 42} fontSize="12" fill="white">
                       Opportunité: <tspan fontWeight={600}>{fmtOppPct(hoverRow.opp)}</tspan>
@@ -833,6 +794,7 @@ function OpportunityChart({
           )}
         </g>
 
+        {/* Gloss */}
         <defs>
           <linearGradient id="bandShine" x1="0" y1="0" x2="0" y2="1">
             <stop offset="0" stopColor="rgba(255,255,255,0.06)" />
