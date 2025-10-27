@@ -44,11 +44,13 @@ export async function fetchYahooV10(ticker: string, sess: YSession, retryOnce: b
 
 /**
  * Extrait et calcule les fondamentaux Yahoo v10 dans un format unifié
- * (avec fallbacks robustes : D/E via totalLiab, interest coverage via operatingIncome,
- *  buyback yield approx depuis cashflow, ROIC neutralisé si invested ≤ 0, etc.)
+ * - D/E: priorité bilan (totalDebt / equity), fallback totalLiab / equity, fallback Yahoo financialData.debtToEquity (% → ratio)
+ * - Interest coverage: ebit / |interestExpense|, fallback operatingIncome
+ * - Buyback yield approx depuis cashflow (repurchaseOfCommonStock*)
+ * - ROIC neutralisé si invested ≤ 0
  */
 export function computeFundamentalsFromV10(r: any): Fundamentals {
-  // --- Données brutes
+  // --- Données brutes -------------------------------------------------------
   const price  = num(r?.price?.regularMarketPrice?.raw ?? r?.price?.regularMarketPrice);
   const shares = num(r?.defaultKeyStatistics?.sharesOutstanding?.raw ?? r?.defaultKeyStatistics?.sharesOutstanding);
 
@@ -62,11 +64,14 @@ export function computeFundamentalsFromV10(r: any): Fundamentals {
   const ebitda       = num(r?.financialData?.ebitda?.raw ?? r?.financialData?.ebitda);
   const ebit         = num(r?.financialData?.ebit?.raw ?? r?.financialData?.ebit);
 
-  // --- Croissance
+  // Yahoo fournit parfois debtToEquity en % (ex: 154.48 → 154.48%)
+  const debtToEquityYahooPct = num(r?.financialData?.debtToEquity?.raw ?? r?.financialData?.debtToEquity);
+
+  // --- Croissance -----------------------------------------------------------
   const revGrowth = num(r?.financialData?.revenueGrowth?.raw ?? r?.financialData?.revenueGrowth);
   const epsGrowth = num(r?.financialData?.earningsGrowth?.raw ?? r?.financialData?.earningsGrowth);
 
-  // --- États financiers pour ratios avancés
+  // --- États financiers ------------------------------------------------------
   const ishs: any[] = r?.incomeStatementHistory?.incomeStatementHistory || [];
   const bsh:  any[] = r?.balanceSheetHistory?.balanceSheetStatements || [];
   const cfsh: any[] = r?.cashflowStatementHistory?.cashflowStatements || [];
@@ -79,35 +84,39 @@ export function computeFundamentalsFromV10(r: any): Fundamentals {
   const eq0          = num(bsh?.[0]?.totalStockholderEquity?.raw ?? bsh?.[0]?.totalStockholderEquity);
   const eq1          = num(bsh?.[1]?.totalStockholderEquity?.raw ?? bsh?.[1]?.totalStockholderEquity);
   const assets0      = num(bsh?.[0]?.totalAssets?.raw ?? bsh?.[0]?.totalAssets);
-  const totalLiab0   = num(bsh?.[0]?.totalLiab?.raw ?? bsh?.[0]?.totalLiab); // <-- fallback dettes
+  const totalLiab0   = num(bsh?.[0]?.totalLiab?.raw ?? bsh?.[0]?.totalLiab);
 
-  // --- Market cap et yields
-  const mc  = price && shares ? price * shares : null;
-  const ey  = trailingPE && trailingPE > 0 ? 1 / trailingPE : null;
+  // --- Market cap et yields -------------------------------------------------
+  const mc   = price && shares ? price * shares : null;
+  const ey   = trailingPE && trailingPE > 0 ? 1 / trailingPE : null;
   const fcfy = mc && fcf != null ? clip(fcf / mc, -0.05, 0.08) : null;
 
-  // --- EV et ratios dérivés
+  // --- EV et dérivés --------------------------------------------------------
   const enterpriseValue = mc != null && debt != null && cash != null ? mc + debt - cash : null;
   const evToEbitda = ebitda && ebitda !== 0 && enterpriseValue != null ? enterpriseValue / ebitda : null;
 
-  // --- Safety ratios (avec fallbacks)
-  // D/E : si totalDebt indisponible, on fallback sur totalLiab (proche de la dette totale au sens large)
-  const debtLike = debt != null ? debt : (totalLiab0 ?? null);
-  const debtToEquity_fallback =
-    eq0 != null && eq0 !== 0 && debtLike != null ? debtLike / eq0 : null;
+  // --- Safety ratios (multi-fallbacks) -------------------------------------
+  // 1) privilégier totalDebt, 2) sinon totalLiab, 3) sinon fallback Yahoo % si equity connu
+  const debtLike = (debt != null) ? debt : (totalLiab0 ?? null);
+  const d2e_bs   = (eq0 != null && eq0 !== 0 && debtLike != null) ? (debtLike / eq0) : null;
+  const d2e_yh   = (debtToEquityYahooPct != null) ? (debtToEquityYahooPct / 100) : null;
+
+  const debtToEquity_value = (d2e_bs != null) ? d2e_bs : (d2e_yh != null ? d2e_yh : null);
+  const debtToEquity_src   = (d2e_bs != null) ? "calc" : ((d2e_yh != null) ? "yahoo-v10" : "calc");
 
   const netDebt = (debtLike != null && cash != null) ? (debtLike - cash) : null;
+
   const netDebtToEbitda =
     ebitda && ebitda !== 0 && netDebt != null ? netDebt / ebitda : null;
 
-  // Interest coverage : fallback ebit -> operatingIncome ; si interest ≈ 0, on laisse null (pas d'infini)
+  // Interest coverage : fallback operatingIncome si ebit indispo
   const ebitOrOp = (ebit != null ? ebit : opInc0);
-  const interestCoverage_fallback =
+  const interestCoverage =
     (ebitOrOp != null && interestExp != null && interestExp !== 0)
       ? (ebitOrOp as number) / Math.abs(interestExp)
       : null;
 
-  // --- Net cash proxy
+  // --- Net cash proxy -------------------------------------------------------
   let netCash: number | null = null;
   if (cash != null && debtLike != null) {
     netCash = cash - debtLike > 0 ? 1 : 0;
@@ -115,7 +124,7 @@ export function computeFundamentalsFromV10(r: any): Fundamentals {
     netCash = priceToBook < 1.2 ? 1 : 0;
   }
 
-  // --- ROE / ROA / ROIC
+  // --- ROE / ROA / ROIC ----------------------------------------------------
   const roe_direct = num(r?.financialData?.returnOnEquity?.raw ?? r?.financialData?.returnOnEquity);
   const avgEq      = (eq0 != null && eq1 != null) ? (eq0 + eq1) / 2 : (eq0 ?? null);
   const roe_calc   = (ni0 != null && avgEq) ? (avgEq !== 0 ? ni0 / avgEq : null) : null;
@@ -127,29 +136,29 @@ export function computeFundamentalsFromV10(r: any): Fundamentals {
   const fcf_over_ni = (fcf != null && ni0 != null && ni0 !== 0) ? fcf / ni0 : null;
   const taxRate =
     preTax0 && taxExp0 != null && preTax0 !== 0 ? Math.min(0.5, Math.max(0, taxExp0 / preTax0)) : 0.21;
+
   const nopat = opInc0 != null ? opInc0 * (1 - taxRate) : (ni0 != null ? ni0 : null);
 
-  // Invested capital : si ≤ 0 (ex. net cash énorme), on neutralise le ROIC pour éviter des artefacts absurdes
+  // Invested: neutralise si ≤ 0
   const investedRaw =
     (debtLike ?? null) != null || (eq0 ?? null) != null ? ((debtLike ?? 0) + (eq0 ?? 0) - (cash ?? 0)) : null;
 
   let roic: number | null = null;
   if (nopat != null && investedRaw != null && investedRaw !== 0) {
-    if (investedRaw > 0) roic = nopat / investedRaw;
-    else roic = null; // neutralise cas invested <= 0
+    roic = investedRaw > 0 ? (nopat / investedRaw) : null;
   }
 
-  // --- Governance
-  const payoutRatio = num(r?.summaryDetail?.payoutRatio?.raw ?? r?.summaryDetail?.payoutRatio);
+  // --- Governance -----------------------------------------------------------
+  const payoutRatio      = num(r?.summaryDetail?.payoutRatio?.raw ?? r?.summaryDetail?.payoutRatio);
   const insiderOwnership = num(
     r?.defaultKeyStatistics?.heldPercentInsiders?.raw ?? r?.defaultKeyStatistics?.heldPercentInsiders
   );
 
-  // --- ESG / controverses (non dispo ici, placeholders)
-  const esgScore = null;
+  // --- ESG placeholders -----------------------------------------------------
+  const esgScore         = null;
   const controversiesLow = null;
 
-  // --- Buyback yield approx (repurchaseOfCommonStock varie selon listings)
+  // --- Buyback yield approx (repurchaseOfCommonStock*) ----------------------
   const cfs0 = cfsh?.[0] ?? {};
   const repurchaseKeys = Object.keys(cfs0).filter(k => /repurchase.*stock/i.test(k));
   let repurchase: number | null = null;
@@ -157,13 +166,13 @@ export function computeFundamentalsFromV10(r: any): Fundamentals {
     const v = num((cfs0 as any)[k]?.raw ?? (cfs0 as any)[k]);
     if (typeof v === "number") { repurchase = v; break; }
   }
-  // Si on a repurchase < 0 (sortie de cash), on approx le rendement de rachat via |repurchase| / market cap
+  // v < 0 (sortie de cash) → approx |v| / market cap, clamp pour éviter outliers
   let buybackYieldApprox: number | null = null;
   if (mc && typeof repurchase === "number" && repurchase < 0) {
-    buybackYieldApprox = Math.min(0.10, Math.max(-0.12, Math.abs(repurchase) / mc)); // clamp raisonnable
+    buybackYieldApprox = Math.min(0.10, Math.max(-0.12, Math.abs(repurchase) / mc));
   }
 
-  // --- Construction finale
+  // --- Construction finale --------------------------------------------------
   return {
     // Core
     op_margin:         asMetric(opm,          opm != null ? 0.45 : 0, "yahoo-v10"),
@@ -172,20 +181,20 @@ export function computeFundamentalsFromV10(r: any): Fundamentals {
     earnings_yield:    asMetric(ey,           ey != null ? 0.45 : 0, "yahoo-v10"),
     net_cash:          asMetric(netCash,      netCash != null ? 0.35 : 0, "yahoo-v10"),
 
-    // Ratios qualité
+    // Quality
     roe:                asMetric(roe ?? null,               roe != null ? 0.45 : 0, roe_direct != null ? "yahoo-v10" : "calc"),
     roa:                asMetric(roa ?? null,               roa != null ? 0.4  : 0, roa_direct != null ? "yahoo-v10" : "calc"),
     fcf_over_netincome: asMetric(fcf_over_ni,               fcf_over_ni != null ? 0.35 : 0, "calc"),
     roic:               asMetric(roic,                      roic != null ? 0.3  : 0, "calc"),
 
-    // Croissance
+    // Growth
     rev_growth:  asMetric(revGrowth, revGrowth != null ? 0.4 : 0, "yahoo-v10"),
     eps_growth:  asMetric(epsGrowth, epsGrowth != null ? 0.4 : 0, "yahoo-v10"),
 
-    // Safety (avec fallbacks)
-    debt_to_equity:   asMetric(debtToEquity_fallback,   debtToEquity_fallback   != null ? 0.35 : 0, "calc"),
-    net_debt_to_ebitda: asMetric(netDebtToEbitda,       netDebtToEbitda         != null ? 0.35 : 0, "calc"),
-    interest_coverage:  asMetric(interestCoverage_fallback, interestCoverage_fallback != null ? 0.35 : 0, "calc"),
+    // Safety
+    debt_to_equity:     asMetric(debtToEquity_value, debtToEquity_value != null ? 0.35 : 0, debtToEquity_src),
+    net_debt_to_ebitda: asMetric(netDebtToEbitda,    netDebtToEbitda    != null ? 0.35 : 0, "calc"),
+    interest_coverage:  asMetric(interestCoverage,   interestCoverage   != null ? 0.35 : 0, "calc"),
 
     // Valuation
     ev_to_ebitda: asMetric(evToEbitda, evToEbitda != null ? 0.35 : 0, "calc"),
@@ -197,7 +206,7 @@ export function computeFundamentalsFromV10(r: any): Fundamentals {
     insider_ownership: asMetric(insiderOwnership, insiderOwnership != null ? 0.3 : 0, "yahoo-v10"),
 
     // ESG
-    esg_score:        asMetric(esgScore,        0, "none"),
-    controversies_low:asMetric(controversiesLow,0, "none"),
+    esg_score:         asMetric(esgScore, 0, "none"),
+    controversies_low: asMetric(controversiesLow, 0, "none"),
   };
 }
