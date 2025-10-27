@@ -250,7 +250,7 @@ export default function Page() {
 
   /* ====================== Render ====================== */
   return (
-    <main className="min-h-screen bg-slate-950 text-slate-100">
+    <main className="min-h-screen bg-slate-950 text-slate-100 overflow-x-hidden">
       {/* Top bar */}
       <header className="sticky top-0 z-30 backdrop-blur supports-[backdrop-filter]:bg-slate-950/60 bg-slate-950/90 border-b border-slate-800">
         <div className="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8 py-3 flex items-center gap-3">
@@ -372,7 +372,7 @@ export default function Page() {
 
       {/* Result */}
       {data && (
-        <section className="max-w-7xl mx-auto px-5 sm:px-6 lg:px-8 py-8 grid lg:grid-cols-3 gap-6">
+        <section className="w-full max-w-7xl mx-auto px-5 sm:px-6 lg:px-8 py-8 grid lg:grid-cols-3 gap-6 overflow-hidden">
           {/* Left: Score & pillars */}
           <div className="lg:col-span-2 min-w-0">
             <div className="rounded-3xl border border-slate-800 bg-gradient-to-b from-slate-900/60 to-slate-900/30 p-6 md:p-7">
