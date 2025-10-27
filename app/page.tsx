@@ -221,7 +221,6 @@ export default function Page() {
   function fmtPct(x?: number | null) {
     return typeof x === "number" ? `${(x * 100).toFixed(1)}%` : "—";
   }
-  // Clamp visuel pour éviter des chiffres absurdes (ex : ROIC proxy)
   function fmtPctClamped(x?: number | null, capAbs = 2.0) {
     if (typeof x !== "number") return "—";
     const capped = Math.max(-capAbs, Math.min(capAbs, x));
@@ -423,7 +422,7 @@ export default function Page() {
                 </div>
               </div>
 
-              {/* ======== Opportunity Chart ======== */}
+              {/* ======== NEW: Opportunity Chart ======== */}
               {data.opportunity_series?.length ? (
                 <div className="mt-6">
                   <h3 className="text-sm uppercase tracking-wide text-slate-400">
@@ -431,8 +430,8 @@ export default function Page() {
                   </h3>
                   <OpportunityChart rows={data.opportunity_series} />
                   <p className="mt-2 text-xs text-slate-500">
-                    Bandeau rouge→vert&nbsp;: plus c’est vert, plus l’opportunité semblait favorable ce jour-là
-                    (mix qualité/sécurité, “prix attractif” vs 52s et momentum vs MM200).
+                    Bandeau rouge→vert : plus c’est vert, plus l’opportunité semblait favorable ce jour-là (mix
+                    qualité/sécurité, “prix attractif” vs 52s et momentum vs MM200).
                   </p>
                 </div>
               ) : null}
