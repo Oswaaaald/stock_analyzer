@@ -6,8 +6,9 @@ import type { ScorePayload, DataBundle, OppPoint } from "@/lib/types";
 import { fetchYahooChartAndEnrich } from "@/lib/yahooPrice";
 import { getYahooSession } from "@/lib/yahooSession";
 import { fetchYahooV10, computeFundamentalsFromV10 } from "@/lib/yahooV10";
-import { computeScore, buildReasons, makeVerdict } from "@/lib/scoring";
 import { buildOpportunitySeries } from "@/lib/opportunity";
+import { bundleToMetrics } from "@/lib/adapter";
+import { computePillars } from "@/lib/pillars";
 
 // -------- Cache mémoire --------
 const MEM: Record<string, { expires: number; data: any }> = {};
@@ -26,65 +27,59 @@ export async function GET(req: Request, { params }: { params: { ticker: string }
   if (!isDebug && hit && hit.expires > now) return NextResponse.json(hit.data);
 
   try {
-    // 1) Prix & momentum (v8)
+    // --- 1) Prix & momentum (Yahoo v8)
     const priceFeed = await fetchYahooChartAndEnrich(t);
 
-    // 2) v10 (fundamentaux & annuals)
+    // --- 2) Fundamentals & ratios (Yahoo v10)
     const sess = await getYahooSession();
     const v10 = await fetchYahooV10(t, sess, /*retryOnce*/ true);
-
-    // 3) Fundamentals
     const fundamentals = computeFundamentalsFromV10(v10);
     const sources_used = ["price:yahoo(v8)", "yahoo:v10"];
+
     const bundle: DataBundle = { ticker: t, fundamentals, prices: priceFeed, sources_used };
 
-    // 4) Opportunité d’achat
+    // --- 3) Série d’opportunité d’achat
     let opportunity_series: OppPoint[] | undefined = undefined;
     if (priceFeed.series?.closes?.length && priceFeed.series?.ts?.length) {
       opportunity_series = buildOpportunitySeries(priceFeed.series.closes, priceFeed.series.ts, fundamentals);
     }
 
-    // 5) Score & couverture
-    const { subscores, maxes } = computeScore(bundle);
+    // --- 4) Conversion Yahoo → Metrics → Pillars
+    const metrics = bundleToMetrics(bundle);
+    const pillars = computePillars(metrics);
 
-    // Couverture (UI)
-    const covQuality = Math.min(1, (maxes.quality   || 0) / 8 ) * 35; // 0..35
-    const covSafety  = Math.min(1, (maxes.safety    || 0) / 6 ) * 25; // 0..25
-    const covVal     = Math.min(1, (maxes.valuation || 0) / 10) * 25; // 0..25
-    const covMom     = Math.min(1, (maxes.momentum  || 0) / 15) * 15; // 0..15
-    const coverage_display = Math.round(covQuality + covSafety + covVal + covMom); // 0..100
+    // --- 5) Score global et couleur
+    const totalScore = Object.values(pillars.subscores).reduce((a, b) => a + b, 0);
+    const score_adj = Math.round(totalScore);
+    const color: ScorePayload["color"] =
+      score_adj >= 65 ? "green" : score_adj >= 50 ? "orange" : "red";
 
-    const denom = Math.max(1, Math.round(maxes.quality + maxes.safety + maxes.valuation + maxes.momentum));
-    const total = subscores.quality + subscores.safety + subscores.valuation + subscores.momentum;
-    const raw = Math.max(0, Math.min(100, Math.round(total)));
-    const score_adj = Math.round((total / denom) * 100);
+    // --- 6) Construction du verdict synthétique
+    let verdict: ScorePayload["verdict"] = "fragile";
+    let verdict_reason = "Signal faible ou données incomplètes";
+    if (score_adj >= 70 && pillars.coverage >= 50) {
+      verdict = "sain";
+      verdict_reason = "Entreprise solide et bien valorisée";
+    } else if (score_adj >= 50) {
+      verdict = "a_surveiller";
+      verdict_reason = "Profil intéressant mais à surveiller";
+    }
 
-    const shown = score_adj ?? raw;
-    const color: ScorePayload["color"] = shown >= 65 ? "green" : shown >= 50 ? "orange" : "red";
-
-    const { verdict, reason } = makeVerdict({
-      coverage: coverage_display,
-      total,
-      momentumPresent: true,
-      score_adj: shown,
-    });
-
-    const reasons = buildReasons(bundle, subscores);
-
+    // --- 7) Payload final
     const payload: ScorePayload = {
       ticker: t,
       company_name: v10?.price?.longName ?? v10?.price?.shortName ?? null,
       exchange: v10?.price?.exchangeName ?? v10?.price?.exchange ?? null,
 
-      score: raw,
+      score: score_adj,
       score_adj,
       color,
       verdict,
-      verdict_reason: reason,
-      reasons_positive: reasons.slice(0, 3),
-      red_flags: [],
-      subscores,
-      coverage: coverage_display,
+      verdict_reason,
+      reasons_positive: pillars.reasons_positive,
+      red_flags: pillars.red_flags,
+      subscores: pillars.subscores,
+      coverage: pillars.coverage,
       opportunity_series,
 
       proof: {
@@ -95,7 +90,8 @@ export async function GET(req: Request, { params }: { params: { ticker: string }
         price_last_date: priceFeed.series?.ts?.at(-1)
           ? new Date(priceFeed.series.ts.at(-1)!).toISOString().slice(0, 10)
           : null,
-        valuation_used: (fundamentals.fcf_yield.value ?? fundamentals.earnings_yield.value) != null,
+        valuation_used:
+          (fundamentals.fcf_yield.value ?? fundamentals.earnings_yield.value) != null,
         valuation_metric:
           typeof fundamentals.fcf_yield.value === "number"
             ? "FCFY"
@@ -112,8 +108,11 @@ export async function GET(req: Request, { params }: { params: { ticker: string }
       },
     };
 
+    // --- 8) Mise en cache et retour
     if (!isDebug) MEM[cacheKey] = { expires: now + TTL_MS, data: payload };
-    return NextResponse.json(payload, { headers: { "Cache-Control": "s-maxage=600, stale-while-revalidate=1200" } });
+    return NextResponse.json(payload, {
+      headers: { "Cache-Control": "s-maxage=600, stale-while-revalidate=1200" },
+    });
   } catch (e: any) {
     const msg = typeof e?.message === "string" ? e.message : e?.toString?.() || "Erreur provider";
     return NextResponse.json({ error: msg }, { status: 500 });

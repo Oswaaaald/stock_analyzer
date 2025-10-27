@@ -231,13 +231,50 @@ export default function Page() {
   }
 
   // libellés piliers + dénominateurs
-  const PILLAR_MAX: Record<string, number> = { quality: 35, safety: 25, valuation: 25, momentum: 15 };
-  const PILLAR_LABEL: Record<string, string> = {
-    quality: "Qualité opérationnelle",
-    safety: "Solidité financière",
-    valuation: "Valorisation",
-    momentum: "Momentum / Tendance",
-  };
+const PILLAR_MAX: Record<string, number> = {
+  quality: 35,
+  safety: 25,
+  valuation: 25,
+  growth: 15,
+  momentum: 15,
+  moat: 10,
+  esg: 5,
+  governance: 5,
+};
+
+const PILLAR_LABEL: Record<string, string> = {
+  quality: "Qualité opérationnelle",
+  safety: "Solidité financière",
+  valuation: "Valorisation",
+  growth: "Croissance",
+  momentum: "Momentum / Tendance",
+  moat: "Moat (avantage durable)",
+  esg: "ESG",
+  governance: "Gouvernance",
+};
+
+// ordre d’affichage (pour ne pas dépendre de l’ordre des clés de l’objet)
+const PILLAR_ORDER = [
+  "quality",
+  "safety",
+  "valuation",
+  "growth",
+  "momentum",
+  "moat",
+  "esg",
+  "governance",
+] as const;
+
+const tips: Record<string, string> = {
+  quality: "Rentabilité & efficacité opérationnelle",
+  safety: "Liquidité, levier & trésorerie",
+  valuation: "Rendement FCF / bénéfices vs prix",
+  growth: "Croissance historique et attendue (CA/EPS)",
+  momentum: "Prix vs MM200 + performances récentes",
+  moat: "Avantage compétitif durable (proxies ROIC/marges/part de marché)",
+  esg: "Score ESG et controverses",
+  governance: "Distribution, buybacks et actionnariat interne",
+};
 
   // texte d’interprétation sous le titre
   const interpretation = useMemo(() => {
@@ -440,15 +477,10 @@ export default function Page() {
               <div className="mt-6">
                 <h3 className="text-sm uppercase tracking-wide text-slate-400">Piliers de performance</h3>
                 <div className="mt-3 grid grid-cols-1 sm:grid-cols-2 gap-3">
-                  {Object.entries(data.subscores || {}).map(([k, v]) => {
+                  {PILLAR_ORDER.map((k) => {
+                    const v = Number.isFinite(data.subscores?.[k] as number) ? (data.subscores as any)[k] : 0;
                     const max = PILLAR_MAX[k] ?? 10;
                     const pct = Math.max(0, Math.min(100, (v / max) * 100));
-                    const tips: Record<string, string> = {
-                      quality: "Rentabilité & efficacité opérationnelle",
-                      safety: "Liquidité, levier & trésorerie",
-                      valuation: "Rendement FCF / bénéfices vs prix",
-                      momentum: "Prix vs moyenne mobile 200 jours + performance récente",
-                    };
                     return (
                       <div key={k} className="p-4 rounded-2xl bg-slate-900/40 border border-slate-800">
                         <div className="flex items-center justify-between">
