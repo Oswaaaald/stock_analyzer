@@ -1,24 +1,40 @@
-// /app/api/diag/[ticker]/route.ts
+// app/api/diag/[ticker]/route.ts
 import { NextResponse } from "next/server";
 import { getYahooSession } from "@/lib/yahooSession";
 import { fetchYahooV10 } from "@/lib/yahooV10";
 
-export async function GET(_: Request, { params }: { params: { ticker: string } }) {
+export const dynamic = "force-dynamic";
+export const revalidate = 0;
+
+export async function GET(
+  _req: Request,
+  { params }: { params: { ticker: string } }
+) {
   try {
+    const ticker = decodeURIComponent(params.ticker || "").trim();
+    if (!ticker) return NextResponse.json({ error: "Missing ticker" }, { status: 400 });
+
     const sess = await getYahooSession();
-    const r = await fetchYahooV10(params.ticker, sess, true);
+    const raw = await fetchYahooV10(ticker, sess, /*retryOnce*/ true);
 
-    const pick = {
-      price_keys: Object.keys(r?.price || {}),
-      fin_keys: Object.keys(r?.financialData || {}),
-      dks_keys: Object.keys(r?.defaultKeyStatistics || {}),
-      is_hist_0: r?.incomeStatementHistory?.incomeStatementHistory?.[0] || null,
-      bs_hist_0: r?.balanceSheetHistory?.balanceSheetStatements?.[0] || null,
-      cfs_hist_0_keys: Object.keys(r?.cashflowStatementHistory?.cashflowStatements?.[0] || {}),
-    };
-
-    return NextResponse.json(pick);
+    // On retourne un diagnostic lisible: les clés top-level + quelques modules utiles
+    return NextResponse.json({
+      ticker,
+      availableModules: Object.keys(raw || {}),
+      priceKeys: Object.keys(raw?.price || {}),
+      summaryDetailKeys: Object.keys(raw?.summaryDetail || {}),
+      defaultKeyStatisticsKeys: Object.keys(raw?.defaultKeyStatistics || {}),
+      financialDataKeys: Object.keys(raw?.financialData || {}),
+      hasIncomeStatementHistory: !!raw?.incomeStatementHistory?.incomeStatementHistory?.length,
+      hasBalanceSheetHistory: !!raw?.balanceSheetHistory?.balanceSheetStatements?.length,
+      hasCashflowStatementHistory: !!raw?.cashflowStatementHistory?.cashflowStatements?.length,
+      sample: {
+        financialData: raw?.financialData ?? null,
+        defaultKeyStatistics: raw?.defaultKeyStatistics ?? null,
+        summaryDetail: raw?.summaryDetail ?? null,
+      },
+    });
   } catch (e: any) {
-    return NextResponse.json({ error: e?.message || "diag error" }, { status: 500 });
+    return NextResponse.json({ error: e?.message || "diag failed" }, { status: 500 });
   }
 }
