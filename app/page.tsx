@@ -385,21 +385,27 @@ export default function Page() {
                             : data.ticker.toUpperCase())}
                     </h2>
                         
-                    <div className="flex items-center gap-3 flex-wrap">
-                      <abbr title="Estimation de la part des données réellement disponibles pour calculer la note finale.">
-                        <span className="text-xs px-2 py-0.5 rounded-full border border-slate-700 text-slate-300">
+                    {/* Badges ligne flexibles */}
+                    <div className="flex flex-wrap items-center gap-2 text-xs">
+                      <abbr
+                        title="Estimation de la part des données réellement disponibles pour calculer la note finale."
+                        className="no-underline"
+                      >
+                        <span className="px-2 py-0.5 rounded-full border border-slate-700 text-slate-300 whitespace-nowrap">
                           Couverture des données&nbsp;: {data.coverage}%
                         </span>
                       </abbr>
-                      {verdictBadge}
+                        
+                      {/* Badge verdict : ENTREPRISE À SURVEILLER / SOLIDE / FRAGILE */}
+                      <div className="flex-shrink-0">{verdictBadge}</div>
                     </div>
                   </div>
-
-                  {/* Interpretation (à gauche) */}
+                        
+                  {/* Interprétation sous le titre */}
                   <div className="mt-2 text-slate-300 text-sm">{interpretation}</div>
                 </div>
 
-                {/* Score block (en haut à droite) */}
+                {/* Score à droite */}
                 <div className="w-40 shrink-0">
                   <div className="text-4xl font-extrabold tabular-nums text-right">
                     {data.score_adj ?? data.score}
