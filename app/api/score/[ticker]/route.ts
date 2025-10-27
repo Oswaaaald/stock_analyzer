@@ -14,6 +14,27 @@ import { computePillars } from "@/lib/pillars";
 const MEM: Record<string, { expires: number; data: any }> = {};
 const TTL_MS = 30 * 60 * 1000; // 30 min
 
+// -------- Helpers debug --------
+function missingFundamentals(f: DataBundle["fundamentals"]) {
+  const miss: string[] = [];
+  for (const [k, v] of Object.entries(f)) {
+    if (v == null) {
+      miss.push(k);
+      continue;
+    }
+    if (typeof v === "object" && "value" in v && (v as any).value == null) {
+      miss.push(k);
+    }
+  }
+  return miss.sort();
+}
+function missingMetrics(m: Record<string, any>) {
+  return Object.entries(m)
+    .filter(([_, v]) => v == null || (typeof v === "number" && !Number.isFinite(v)))
+    .map(([k]) => k)
+    .sort();
+}
+
 export async function GET(req: Request, { params }: { params: { ticker: string } }) {
   const t = (params.ticker || "").toUpperCase().trim();
   if (!t) return NextResponse.json({ error: "Ticker requis" }, { status: 400 });
@@ -108,7 +129,24 @@ export async function GET(req: Request, { params }: { params: { ticker: string }
       },
     };
 
-    // --- 8) Mise en cache et retour
+    // --- 8) Debug payload (seulement si ?debug=1)
+    if (isDebug) {
+      (payload as any).debug = {
+        fundamentals_raw: fundamentals,
+        prices_raw: priceFeed,
+        metrics,
+        subscores: pillars.subscores,
+        coverage_calc: pillars.coverage,
+        missing: {
+          fundamentals: missingFundamentals(fundamentals),
+          metrics: missingMetrics(metrics as any),
+        },
+      };
+      // Log serveur compact
+      console.log(`[score dbg ${t}]`, JSON.stringify((payload as any).debug.missing));
+    }
+
+    // --- 9) Mise en cache et retour
     if (!isDebug) MEM[cacheKey] = { expires: now + TTL_MS, data: payload };
     return NextResponse.json(payload, {
       headers: { "Cache-Control": "s-maxage=600, stale-while-revalidate=1200" },
