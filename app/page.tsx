@@ -221,6 +221,7 @@ export default function Page() {
   function fmtPct(x?: number | null) {
     return typeof x === "number" ? `${(x * 100).toFixed(1)}%` : "—";
   }
+  // Clamp visuel pour éviter des chiffres absurdes (ex : ROIC proxy)
   function fmtPctClamped(x?: number | null, capAbs = 2.0) {
     if (typeof x !== "number") return "—";
     const capped = Math.max(-capAbs, Math.min(capAbs, x));
@@ -422,7 +423,7 @@ export default function Page() {
                 </div>
               </div>
 
-              {/* ======== NEW: Opportunity Chart ======== */}
+              {/* ======== Opportunity Chart ======== */}
               {data.opportunity_series?.length ? (
                 <div className="mt-6">
                   <h3 className="text-sm uppercase tracking-wide text-slate-400">
@@ -430,8 +431,8 @@ export default function Page() {
                   </h3>
                   <OpportunityChart rows={data.opportunity_series} />
                   <p className="mt-2 text-xs text-slate-500">
-                    Bandeau rouge→vert : plus c’est vert, plus l’opportunité semblait favorable ce jour-là (mix
-                    qualité/sécurité, “prix attractif” vs 52s et momentum vs MM200).
+                    Bandeau rouge→vert&nbsp;: plus c’est vert, plus l’opportunité semblait favorable ce jour-là
+                    (mix qualité/sécurité, “prix attractif” vs 52s et momentum vs MM200).
                   </p>
                 </div>
               ) : null}
@@ -584,15 +585,15 @@ export default function Page() {
 /* ---------------- Opportunity Chart ---------------- */
 function OpportunityChart({ rows }: { rows: { t: number; close: number; opp: number }[] }) {
   // --- Dimensions & mise en page -------------------------------------------
-  const W = 760;                  // largeur logique du SVG
-  const H = 260;                  // ↑ un peu plus haut pour laisser de la place
-  const M = { top: 16, right: 48, bottom: 52, left: 56 };
+  const W = 760;                 // largeur logique du SVG
+  const H = 260;                 // hauteur totale compacte
+  const M = { top: 16, right: 48, bottom: 34, left: 56 }; // marges pour axes/labels
   const innerW = W - M.left - M.right;
-  const priceH = 150;             // zone prix
-  const bandH = 20;               // bande "opportunité"
-  const gap = 22;                 // ↑ espace entre la courbe et la bande
-  const bandY = priceH + gap;     // position verticale de la bande
-  const axisY = bandY + bandH + 8; // position de l’axe X sous la bande
+  const priceH = 150;            // hauteur de la zone prix
+  const bandH = 20;              // hauteur de la bande "opportunité"
+  const gap = 8;                 // petit espace entre la courbe et la bande
+  const bandY = priceH + gap;    // position verticale de la bande
+  const axisY = bandY + bandH + 8; // axe X juste sous la bande
 
   const n = rows.length || 0;
   if (n === 0) {
@@ -621,7 +622,7 @@ function OpportunityChart({ rows }: { rows: { t: number; close: number; opp: num
   const scaleOpp01 = (v: number) => (oMax > oMin ? (v - oMin) / (oMax - oMin) : 0.5);
   const oppColor = (v: number) => {
     const s = Math.max(0, Math.min(1, scaleOpp01(v)));
-    const hue = 10 + s * 120;
+    const hue = 10 + s * 120; // 10=rouge → 130≈vert
     return `hsl(${hue} 85% 48%)`;
   };
 
@@ -629,7 +630,7 @@ function OpportunityChart({ rows }: { rows: { t: number; close: number; opp: num
   const tickCount = 5;
   const step = Math.max(1, Math.floor(n / (tickCount + 1)));
   const tickIdx = [0, ...Array.from({ length: tickCount }, (_, k) => Math.min(n - 1, (k + 1) * step)), n - 1]
-    .filter((v, i, arr) => i === 0 || v !== arr[i - 1]);
+    .filter((v, i, arr) => i === 0 || v !== arr[i - 1]); // unique
   const fmtDate = (ms: number) =>
     new Date(ms).toLocaleDateString("fr-FR", { year: "2-digit", month: "short" }).replace(".", "");
 
@@ -669,7 +670,7 @@ function OpportunityChart({ rows }: { rows: { t: number; close: number; opp: num
     <div className="mt-3 rounded-2xl border border-slate-800 bg-slate-900/40 overflow-hidden">
       <svg
         viewBox={`0 0 ${W} ${H}`}
-        className="w-full h-[260px]" // ↑ hauteur tailwind alignée avec H
+        className="w-full h-[260px]"
         onMouseMove={onMove}
         onMouseLeave={onLeave}
       >
@@ -712,7 +713,7 @@ function OpportunityChart({ rows }: { rows: { t: number; close: number; opp: num
             <text x={6} y={12} fontSize="10" fill="rgba(148,163,184,0.9)">Min {fmtPrice(pMin)}</text>
           </g>
 
-          {/* Bande opportunité (heat strip) — ↓ plus bas */}
+          {/* Bande opportunité (heat strip) */}
           <g transform={`translate(0, ${bandY})`}>
             <rect x={0} y={0} width={innerW} height={bandH} fill="rgba(2,6,23,0.6)" />
             <rect x={0} y={0} width={innerW} height={bandH} fill="url(#bandShine)" />
@@ -747,7 +748,7 @@ function OpportunityChart({ rows }: { rows: { t: number; close: number; opp: num
             ))}
           </g>
 
-          {/* Axe X (dates) — ↓ sous la bande */}
+          {/* Axe X (dates) */}
           <g transform={`translate(0, ${axisY})`}>
             <line x1={0} x2={innerW} y1={0} y2={0} stroke="rgba(148,163,184,0.18)" />
             {tickIdx.map((idx, k) => (
@@ -768,7 +769,7 @@ function OpportunityChart({ rows }: { rows: { t: number; close: number; opp: num
           {/* Crosshair + tooltip */}
           {hoverRow && (
             <g>
-              {/* ligne verticale qui descend jusqu’à l’axe */}
+              {/* vertical line jusqu’à l’axe */}
               <line
                 x1={hx} x2={hx}
                 y1={0} y2={axisY}
