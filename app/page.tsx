@@ -579,7 +579,7 @@ function OpportunityChart({ rows }: { rows: { t: number; close: number; opp: num
   // --- Dimensions & mise en page -------------------------------------------
   const W = 760;
   const H = 268;                         // légèrement compact
-  const M = { top: 16, right: 48, bottom: 40, left: 56 };
+  const M = { top: 16, right: 64, bottom: 40, left: 56 };
   const innerW = W - M.left - M.right;
   const priceH = 150;
   const bandH = 20;
@@ -667,10 +667,11 @@ function OpportunityChart({ rows }: { rows: { t: number; close: number; opp: num
   const hy = hoverRow ? y(hoverRow.close) : 0;
 
   return (
-    <div className="mt-3 rounded-2xl border border-slate-800 bg-slate-900/40 overflow-hidden">
+    <div className="mt-3 rounded-2xl border border-slate-800 bg-slate-900/40 overflow-hidden mx-auto">
       <svg
         viewBox={`0 0 ${W} ${H}`}
-        className="w-full h-[268px]"
+        preserveAspectRatio="xMidYMid meet"
+        className="w-full h-[300px] sm:h-[268px]"
         onMouseMove={onMove}
         onMouseLeave={onLeave}
       >
