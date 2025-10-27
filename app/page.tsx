@@ -268,7 +268,7 @@ export default function Page() {
       </header>
 
       {/* Search */}
-      <section className="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8 pt-8">
+      <section className="max-w-7xl mx-auto px-5 sm:px-6 lg:px-8 pt-8">
         <div className="grid gap-4 md:grid-cols-[1fr_auto] relative">
           <div className="flex relative rounded-2xl border border-slate-800 bg-slate-900/40 focus-within:ring-2 focus-within:ring-sky-500">
             <input
@@ -372,7 +372,7 @@ export default function Page() {
 
       {/* Result */}
       {data && (
-        <section className="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8 py-8 grid lg:grid-cols-3 gap-6">
+        <section className="max-w-7xl mx-auto px-5 sm:px-6 lg:px-8 py-8 grid lg:grid-cols-3 gap-6">
           {/* Left: Score & pillars */}
           <div className="lg:col-span-2">
             <div className="rounded-3xl border border-slate-800 bg-gradient-to-b from-slate-900/60 to-slate-900/30 p-6 md:p-7">
@@ -578,14 +578,14 @@ export default function Page() {
 function OpportunityChart({ rows }: { rows: { t: number; close: number; opp: number }[] }) {
   // --- Dimensions & mise en page -------------------------------------------
   const W = 760;
-  const H = 268;                         // légèrement compact
-  const M = { top: 16, right: 64, bottom: 40, left: 56 };
+  const M = { top: 8, right: 64, bottom: 28, left: 56 };
   const innerW = W - M.left - M.right;
-  const priceH = 150;
-  const bandH = 20;
-  const gap = 18;                        // espace entre courbe et bande
+  const priceH = 154;
+  const bandH = 22;
+  const gap = 12;                        // espace entre courbe et bande
   const bandY = priceH + gap;
-  const axisY = bandY + bandH + 8;
+  const axisY = bandY + bandH + 10;
+  const H = M.top + axisY + M.bottom;
 
   const n = rows.length || 0;
   if (n === 0) {
@@ -667,11 +667,12 @@ function OpportunityChart({ rows }: { rows: { t: number; close: number; opp: num
   const hy = hoverRow ? y(hoverRow.close) : 0;
 
   return (
-    <div className="mt-3 rounded-2xl border border-slate-800 bg-slate-900/40 overflow-hidden mx-auto">
+    <div className="mt-3 rounded-2xl border border-slate-800 bg-slate-900/40 overflow-hidden mx-auto w-full">
       <svg
         viewBox={`0 0 ${W} ${H}`}
         preserveAspectRatio="xMidYMid meet"
-        className="w-full h-[300px] sm:h-[268px]"
+        className="w-full"
+        style={{ height: H }}
         onMouseMove={onMove}
         onMouseLeave={onLeave}
       >
