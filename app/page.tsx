@@ -584,13 +584,15 @@ export default function Page() {
 /* ---------------- Opportunity Chart ---------------- */
 function OpportunityChart({ rows }: { rows: { t: number; close: number; opp: number }[] }) {
   // --- Dimensions & mise en page -------------------------------------------
-  const W = 760;                 // largeur logique du SVG
-  const H = 260;                 // hauteur totale
-  const M = { top: 16, right: 48, bottom: 34, left: 56 }; // marges pour axes/labels
+  const W = 760;                  // largeur logique du SVG
+  const H = 290;                  // ↑ un peu plus haut pour laisser de la place
+  const M = { top: 16, right: 48, bottom: 52, left: 56 };
   const innerW = W - M.left - M.right;
-  const priceH = 150;            // hauteur de la zone prix
-  const bandH = 20;              // hauteur de la bande "opportunité"
-  const innerH = priceH + 8 + bandH; // hauteur interne
+  const priceH = 150;             // zone prix
+  const bandH = 20;               // bande "opportunité"
+  const gap = 22;                 // ↑ espace entre la courbe et la bande
+  const bandY = priceH + gap;     // position verticale de la bande
+  const axisY = bandY + bandH + 12; // position de l’axe X sous la bande
 
   const n = rows.length || 0;
   if (n === 0) {
@@ -613,13 +615,13 @@ function OpportunityChart({ rows }: { rows: { t: number; close: number; opp: num
   // Chemin de la courbe
   const path = rows.map((r, i) => `${i === 0 ? "M" : "L"} ${x(i)} ${y(r.close)}`).join(" ");
 
-  // Recalibrage local de l’opportunité (pour de vraies teintes vertes)
+  // Recalibrage local de l’opportunité (couleurs rouge→vert)
   const oppVals = rows.map(r => r.opp);
   const oMin = Math.min(...oppVals), oMax = Math.max(...oppVals);
   const scaleOpp01 = (v: number) => (oMax > oMin ? (v - oMin) / (oMax - oMin) : 0.5);
   const oppColor = (v: number) => {
     const s = Math.max(0, Math.min(1, scaleOpp01(v)));
-    const hue = 10 + s * 120; // rouge→vert
+    const hue = 10 + s * 120;
     return `hsl(${hue} 85% 48%)`;
   };
 
@@ -627,7 +629,7 @@ function OpportunityChart({ rows }: { rows: { t: number; close: number; opp: num
   const tickCount = 5;
   const step = Math.max(1, Math.floor(n / (tickCount + 1)));
   const tickIdx = [0, ...Array.from({ length: tickCount }, (_, k) => Math.min(n - 1, (k + 1) * step)), n - 1]
-    .filter((v, i, arr) => i === 0 || v !== arr[i - 1]); // unique
+    .filter((v, i, arr) => i === 0 || v !== arr[i - 1]);
   const fmtDate = (ms: number) =>
     new Date(ms).toLocaleDateString("fr-FR", { year: "2-digit", month: "short" }).replace(".", "");
 
@@ -667,7 +669,7 @@ function OpportunityChart({ rows }: { rows: { t: number; close: number; opp: num
     <div className="mt-3 rounded-2xl border border-slate-800 bg-slate-900/40 overflow-hidden">
       <svg
         viewBox={`0 0 ${W} ${H}`}
-        className="w-full h-[260px]"
+        className="w-full h-[290px]" // ↑ hauteur tailwind alignée avec H
         onMouseMove={onMove}
         onMouseLeave={onLeave}
       >
@@ -710,9 +712,8 @@ function OpportunityChart({ rows }: { rows: { t: number; close: number; opp: num
             <text x={6} y={12} fontSize="10" fill="rgba(148,163,184,0.9)">Min {fmtPrice(pMin)}</text>
           </g>
 
-          {/* Bande opportunité (heat strip) */}
-          <g transform={`translate(0, ${priceH + 8})`}>
-            {/* Légère grille */}
+          {/* Bande opportunité (heat strip) — ↓ plus bas */}
+          <g transform={`translate(0, ${bandY})`}>
             <rect x={0} y={0} width={innerW} height={bandH} fill="rgba(2,6,23,0.6)" />
             <rect x={0} y={0} width={innerW} height={bandH} fill="url(#bandShine)" />
             {rows.map((r, i) => {
@@ -746,8 +747,8 @@ function OpportunityChart({ rows }: { rows: { t: number; close: number; opp: num
             ))}
           </g>
 
-          {/* Axe X (dates) */}
-          <g transform={`translate(0, ${priceH + 8 + bandH})`}>
+          {/* Axe X (dates) — ↓ sous la bande */}
+          <g transform={`translate(0, ${axisY})`}>
             <line x1={0} x2={innerW} y1={0} y2={0} stroke="rgba(148,163,184,0.18)" />
             {tickIdx.map((idx, k) => (
               <g key={k} transform={`translate(${x(idx)},0)`}>
@@ -767,10 +768,10 @@ function OpportunityChart({ rows }: { rows: { t: number; close: number; opp: num
           {/* Crosshair + tooltip */}
           {hoverRow && (
             <g>
-              {/* vertical line */}
+              {/* ligne verticale qui descend jusqu’à l’axe */}
               <line
                 x1={hx} x2={hx}
-                y1={0} y2={priceH + 8 + bandH}
+                y1={0} y2={axisY}
                 stroke="rgba(148,163,184,0.35)"
                 strokeDasharray="3 3"
               />
@@ -781,7 +782,6 @@ function OpportunityChart({ rows }: { rows: { t: number; close: number; opp: num
               {(() => {
                 const pad = 8;
                 const w = 160, h = 64;
-                // position à gauche/droite selon l’espace
                 const left = hx + 12 + w > innerW ? hx - 12 - w : hx + 12;
                 const top = Math.max(0, Math.min(priceH - h, hy - h / 2));
                 return (
