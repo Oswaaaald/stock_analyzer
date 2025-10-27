@@ -14,6 +14,26 @@ function trailingReturnFromSeries(
   return last / past - 1;
 }
 
+function rsi14FromCloses(closes: number[] | undefined): number | null {
+  if (!closes || closes.length < 15) return null;
+  let gains = 0, losses = 0;
+  for (let i = 1; i < 15; i++) {
+    const d = closes[i] - closes[i - 1];
+    if (d >= 0) gains += d; else losses -= d;
+  }
+  let avgG = gains / 14, avgL = losses / 14;
+  for (let i = 15; i < closes.length; i++) {
+    const d = closes[i] - closes[i - 1];
+    const g = d > 0 ? d : 0;
+    const l = d < 0 ? -d : 0;
+    avgG = (avgG * 13 + g) / 14;
+    avgL = (avgL * 13 + l) / 14;
+  }
+  if (avgL === 0) return 100;
+  const rs = avgG / avgL;
+  return 100 - 100 / (1 + rs);
+}
+
 /**
  * Convertit un DataBundle (Yahoo v8/v10) en Metrics pour computePillars().
  * Couvre les 8 piliers quand les champs Fundamentals sont présents.
@@ -53,13 +73,13 @@ export function bundleToMetrics(d: DataBundle): Metrics {
   // Yahoo financialData.revenueGrowth / earningsGrowth (YoY) → proxies
   m.forwardRevGrowth = f.rev_growth?.value ?? null;
   m.cagrEps3y = f.eps_growth?.value ?? null;
-  m.cagrRevenue3y = null; // calculable plus tard avec historiques
+  m.cagrRevenue3y = null; // restera null tant qu'on n'a pas une série revenue multi-années
 
   // --- Momentum ---
   m.perf6m  = perf6mFromSeries  ?? (p.ret_60d.value ?? null); // fallback 60j ≈ 3 mois
   m.perf12m = perf12mFromSeries ?? null;                      // 12m depuis série uniquement
   m.above200dma = (p.px_vs_200dma.value ?? 0) >= 0;
-  m.rsi = null; // non disponible pour l’instant
+  m.rsi = rsi14FromCloses(p.series?.closes);                 // NEW: RSI(14) depuis la série des prix
 
   // --- Moat (placeholders) ---
   m.roicPersistence = null;

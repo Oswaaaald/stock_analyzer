@@ -16,8 +16,9 @@ export async function fetchYahooV10(ticker: string, sess: YSession, retryOnce: b
     ...(sess.cookie ? ({ Cookie: sess.cookie } as any) : {}),
   };
   const crumbQS = sess.crumb ? `&crumb=${encodeURIComponent(sess.crumb)}` : "";
+  // modules étendus : on garde les tiens; timeSeries/ESG restent optionnels côté YF
   const modules =
-    "financialData,defaultKeyStatistics,price,summaryDetail,defaultKeyStatistics,quoteType,incomeStatementHistory,balanceSheetHistory,cashflowStatementHistory";
+    "financialData,defaultKeyStatistics,price,summaryDetail,quoteType,incomeStatementHistory,balanceSheetHistory,cashflowStatementHistory";
   const urls = [
     `https://query2.finance.yahoo.com/v10/finance/quoteSummary/${encodeURIComponent(
       ticker
@@ -40,6 +41,16 @@ export async function fetchYahooV10(ticker: string, sess: YSession, retryOnce: b
     }
   }
   throw new Error("QuoteSummary indisponible");
+}
+
+/* ---------- helpers locaux ---------- */
+function cagr(series: Array<number | null>, years: number): number | null {
+  const arr = series.filter((x): x is number => typeof x === "number" && isFinite(x));
+  if (arr.length < years + 1) return null;
+  const a = arr.at(-1)!;
+  const b = arr.at(-(years + 1))!;
+  if (!(a > 0 && b > 0)) return null;
+  return Math.pow(a / b, 1 / years) - 1;
 }
 
 /**
@@ -66,7 +77,7 @@ export function computeFundamentalsFromV10(r: any): Fundamentals {
 
   // --- États financiers pour ratios avancés
   const ishs: any[] = r?.incomeStatementHistory?.incomeStatementHistory || [];
-  const bsh: any[]  = r?.balanceSheetHistory?.balanceSheetStatements || [];
+  const bsh:  any[] = r?.balanceSheetHistory?.balanceSheetStatements || [];
   const cfsh: any[] = r?.cashflowStatementHistory?.cashflowStatements || [];
 
   const ni0     = num(ishs?.[0]?.netIncome?.raw ?? ishs?.[0]?.netIncome);
@@ -117,11 +128,28 @@ export function computeFundamentalsFromV10(r: any): Fundamentals {
     (debt ?? null) != null || (eq0 ?? null) != null ? ((debt ?? 0) + (eq0 ?? 0) - (cash ?? 0)) : null;
   const roic = nopat != null && invested && invested !== 0 ? nopat / invested : null;
 
-  // --- Governance
+  // --- Governance de base
   const payoutRatio = num(r?.summaryDetail?.payoutRatio?.raw ?? r?.summaryDetail?.payoutRatio);
   const insiderOwnership = num(
     r?.defaultKeyStatistics?.heldPercentInsiders?.raw ?? r?.defaultKeyStatistics?.heldPercentInsiders
   );
+
+  // --- Governance avancée : buybacks & dividend CAGR (approximations robustes)
+  // Buyback yield via cashflow (repurchaseOfStock est souvent négatif)
+  const repurchase0 = num(cfsh?.[0]?.repurchaseOfStock?.raw ?? cfsh?.[0]?.repurchaseOfStock);
+  const buyback_yield =
+    (repurchase0 != null && mc && mc > 0)
+      ? Math.max(0, -(repurchase0 as number) / mc)
+      : null;
+
+  // Dividend CAGR 3y (approx par flux "dividendsPaid" total – pas par action, mais corrélé)
+  const divPaid0 = num(cfsh?.[0]?.dividendsPaid?.raw ?? cfsh?.[0]?.dividendsPaid);
+  const divPaid1 = num(cfsh?.[1]?.dividendsPaid?.raw ?? cfsh?.[1]?.dividendsPaid);
+  const divPaid2 = num(cfsh?.[2]?.dividendsPaid?.raw ?? cfsh?.[2]?.dividendsPaid);
+  const divPaid3 = num(cfsh?.[3]?.dividendsPaid?.raw ?? cfsh?.[3]?.dividendsPaid);
+  // on passe en valeurs positives (cash-out)
+  const divSeries = [divPaid0, divPaid1, divPaid2, divPaid3].map(v => (v == null ? null : Math.abs(v)));
+  const dividend_cagr_3y = cagr(divSeries, 3);
 
   // --- ESG / controverses (non dispo ici, placeholders)
   const esgScore = null;
@@ -142,7 +170,7 @@ export function computeFundamentalsFromV10(r: any): Fundamentals {
     fcf_over_netincome: asMetric(fcf_over_ni, fcf_over_ni != null ? 0.35 : 0, "calc"),
     roic: asMetric(roic, roic != null ? 0.3 : 0, "calc"),
 
-    // Croissance
+    // Croissance (YoY proxies)
     rev_growth: asMetric(revGrowth, revGrowth != null ? 0.4 : 0, "yahoo-v10"),
     eps_growth: asMetric(epsGrowth, epsGrowth != null ? 0.4 : 0, "yahoo-v10"),
 
@@ -156,8 +184,8 @@ export function computeFundamentalsFromV10(r: any): Fundamentals {
 
     // Governance
     payout_ratio: asMetric(payoutRatio, payoutRatio != null ? 0.3 : 0, "yahoo-v10"),
-    dividend_cagr_3y: asMetric(null, 0, "none"),
-    buyback_yield: asMetric(null, 0, "none"),
+    dividend_cagr_3y: asMetric(dividend_cagr_3y, dividend_cagr_3y != null ? 0.3 : 0, "calc"),
+    buyback_yield: asMetric(buyback_yield, buyback_yield != null ? 0.3 : 0, "calc"),
     insider_ownership: asMetric(insiderOwnership, insiderOwnership != null ? 0.3 : 0, "yahoo-v10"),
 
     // ESG
