@@ -3,6 +3,8 @@
 import { useEffect, useMemo, useRef, useState } from "react";
 
 /* ====================== Types ====================== */
+type OppPoint = { t: number; close: number; opp: number };
+
 type ScoreResponse = {
   ticker: string;
   company_name?: string | null;
@@ -19,6 +21,8 @@ type ScoreResponse = {
 
   subscores: Record<string, number>; // { quality:0..35, safety:0..25, valuation:0..25, momentum:0..15 }
   coverage: number;       // "Couverture des données" (0..100)
+
+  opportunity_series?: OppPoint[];
 
   proof?: {
     price_source?: string;
@@ -217,7 +221,6 @@ export default function Page() {
   function fmtPct(x?: number | null) {
     return typeof x === "number" ? `${(x * 100).toFixed(1)}%` : "—";
   }
-  // Clamp visuel pour éviter des chiffres absurdes (ex : ROIC proxy)
   function fmtPctClamped(x?: number | null, capAbs = 2.0) {
     if (typeof x !== "number") return "—";
     const capped = Math.max(-capAbs, Math.min(capAbs, x));
@@ -384,24 +387,22 @@ export default function Page() {
                             ? `${data.company_name}${data.exchange ? " — " + data.exchange?.toUpperCase() : ""}`
                             : data.ticker.toUpperCase())}
                     </h2>
-                        
-                    {/* Badges line */}
+
                     <div className="mt-1.5 flex flex-wrap items-center gap-x-2 gap-y-4 text-xs">
                       <abbr title="Estimation de la part des données réellement disponibles pour calculer la note finale.">
                         <span className="px-2 py-0.5 rounded-full border border-slate-700 text-slate-300 whitespace-nowrap">
                           Couverture des données&nbsp;: {data.coverage}%
                         </span>
                       </abbr>
-                        
                       <span className="whitespace-nowrap">{verdictBadge}</span>
                     </div>
                   </div>
-                        
-                  {/* Interprétation sous le titre */}
+
+                  {/* Interpretation (à gauche) */}
                   <div className="mt-2 text-slate-300 text-sm">{interpretation}</div>
                 </div>
 
-                {/* Score à droite */}
+                {/* Score block (en haut à droite) */}
                 <div className="w-40 shrink-0">
                   <div className="text-4xl font-extrabold tabular-nums text-right">
                     {data.score_adj ?? data.score}
@@ -421,11 +422,32 @@ export default function Page() {
                 </div>
               </div>
 
+              {/* ======== NEW: Opportunity Chart ======== */}
+              {data.opportunity_series?.length ? (
+                <div className="mt-6">
+                  <h3 className="text-sm uppercase tracking-wide text-slate-400">
+                    Opportunité d’achat (passé & présent)
+                  </h3>
+                  <OpportunityChart rows={data.opportunity_series} />
+                  <p className="mt-2 text-xs text-slate-500">
+                    Bandeau rouge→vert : plus c’est vert, plus l’opportunité semblait favorable ce jour-là (mix
+                    qualité/sécurité, “prix attractif” vs 52s et momentum vs MM200).
+                  </p>
+                </div>
+              ) : null}
+
               {/* Pillars */}
               <div className="mt-6">
                 <h3 className="text-sm uppercase tracking-wide text-slate-400">Piliers de performance</h3>
                 <div className="mt-3 grid grid-cols-1 sm:grid-cols-2 gap-3">
                   {Object.entries(data.subscores || {}).map(([k, v]) => {
+                    const PILLAR_MAX: Record<string, number> = { quality: 35, safety: 25, valuation: 25, momentum: 15 };
+                    const PILLAR_LABEL: Record<string, string> = {
+                      quality: "Qualité opérationnelle",
+                      safety: "Solidité financière",
+                      valuation: "Valorisation",
+                      momentum: "Momentum / Tendance",
+                    };
                     const max = PILLAR_MAX[k] ?? 10;
                     const pct = Math.max(0, Math.min(100, (v / max) * 100));
                     const tips: Record<string, string> = {
@@ -556,6 +578,75 @@ export default function Page() {
         </section>
       )}
     </main>
+  );
+}
+
+/* ---------------- Opportunity Chart ---------------- */
+function OpportunityChart({ rows }: { rows: OppPoint[] }) {
+  // dimensions
+  const W = 720;   // width SVG logical
+  const H = 180;   // total height
+  const PAD = 12;  // padding around
+  const BAND_H = 18; // heat strip height
+  const PRICE_H = H - PAD * 2 - BAND_H - 8; // price plot height
+
+  const n = rows.length;
+  const closes = rows.map(r => r.close);
+  const minP = Math.min(...closes);
+  const maxP = Math.max(...closes);
+  const x = (i: number) => PAD + (i * (W - 2 * PAD)) / Math.max(1, n - 1);
+  const y = (p: number) => PAD + PRICE_H - ((p - minP) * PRICE_H) / Math.max(1e-9, (maxP - minP));
+
+  // path prix
+  const d = rows.map((r, i) => `${i === 0 ? "M" : "L"} ${x(i)} ${y(r.close)}`).join(" ");
+
+  // couleur opp → HSL rouge (0) → vert (120)
+  const oppColor = (v: number) => {
+    const h = Math.round((v / 100) * 120); // 0..120
+    return `hsl(${h} 85% 50%)`;
+  };
+
+  return (
+    <div className="mt-2 rounded-2xl border border-slate-800 bg-slate-900/40">
+      <svg viewBox={`0 0 ${W} ${H}`} className="w-full h-[200px]">
+        {/* fond */}
+        <rect x={0} y={0} width={W} height={H} fill="rgb(2,6,23)" />
+        {/* bandes horizontales de référence */}
+        <g>
+          {[0.25, 0.5, 0.75].map((f, i) => (
+            <line key={i} x1={PAD} x2={W - PAD} y1={PAD + PRICE_H * (1 - f)} y2={PAD + PRICE_H * (1 - f)} stroke="rgba(148,163,184,0.2)" strokeWidth={1} />
+          ))}
+        </g>
+
+        {/* prix */}
+        <path d={d} fill="none" stroke="rgba(203,213,225,0.9)" strokeWidth={1.8} />
+
+        {/* heat strip (en bas) */}
+        <g transform={`translate(${PAD}, ${PAD + PRICE_H + 6})`}>
+          {rows.map((r, i) => {
+            const nextX = (i + 1) * (W - 2 * PAD) / Math.max(1, n - 1);
+            const curX = i * (W - 2 * PAD) / Math.max(1, n - 1);
+            const w = Math.max(1, nextX - curX);
+            return (
+              <rect
+                key={i}
+                x={curX}
+                y={0}
+                width={w}
+                height={BAND_H}
+                fill={oppColor(r.opp)}
+              />
+            );
+          })}
+          {/* cadre */}
+          <rect x={0} y={0} width={(W - 2 * PAD)} height={BAND_H} fill="none" stroke="rgba(148,163,184,0.3)" />
+        </g>
+
+        {/* axes minimaux prix */}
+        <text x={PAD} y={PAD - 2} fill="rgba(148,163,184,0.6)" fontSize="10">{maxP.toFixed(2)}</text>
+        <text x={PAD} y={PAD + PRICE_H + 10} fill="rgba(148,163,184,0.6)" fontSize="10">{minP.toFixed(2)}</text>
+      </svg>
+    </div>
   );
 }
 
