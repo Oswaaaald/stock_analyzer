@@ -376,7 +376,7 @@ export default function Page() {
               {/* Header line: name + chips */}
               <div className="flex items-start gap-4">
                 <div className="flex-1">
-                  <div className="flex flex-col gap-2">
+                  <div className="flex flex-col gap-1">
                     <h2 className="text-2xl font-semibold tracking-tight">
                       {selected?.name
                         ? `${selected.name}${selected.exchange ? " — " + selected.exchange?.toUpperCase() : ""}`
@@ -385,19 +385,15 @@ export default function Page() {
                             : data.ticker.toUpperCase())}
                     </h2>
                         
-                    {/* Badges ligne flexibles */}
-                    <div className="mt-1.5 flex flex-wrap items-center gap-x-2 gap-y-2 text-xs">
-                      <abbr
-                        title="Estimation de la part des données réellement disponibles pour calculer la note finale."
-                        className="no-underline"
-                      >
+                    {/* Badges line */}
+                    <div className="mt-1.5 flex flex-wrap items-center gap-x-2 gap-y-4 text-xs">
+                      <abbr title="Estimation de la part des données réellement disponibles pour calculer la note finale.">
                         <span className="px-2 py-0.5 rounded-full border border-slate-700 text-slate-300 whitespace-nowrap">
                           Couverture des données&nbsp;: {data.coverage}%
                         </span>
                       </abbr>
                         
-                      {/* Badge verdict : ENTREPRISE À SURVEILLER / SOLIDE / FRAGILE */}
-                      <div className="flex-shrink-0">{verdictBadge}</div>
+                      <span className="whitespace-nowrap">{verdictBadge}</span>
                     </div>
                   </div>
                         
