@@ -441,13 +441,6 @@ export default function Page() {
                 <h3 className="text-sm uppercase tracking-wide text-slate-400">Piliers de performance</h3>
                 <div className="mt-3 grid grid-cols-1 sm:grid-cols-2 gap-3">
                   {Object.entries(data.subscores || {}).map(([k, v]) => {
-                    const PILLAR_MAX: Record<string, number> = { quality: 35, safety: 25, valuation: 25, momentum: 15 };
-                    const PILLAR_LABEL: Record<string, string> = {
-                      quality: "Qualité opérationnelle",
-                      safety: "Solidité financière",
-                      valuation: "Valorisation",
-                      momentum: "Momentum / Tendance",
-                    };
                     const max = PILLAR_MAX[k] ?? 10;
                     const pct = Math.max(0, Math.min(100, (v / max) * 100));
                     const tips: Record<string, string> = {
