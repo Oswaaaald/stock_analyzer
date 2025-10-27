@@ -374,11 +374,11 @@ export default function Page() {
       {data && (
         <section className="max-w-7xl mx-auto px-5 sm:px-6 lg:px-8 py-8 grid lg:grid-cols-3 gap-6">
           {/* Left: Score & pillars */}
-          <div className="lg:col-span-2">
+          <div className="lg:col-span-2 min-w-0">
             <div className="rounded-3xl border border-slate-800 bg-gradient-to-b from-slate-900/60 to-slate-900/30 p-6 md:p-7">
               {/* Header line: name + chips */}
               <div className="flex items-start gap-4">
-                <div className="flex-1">
+                <div className="flex-1 min-w-0">
                   <div className="flex flex-col gap-1">
                     <h2 className="text-2xl font-semibold tracking-tight">
                       {selected?.name
@@ -520,7 +520,7 @@ export default function Page() {
           </div>
 
           {/* Right: Proofs */}
-          <aside className="lg:col-span-1">
+          <aside className="lg:col-span-1 min-w-0">
             <div className="rounded-3xl border border-slate-800 bg-slate-900/40 p-5">
               <h3 className="text-sm uppercase tracking-wide text-slate-400">Sources &amp; fraîcheur</h3>
 
