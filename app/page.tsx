@@ -582,50 +582,81 @@ export default function Page() {
 }
 
 /* ---------------- Opportunity Chart ---------------- */
-function OpportunityChart({ rows }: { rows: OppPoint[] }) {
+function OpportunityChart({ rows }: { rows: { t: number; close: number; opp: number }[] }) {
   // dimensions
-  const W = 720;   // width SVG logical
-  const H = 180;   // total height
-  const PAD = 12;  // padding around
-  const BAND_H = 18; // heat strip height
-  const PRICE_H = H - PAD * 2 - BAND_H - 8; // price plot height
+  const W = 720;            // width SVG logical
+  const H = 200;            // total height
+  const PAD = 12;           // padding around
+  const BAND_H = 18;        // heat strip height
+  const PRICE_H = H - PAD * 2 - BAND_H - 22; // price plot height (un peu plus de place pour les dates)
 
   const n = rows.length;
   const closes = rows.map(r => r.close);
   const minP = Math.min(...closes);
   const maxP = Math.max(...closes);
+
   const x = (i: number) => PAD + (i * (W - 2 * PAD)) / Math.max(1, n - 1);
   const y = (p: number) => PAD + PRICE_H - ((p - minP) * PRICE_H) / Math.max(1e-9, (maxP - minP));
 
   // path prix
   const d = rows.map((r, i) => `${i === 0 ? "M" : "L"} ${x(i)} ${y(r.close)}`).join(" ");
 
-  // couleur opp → HSL rouge (0) → vert (120)
-  const oppColor = (v: number) => {
-    const h = Math.round((v / 100) * 120); // 0..120
-    return `hsl(${h} 85% 50%)`;
+  // === Recalibrage local de l'opportunité pour maximiser le contraste de couleurs
+  const oppVals = rows.map(r => r.opp);
+  const oMin = Math.min(...oppVals);
+  const oMax = Math.max(...oppVals);
+  const scaleOpp01 = (v: number) => {
+    if (!(oMax > oMin)) return 0.5; // cas constant
+    return Math.max(0, Math.min(1, (v - oMin) / (oMax - oMin)));
   };
+
+  // couleur opp → HSL rouge (0) → vert (120) avec légère extension vers le vert
+  const oppColor = (v: number) => {
+    const s01 = scaleOpp01(v);
+    const hue = 10 + s01 * 120;           // 10..130 (un chouïa plus vert aux meilleurs jours)
+    return `hsl(${hue} 85% 50%)`;
+  };
+
+  // === Ticks X (dates): ~6 graduations réparties
+  const tickCount = 6;
+  const step = Math.max(1, Math.floor(n / (tickCount - 1)));
+  const tickIdx: number[] = [];
+  for (let i = 0; i < n; i += step) tickIdx.push(i);
+  if (tickIdx[tickIdx.length - 1] !== n - 1) tickIdx.push(n - 1);
+
+  const fmtDate = (ms: number) =>
+    new Date(ms).toLocaleDateString("fr-FR", { year: "2-digit", month: "short" }).replace(".", "");
 
   return (
     <div className="mt-2 rounded-2xl border border-slate-800 bg-slate-900/40">
-      <svg viewBox={`0 0 ${W} ${H}`} className="w-full h-[200px]">
+      <svg viewBox={`0 0 ${W} ${H}`} className="w-full h-[220px]">
         {/* fond */}
         <rect x={0} y={0} width={W} height={H} fill="rgb(2,6,23)" />
-        {/* bandes horizontales de référence */}
+
+        {/* grilles horizontales prix */}
         <g>
           {[0.25, 0.5, 0.75].map((f, i) => (
-            <line key={i} x1={PAD} x2={W - PAD} y1={PAD + PRICE_H * (1 - f)} y2={PAD + PRICE_H * (1 - f)} stroke="rgba(148,163,184,0.2)" strokeWidth={1} />
+            <line
+              key={i}
+              x1={PAD}
+              x2={W - PAD}
+              y1={PAD + PRICE_H * (1 - f)}
+              y2={PAD + PRICE_H * (1 - f)}
+              stroke="rgba(148,163,184,0.18)"
+              strokeWidth={1}
+            />
           ))}
         </g>
 
         {/* prix */}
         <path d={d} fill="none" stroke="rgba(203,213,225,0.9)" strokeWidth={1.8} />
 
-        {/* heat strip (en bas) */}
+        {/* heat strip (en bas, sous la courbe) */}
         <g transform={`translate(${PAD}, ${PAD + PRICE_H + 6})`}>
           {rows.map((r, i) => {
-            const nextX = (i + 1) * (W - 2 * PAD) / Math.max(1, n - 1);
-            const curX = i * (W - 2 * PAD) / Math.max(1, n - 1);
+            const fullW = (W - 2 * PAD);
+            const curX = (i * fullW) / Math.max(1, n - 1);
+            const nextX = ((i + 1) * fullW) / Math.max(1, n - 1);
             const w = Math.max(1, nextX - curX);
             return (
               <rect
@@ -642,9 +673,40 @@ function OpportunityChart({ rows }: { rows: OppPoint[] }) {
           <rect x={0} y={0} width={(W - 2 * PAD)} height={BAND_H} fill="none" stroke="rgba(148,163,184,0.3)" />
         </g>
 
-        {/* axes minimaux prix */}
+        {/* Axe Y simplifié (prix min/max) */}
         <text x={PAD} y={PAD - 2} fill="rgba(148,163,184,0.6)" fontSize="10">{maxP.toFixed(2)}</text>
         <text x={PAD} y={PAD + PRICE_H + 10} fill="rgba(148,163,184,0.6)" fontSize="10">{minP.toFixed(2)}</text>
+
+        {/* Ticks X + labels dates (sous le heat strip) */}
+        <g>
+          {tickIdx.map((idx, k) => {
+            const xi = x(idx);
+            const dateMs = rows[idx]?.t ?? 0;
+            return (
+              <g key={k}>
+                {/* petite ligne repère */}
+                <line
+                  x1={xi}
+                  x2={xi}
+                  y1={PAD + PRICE_H - 2}
+                  y2={PAD + PRICE_H + BAND_H + 8}
+                  stroke="rgba(148,163,184,0.18)"
+                  strokeWidth={1}
+                />
+                {/* libellé date */}
+                <text
+                  x={xi}
+                  y={PAD + PRICE_H + BAND_H + 18}
+                  fill="rgba(148,163,184,0.7)"
+                  fontSize="10"
+                  textAnchor="middle"
+                >
+                  {fmtDate(dateMs)}
+                </text>
+              </g>
+            );
+          })}
+        </g>
       </svg>
     </div>
   );
