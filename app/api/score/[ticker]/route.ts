@@ -31,7 +31,7 @@ type Prices = {
   ret_20d: Metric;
   ret_60d: Metric;
   meta?: { source_primary: "yahoo"; points: number; recency_days: number };
-  series?: { ts: number[]; closes: number[] }; // timestamps (ms) + prix journaliers
+  series?: { ts: number[]; closes: number[] }; // pour le graphe (timestamps ms + closes alignés)
 };
 
 type OppPoint = { t: number; close: number; opp: number };
@@ -48,8 +48,8 @@ type ScorePayload = {
   company_name?: string | null;
   exchange?: string | null;
 
-  score: number;
-  score_adj?: number;
+  score: number;          // brut 0..100
+  score_adj?: number;     // normalisé 0..100 (affiché)
   color: "green" | "orange" | "red";
   verdict: "sain" | "a_surveiller" | "fragile";
   verdict_reason: string;
@@ -57,8 +57,8 @@ type ScorePayload = {
   reasons_positive: string[];
   red_flags: string[];
 
-  subscores: Record<string, number>;
-  coverage: number;
+  subscores: Record<string, number>; // { quality:0..35, safety:0..25, valuation:0..25, momentum:0..15 }
+  coverage: number;       // "Couverture des données" (0..100)
 
   opportunity_series?: OppPoint[];
 
@@ -122,7 +122,7 @@ async function getYahooSession(): Promise<YSession> {
   const q = await fetch("https://finance.yahoo.com/quote/AAPL?guccounter=1", { headers: base, redirect: "manual" });
   cookie = collectCookies(q, cookie);
 
-  // 2) follow consent hops
+  // 2) follow consent hops (si besoin)
   let loc = q.headers.get("location") || "";
   for (let i = 0; i < 3 && loc && /guce|consent\.yahoo\.com/i.test(loc); i++) {
     const r = await fetch(loc, { headers: base, redirect: "manual" });
@@ -138,7 +138,7 @@ async function getYahooSession(): Promise<YSession> {
   const fin = await fetch("https://finance.yahoo.com/quote/AAPL", { headers: { ...base, Cookie: cookie }, redirect: "manual" });
   cookie = collectCookies(fin, cookie);
 
-  // 5) crumb
+  // 5) crumb (q2 -> q1)
   const ch = { ...base, Cookie: cookie, Origin: "https://finance.yahoo.com", Referer: "https://finance.yahoo.com/" };
   let crumb = "";
   for (const host of ["query2", "query1"] as const) {
@@ -179,35 +179,29 @@ export async function GET(req: Request, { params }: { params: { ticker: string }
     const fundamentals = computeFundamentalsFromV10(v10);
     const sources_used = ["price:yahoo(v8)", "yahoo:v10"];
 
-    // 4) Bundle
     const bundle: DataBundle = { ticker: t, fundamentals, prices: priceFeed, sources_used };
 
-    // 5) Opportunity series (0..100, vert = opportunité d’achat)
+    // 4) Opportunité d’achat (bandeau rouge→vert)
     let opportunity_series: OppPoint[] | undefined = undefined;
     if (priceFeed.series?.closes?.length && priceFeed.series?.ts?.length) {
-      opportunity_series = buildOpportunitySeries(
-        priceFeed.series.closes,
-        priceFeed.series.ts,
-        fundamentals
-      );
+      opportunity_series = buildOpportunitySeries(priceFeed.series.closes, priceFeed.series.ts, fundamentals);
     }
 
-    // 6) Score
+    // 5) Score & couverture
     const { subscores, maxes } = computeScore(bundle);
 
-    // ===== Fiabilité (UI) basée sur les *maxes* réellement disponibles =====
+    // Couverture (UI)
     const covQuality = Math.min(1, (maxes.quality || 0) / 8) * 35;   // 0..35
     const covSafety  = Math.min(1, (maxes.safety  || 0) / 6) * 25;   // 0..25
     const covVal     = Math.min(1, (maxes.valuation|| 0) / 10) * 25; // 0..25
     const covMom     = Math.min(1, (maxes.momentum || 0) / 15) * 15; // 0..15
     const coverage_display = Math.round(covQuality + covSafety + covVal + covMom); // 0..100
 
-    // ===== Couverture pour la normalisation du score (dénominateur) =====
+    // Dénominateur dispo (normalisation)
     const denom = Math.max(
       1,
       Math.round(maxes.quality + maxes.safety + maxes.valuation + maxes.momentum)
     );
-
     const total = subscores.quality + subscores.safety + subscores.valuation + subscores.momentum;
     const raw = Math.max(0, Math.min(100, Math.round(total)));
     const score_adj = Math.round((total / denom) * 100); // normalisation → 0..100
@@ -216,37 +210,19 @@ export async function GET(req: Request, { params }: { params: { ticker: string }
     const shown = score_adj ?? raw;
     const color: ScorePayload["color"] = shown >= 65 ? "green" : shown >= 50 ? "orange" : "red";
 
-    // Momentum “présent” uniquement si la 200DMA est vraiment calculable (≥200 points)
-    const momentumPresent = typeof priceFeed.px_vs_200dma.value === "number";
-
     const { verdict, reason } = makeVerdict({
       coverage: coverage_display,
       total,
-      momentumPresent,
+      momentumPresent: true,
       score_adj: shown,
     });
 
     const reasons = buildReasons(bundle, subscores);
 
-    // company & exchange depuis v10.price
-    const company_name =
-      v10?.price?.longName ?? v10?.price?.shortName ?? null;
-    const exchange =
-      v10?.price?.exchangeName ?? v10?.price?.exchange ?? null;
-
-    // valuation metric utilisée
-    const valuation_metric: "FCFY" | "EY" | null =
-      typeof fundamentals.fcf_yield.value === "number" ? "FCFY" :
-      typeof fundamentals.earnings_yield.value === "number" ? "EY" : null;
-
-    // date dernier prix
-    const lastTs = priceFeed.series?.ts?.at(-1) ?? null;
-    const price_last_date = lastTs ? new Date(lastTs).toISOString().slice(0, 10) : null;
-
     const payload: ScorePayload = {
       ticker: t,
-      company_name,
-      exchange,
+      company_name: v10?.price?.longName ?? v10?.price?.shortName ?? null,
+      exchange: v10?.price?.exchangeName ?? v10?.price?.exchange ?? null,
 
       score: raw,
       score_adj,
@@ -264,9 +240,16 @@ export async function GET(req: Request, { params }: { params: { ticker: string }
         price_points: priceFeed.meta?.points,
         price_has_200dma: priceFeed.px_vs_200dma.value !== null,
         price_recency_days: priceFeed.meta?.recency_days ?? null,
-        price_last_date,
+        price_last_date: priceFeed.series?.ts?.at(-1)
+          ? new Date(priceFeed.series.ts.at(-1)!).toISOString().slice(0, 10)
+          : null,
         valuation_used: (fundamentals.fcf_yield.value ?? fundamentals.earnings_yield.value) != null,
-        valuation_metric,
+        valuation_metric:
+          typeof fundamentals.fcf_yield.value === "number"
+            ? "FCFY"
+            : typeof fundamentals.earnings_yield.value === "number"
+            ? "EY"
+            : null,
         sources_used,
       },
       ratios: {
@@ -289,6 +272,11 @@ export async function GET(req: Request, { params }: { params: { ticker: string }
 const asMetric = (v: number | null, conf = 0, source?: string): Metric => ({ value: v, confidence: conf, source });
 const clip = (x: number, lo: number, hi: number) => Math.max(lo, Math.min(hi, x));
 const num = (x: any) => (typeof x === "number" && Number.isFinite(x) ? x : null);
+const clamp01 = (x: number) => Math.max(0, Math.min(1, x));
+const linMap = (x: number, a: number, b: number) => {
+  if (!Number.isFinite(x)) return 0.5;
+  return clamp01((x - a) / (b - a));
+};
 
 /* ============================== v8 chart (prix & momentum) ============================== */
 async function fetchYahooChartAndEnrich(ticker: string): Promise<Prices> {
@@ -307,25 +295,35 @@ async function fetchYahooChartAndEnrich(ticker: string): Promise<Prices> {
   }
   const r = js?.chart?.result?.[0];
   if (!r) throw new Error("Aucune donnée de prix (v8)");
-  const ts: number[] = (r.timestamp || []).map((t: number) => t * 1000);
-  const closes = ((r.indicators?.quote?.[0]?.close || r.indicators?.adjclose?.[0]?.adjclose) || []) as number[];
-  const arr = (closes || []).filter((v: any) => typeof v === "number" && Number.isFinite(v));
-  if (!arr.length) throw new Error("Clôtures vides (v8)");
 
-  const enriched = enrichCloses(arr);
+  // timestamps & closes (on garde uniquement les points valides et alignés)
+  const tsRaw: number[] = (r.timestamp || []).map((t: number) => t * 1000);
+  const closesRaw: number[] = ((r.indicators?.quote?.[0]?.close || r.indicators?.adjclose?.[0]?.adjclose) || []) as number[];
+  const ts: number[] = [];
+  const closes: number[] = [];
+  for (let i = 0; i < Math.min(tsRaw.length, closesRaw.length); i++) {
+    const v = closesRaw[i];
+    if (typeof v === "number" && Number.isFinite(v)) {
+      ts.push(tsRaw[i]);
+      closes.push(v);
+    }
+  }
+  if (!closes.length) throw new Error("Clôtures vides (v8)");
+
+  const enriched = enrichCloses(closes);
   return {
-    px: asMetric(enriched.px, confFromPts(arr.length), "yahoo"),
-    px_vs_200dma: asMetric(enriched.px_vs_200dma, confFromPts(arr.length), "yahoo"),
-    pct_52w: asMetric(enriched.pct_52w, confFromPts(arr.length), "yahoo"),
-    max_dd_1y: asMetric(enriched.max_dd_1y, confFromPts(arr.length), "yahoo"),
-    ret_20d: asMetric(enriched.ret_20d, confFromPts(arr.length), "yahoo"),
-    ret_60d: asMetric(enriched.ret_60d, confFromPts(arr.length), "yahoo"),
+    px: asMetric(enriched.px, confFromPts(closes.length), "yahoo"),
+    px_vs_200dma: asMetric(enriched.px_vs_200dma, confFromPts(closes.length), "yahoo"),
+    pct_52w: asMetric(enriched.pct_52w, confFromPts(closes.length), "yahoo"),
+    max_dd_1y: asMetric(enriched.max_dd_1y, confFromPts(closes.length), "yahoo"),
+    ret_20d: asMetric(enriched.ret_20d, confFromPts(closes.length), "yahoo"),
+    ret_60d: asMetric(enriched.ret_60d, confFromPts(closes.length), "yahoo"),
     meta: {
       source_primary: "yahoo",
-      points: arr.length,
+      points: closes.length,
       recency_days: Math.round((Date.now() - (ts.at(-1) ?? Date.now())) / (1000 * 3600 * 24)),
     },
-    series: { ts, closes: arr }, // <— pour le graphique d'opportunité
+    series: { ts, closes },
   };
 }
 function enrichCloses(closes: number[]) {
@@ -511,7 +509,7 @@ function computeScore(d: DataBundle) {
     v += y > 0.07 ? 9 : y >= 0.05 ? 6 : y >= 0.03 ? 3 : 1;
   }
 
-  // Momentum (15) — plafond interne 15  (inchangé)
+  // Momentum (15) — plafond interne 15
   let m = 0, mMax = 0;
   if (typeof p.px_vs_200dma.value === "number") {
     mMax += 10;
@@ -525,7 +523,9 @@ function computeScore(d: DataBundle) {
     mMax += 2;
     m += p.ret_60d.value > 0.06 ? 2 : p.ret_60d.value > 0 ? 1 : 0;
   }
+  // borne logique côté score
   m = Math.min(m, 15);
+  // mMax reste ce qui est réellement disponible (0..15)
 
   const subscores = {
     quality: clip(q, 0, 35),
@@ -549,33 +549,25 @@ function buildReasons(_d: DataBundle, subs: Record<string, number>) {
 
 function makeVerdict(args: { coverage: number; total: number; momentumPresent: boolean; score_adj: number }) {
   const { coverage, momentumPresent, score_adj } = args;
-  const coverageOk = coverage >= 40;
+  const coverageOk = coverage >= 40; // assoupli pour éviter “À SURVEILLER” partout
   if (score_adj >= 70 && coverageOk && momentumPresent) return { verdict: "sain" as const, reason: "Score élevé et couverture suffisante" };
   if (score_adj >= 50 || momentumPresent) return { verdict: "a_surveiller" as const, reason: "Signal positif mais incomplet" + (coverageOk ? "" : " (couverture limitée)") };
   return { verdict: "fragile" as const, reason: "Signal faible" + (coverageOk ? "" : " (données partielles)") };
 }
 
-/* ============================== Opportunity (contrarian) ============================== */
-function clamp01(x: number) { return Math.max(0, Math.min(1, x)); }
-function linMap(x: number, a: number, b: number) {
-  if (!Number.isFinite(x)) return 0.5;
-  if (a < b) return clamp01((x - a) / (b - a));
-  return clamp01((x - b) / (a - b));
-}
-
-/**
- * Score d’opportunité *d’achat* (0..100) :
- * - plus bon marché (FCFY/EY élevés) => mieux
- * - plus bas vs MM200 => mieux
- * - performance récente négative (20/60 j) => mieux
- * - proche du bas 52s => mieux
- * - qualité/sécurité très faibles pénalisent
- */
+/* ============================== Opportunité d’achat ============================== */
+/*
+  buildOpportunitySeries: renvoie une série 0..100 (vert = attractif)
+  - Prix bas dans son range 52s → vert
+  - Valorisation (FCFY>EY) pèse fort
+  - Momentum pénalise un prix trop au-dessus de la MM200
+  - Légère pénalité si proche des plus hauts, léger bonus si proche des plus bas
+*/
 function buildOpportunitySeries(closes: number[], ts: number[], f: Fundamentals): OppPoint[] {
   const n = Math.min(closes.length, ts.length);
   if (n === 0) return [];
 
-  // 200DMA glissante
+  // MM200 simple
   const roll200: (number | null)[] = Array(n).fill(null);
   let runSum = 0;
   for (let i = 0; i < n; i++) {
@@ -584,15 +576,7 @@ function buildOpportunitySeries(closes: number[], ts: number[], f: Fundamentals)
     if (i >= 199) roll200[i] = runSum / 200;
   }
 
-  // ret_20 / ret_60 glissants
-  const ret20: (number | null)[] = Array(n).fill(null);
-  const ret60: (number | null)[] = Array(n).fill(null);
-  for (let i = 0; i < n; i++) {
-    if (i >= 20 && closes[i - 20] > 0) ret20[i] = closes[i] / closes[i - 20] - 1;
-    if (i >= 60 && closes[i - 60] > 0) ret60[i] = closes[i] / closes[i - 60] - 1;
-  }
-
-  // 52w window (~252 j)
+  // plus bas / hauts roulants 252
   const low252: number[] = Array(n).fill(NaN);
   const high252: number[] = Array(n).fill(NaN);
   for (let i = 0; i < n; i++) {
@@ -602,66 +586,59 @@ function buildOpportunitySeries(closes: number[], ts: number[], f: Fundamentals)
     high252[i] = Math.max(...slice);
   }
 
-  // Valuation score (0..1)
+  // Valorisation (FCFY prioritaire sinon EY)
   const fcfy = typeof f.fcf_yield.value === "number" ? f.fcf_yield.value : null;
-  const ey   = typeof f.earnings_yield.value === "number" ? f.earnings_yield.value : null;
+  const ey = typeof f.earnings_yield.value === "number" ? f.earnings_yield.value : null;
   const valFrom = (y: number | null) =>
-    y == null ? 0.0 :
-    (y <= 0.00 ? 0.0 :
-     y <= 0.02 ? linMap(y, 0.00, 0.02) * 0.3 :
-     y <= 0.04 ? 0.3 + linMap(y, 0.02, 0.04) * 0.3 :
-     y <= 0.06 ? 0.6 + linMap(y, 0.04, 0.06) * 0.2 :
-     0.8 + linMap(Math.min(y, 0.08), 0.06, 0.08) * 0.2);
+    y == null
+      ? 0.0
+      : y <= 0.00 ? 0.0
+      : y <= 0.02 ? linMap(y, 0.00, 0.02) * 0.3
+      : y <= 0.04 ? 0.3 + linMap(y, 0.02, 0.04) * 0.3
+      : y <= 0.06 ? 0.6 + linMap(y, 0.04, 0.06) * 0.2
+      :             0.8 + linMap(Math.min(y, 0.08), 0.06, 0.08) * 0.2;
   const valuationScore = fcfy != null ? valFrom(fcfy) : valFrom(ey);
 
-  // Qualité / Sécurité
-  const qualityOk =
-    typeof f.op_margin.value === "number" ? linMap(f.op_margin.value, 0.05, 0.25) : 0.5;
+  // Qualité / sécurité (petit poids)
+  const qualityOk = typeof f.op_margin.value === "number" ? linMap(f.op_margin.value, 0.05, 0.25) : 0.5;
   const safetyOk = (() => {
     const cr = typeof f.current_ratio.value === "number" ? f.current_ratio.value : null;
-    const nc = typeof f.net_cash.value === "number" ? f.net_cash.value : null; // 1 = net cash, 0 = net debt
-    const crScore = cr == null ? 0.5 : (cr >= 1.5 ? 1 : cr >= 1 ? 0.6 : 0.2);
-    const ncScore = nc == null ? 0.5 : (nc > 0 ? 1 : 0.3);
-    return (crScore * 0.6 + ncScore * 0.4);
+    const nc = typeof f.net_cash.value === "number" ? f.net_cash.value : null;
+    const crScore = cr == null ? 0.5 : cr >= 1.5 ? 1 : cr >= 1 ? 0.6 : 0.2;
+    const ncScore = nc == null ? 0.5 : nc > 0 ? 1 : 0.3;
+    return crScore * 0.6 + ncScore * 0.4;
   })();
+
+  // pondérations
+  const W = { pricePct: 0.4, valuation: 0.4, momentum: 0.15, quality: 0.05 };
+
+  // pénalités/bonus extrêmes de range
+  const hotPenalty = (pct: number) => (pct >= 0.95 ? 0.25 : pct >= 0.9 ? 0.5 : pct >= 0.85 ? 0.75 : 1.0);
+  const coldBoost  = (pct: number) => (pct <= 0.05 ? 1.15 : pct <= 0.1 ? 1.1 : pct <= 0.2 ? 1.05 : 1.0);
 
   const out: OppPoint[] = [];
   for (let i = 0; i < n; i++) {
     const px = closes[i];
-
-    // Distance à MM200 (plus bas = mieux)
     const ma = roll200[i];
-    const dist200 = (ma && ma > 0) ? (px - ma) / ma : 0;
-    const dist200Score = 1 - linMap(dist200, -0.20, +0.10); // -20% ⇒ 1 ; +10% ⇒ 0
+    const dist200 = ma && ma > 0 ? (px - ma) / ma : 0;
+    const momScore = 1 - linMap(dist200, -0.2, +0.1); // en-dessous de la 200 → plus vert
 
-    // Perf récente inversée
-    const r20 = ret20[i] ?? 0;
-    const r60 = ret60[i] ?? 0;
-    const r20Score = 1 - linMap(r20, -0.15, +0.10);
-    const r60Score = 1 - linMap(r60, -0.25, +0.15);
-    const recentScore = clamp01(r20Score * 0.4 + r60Score * 0.6);
-
-    // Position fourchette 52s
     const lo = low252[i], hi = high252[i];
-    const pct52 = (Number.isFinite(lo) && Number.isFinite(hi) && hi > lo)
-      ? (px - lo) / (hi - lo)
-      : 0.5;
-    const pct52Score = 1 - pct52; // bas→1 ; haut→0
+    const pct52w = Number.isFinite(lo) && Number.isFinite(hi) && hi > lo ? (px - lo) / (hi - lo) : 0.5;
+    const pctPrice = 1 - clamp01(pct52w); // bas du range → 1 (vert)
 
-    // Pondération finale
-    const wVal = 0.45, w200 = 0.20, wRecent = 0.15, w52 = 0.10, wQS = 0.10;
+    const qualScore = (qualityOk + safetyOk) / 2;
+
     let opp01 =
-      valuationScore * wVal +
-      dist200Score   * w200 +
-      recentScore    * wRecent +
-      pct52Score     * w52 +
-      (0.5 * qualityOk + 0.5 * safetyOk) * wQS;
+      W.pricePct * pctPrice +
+      W.valuation * valuationScore +
+      W.momentum * momScore +
+      W.quality * qualScore;
 
-    // pénalité si Qualité/Sécurité très faibles
-    const penal = Math.min(qualityOk, safetyOk);
-    if (penal < 0.35) opp01 *= (0.6 + penal);
+    opp01 *= hotPenalty(pct52w);
+    opp01 *= coldBoost(pct52w);
+    opp01 = Math.pow(clamp01(opp01), 0.95);
 
-    opp01 = clamp01(opp01);
     out.push({ t: ts[i], close: px, opp: Math.round(opp01 * 100) });
   }
   return out;
