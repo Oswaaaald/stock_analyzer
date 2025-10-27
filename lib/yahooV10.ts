@@ -3,66 +3,9 @@ import { Fundamentals } from "./types";
 import { asMetric, num, clip } from "./utils";
 import { UA, AL, YSession, getYahooSession } from "./yahooSession";
 
-/** --- Helpers robustes --------------------------------------------------- */
-function n(v: any): number | null {
-  return num(v);
-}
-
-function isFiniteNum(x: any): x is number {
-  return typeof x === "number" && Number.isFinite(x);
-}
-
 /**
- * Yahoo mélange souvent ratio décimal (0.15) et pourcentage (15 ou 150).
- * - Si |v| > 5 on considère que c’est un % (ex: 154.48 pour 154.48%) → v/100.
- * - Si v ∈ [-5; 5], on considère que c’est déjà un ratio décimal.
- * - On cappe ensuite dans un intervalle raisonnable.
+ * Récupère le module Yahoo Finance v10 (quoteSummary) et gère le refresh de cookie/crumb
  */
-function toRatio(v: number | null, capMin = -5, capMax = 5): number | null {
-  if (!isFiniteNum(v)) {
-    return null;
-  }
-  let r = v;
-  if (Math.abs(r) > 5) {
-    r = r / 100.0;
-  }
-  if (!Number.isFinite(r)) {
-    return null;
-  }
-  if (r < capMin) {
-    r = capMin;
-  }
-  if (r > capMax) {
-    r = capMax;
-  }
-  return r;
-}
-
-/** Assure qu’on ne divise jamais par 0, et qu’on ne produit pas d’infini/NaN */
-function safeDiv(a: number | null, b: number | null): number | null {
-  if (!isFiniteNum(a) || !isFiniteNum(b) || b === 0) {
-    return null;
-  }
-  const v = a / b;
-  return Number.isFinite(v) ? v : null;
-}
-
-/** Vérifie rapidement si un objet ressemble au “cashflow statement” Yahoo */
-function getRepurchaseFromCashflow(cfs0: any): number | null {
-  if (!cfs0 || typeof cfs0 !== "object") {
-    return null;
-  }
-  const keys = Object.keys(cfs0);
-  const repurchaseKey = keys.find((k) => /repurchase.*stock/i.test(k));
-  if (!repurchaseKey) {
-    return null;
-  }
-  const raw = cfs0?.[repurchaseKey]?.raw ?? cfs0?.[repurchaseKey];
-  const v = n(raw);
-  return isFiniteNum(v) ? v : null;
-}
-
-/** --- Fetch Yahoo v10 ---------------------------------------------------- */
 export async function fetchYahooV10(ticker: string, sess: YSession, retryOnce: boolean): Promise<any> {
   const base = {
     "User-Agent": UA,
@@ -72,15 +15,16 @@ export async function fetchYahooV10(ticker: string, sess: YSession, retryOnce: b
     Referer: "https://finance.yahoo.com/",
     ...(sess.cookie ? ({ Cookie: sess.cookie } as any) : {}),
   };
-
-  // Modules utiles uniquement (on évite d’alourdir/parasiter)
-  const modules =
-    "financialData,defaultKeyStatistics,price,summaryDetail,quoteType,incomeStatementHistory,balanceSheetHistory,cashflowStatementHistory";
-
   const crumbQS = sess.crumb ? `&crumb=${encodeURIComponent(sess.crumb)}` : "";
+  const modules =
+    "financialData,defaultKeyStatistics,price,summaryDetail,defaultKeyStatistics,quoteType,incomeStatementHistory,balanceSheetHistory,cashflowStatementHistory";
   const urls = [
-    `https://query2.finance.yahoo.com/v10/finance/quoteSummary/${encodeURIComponent(ticker)}?modules=${modules}${crumbQS}`,
-    `https://query1.finance.yahoo.com/v10/finance/quoteSummary/${encodeURIComponent(ticker)}?modules=${modules}${crumbQS}`,
+    `https://query2.finance.yahoo.com/v10/finance/quoteSummary/${encodeURIComponent(
+      ticker
+    )}?modules=${modules}${crumbQS}`,
+    `https://query1.finance.yahoo.com/v10/finance/quoteSummary/${encodeURIComponent(
+      ticker
+    )}?modules=${modules}${crumbQS}`,
   ];
 
   for (const u of urls) {
@@ -100,189 +44,257 @@ export async function fetchYahooV10(ticker: string, sess: YSession, retryOnce: b
   throw new Error("QuoteSummary indisponible");
 }
 
-/** --- Compute fondamentaux unifiés -------------------------------------- */
+/** Convertit un pourcentage "grand" en ratio (ex: 154.4 => 1.544). */
+function percentishToRatio(v: number | null): number | null {
+  if (v == null) {
+    return null;
+  }
+  return v > 5 ? v / 100 : v;
+}
+
+/** Clamp [0..1] */
+function clamp01(x: number): number {
+  if (x < 0) {
+    return 0;
+  }
+  if (x > 1) {
+    return 1;
+  }
+  return x;
+}
+
+/**
+ * Score par paliers décroissants.
+ * thresholds = [t4, t3, t2, t1] du plus exigeant au moins exigeant.
+ * Retourne 1, 0.8, 0.5, 0.2 ou 0 (null si v null).
+ */
+function scoreBand(v: number | null, thresholds: number[]): number | null {
+  if (v == null) {
+    return null;
+  }
+  const [t4, t3, t2, t1] = thresholds;
+  if (v >= t4) {
+    return 1;
+  }
+  if (v >= t3) {
+    return 0.8;
+  }
+  if (v >= t2) {
+    return 0.5;
+  }
+  if (v >= t1) {
+    return 0.2;
+  }
+  return 0;
+}
+
+/**
+ * Extrait et calcule les fondamentaux Yahoo v10 dans un format unifié
+ * (avec fallbacks robustes : D/E via totalLiab, interest coverage via operatingIncome,
+ *  buyback yield approx depuis cashflow, ROIC neutralisé si invested ≤ 0, etc.)
+ *
+ * + Ajout : "moat_proxy" (proxy d'avantage durable) basé sur ROIC/ROE/marge - pénalités levier & décroissance.
+ */
 export function computeFundamentalsFromV10(r: any): Fundamentals {
-  // --- Bruts (avec fallback .raw) -----------------------------------------
-  const price = n(r?.price?.regularMarketPrice?.raw ?? r?.price?.regularMarketPrice);
-  const shares = n(r?.defaultKeyStatistics?.sharesOutstanding?.raw ?? r?.defaultKeyStatistics?.sharesOutstanding);
+  // --- Données brutes -------------------------------------------------------
+  const price = num(r?.price?.regularMarketPrice?.raw ?? r?.price?.regularMarketPrice);
+  const shares = num(r?.defaultKeyStatistics?.sharesOutstanding?.raw ?? r?.defaultKeyStatistics?.sharesOutstanding);
 
-  const trailingPE_raw = n(r?.summaryDetail?.trailingPE?.raw ?? r?.defaultKeyStatistics?.trailingPE?.raw);
-  const priceToBook_raw = n(r?.defaultKeyStatistics?.priceToBook?.raw ?? r?.defaultKeyStatistics?.priceToBook);
+  const trailingPE = num(r?.summaryDetail?.trailingPE?.raw ?? r?.defaultKeyStatistics?.trailingPE?.raw);
+  const priceToBook = num(r?.defaultKeyStatistics?.priceToBook?.raw ?? r?.defaultKeyStatistics?.priceToBook);
+  const currentRatio = num(r?.financialData?.currentRatio?.raw ?? r?.financialData?.currentRatio);
+  const fcf = num(r?.financialData?.freeCashflow?.raw ?? r?.financialData?.freeCashflow);
+  const opm = num(r?.financialData?.operatingMargins?.raw ?? r?.financialData?.operatingMargins);
+  const cash = num(r?.financialData?.totalCash?.raw ?? r?.financialData?.totalCash);
+  const debt = num(r?.financialData?.totalDebt?.raw ?? r?.financialData?.totalDebt);
+  const ebitda = num(r?.financialData?.ebitda?.raw ?? r?.financialData?.ebitda);
+  const ebit = num(r?.financialData?.ebit?.raw ?? r?.financialData?.ebit);
+  const debtToEquity_direct = num(r?.financialData?.debtToEquity?.raw ?? r?.financialData?.debtToEquity);
 
-  const currentRatio = n(r?.financialData?.currentRatio?.raw ?? r?.financialData?.currentRatio);
-  const quickRatio = n(r?.financialData?.quickRatio?.raw ?? r?.financialData?.quickRatio); // non affiché mais utile pour debug
-  const fcf = n(r?.financialData?.freeCashflow?.raw ?? r?.financialData?.freeCashflow);
-  const opm_raw = n(r?.financialData?.operatingMargins?.raw ?? r?.financialData?.operatingMargins);
-  const cash = n(r?.financialData?.totalCash?.raw ?? r?.financialData?.totalCash);
-  const debt = n(r?.financialData?.totalDebt?.raw ?? r?.financialData?.totalDebt);
-  const ebitda = n(r?.financialData?.ebitda?.raw ?? r?.financialData?.ebitda);
-  const ebit = n(r?.financialData?.ebit?.raw ?? r?.financialData?.ebit);
+  // --- Croissance -----------------------------------------------------------
+  const revGrowth = num(r?.financialData?.revenueGrowth?.raw ?? r?.financialData?.revenueGrowth);
+  const epsGrowth = num(r?.financialData?.earningsGrowth?.raw ?? r?.financialData?.earningsGrowth);
 
-  // D/E Yahoo souvent en “%” → normaliser en ratio
-  const debtToEquity_direct = toRatio(n(r?.financialData?.debtToEquity?.raw ?? r?.financialData?.debtToEquity));
-
-  // Croissance (souvent déjà en ratio décimal)
-  const revGrowth = toRatio(n(r?.financialData?.revenueGrowth?.raw ?? r?.financialData?.revenueGrowth), -1, 1);
-  const epsGrowth = toRatio(n(r?.financialData?.earningsGrowth?.raw ?? r?.financialData?.earningsGrowth), -1, 1);
-
-  // États financiers
+  // --- États financiers pour ratios avancés --------------------------------
   const ishs: any[] = r?.incomeStatementHistory?.incomeStatementHistory || [];
   const bsh: any[] = r?.balanceSheetHistory?.balanceSheetStatements || [];
   const cfsh: any[] = r?.cashflowStatementHistory?.cashflowStatements || [];
 
-  const is0 = ishs?.[0] || {};
-  const bs0 = bsh?.[0] || {};
-  const bs1 = bsh?.[1] || {};
-  const cf0 = cfsh?.[0] || {};
+  const ni0 = num(ishs?.[0]?.netIncome?.raw ?? ishs?.[0]?.netIncome);
+  const opInc0 = num(ishs?.[0]?.operatingIncome?.raw ?? ishs?.[0]?.operatingIncome);
+  const interestExp = num(ishs?.[0]?.interestExpense?.raw ?? ishs?.[0]?.interestExpense);
+  const interestExpAlt = num(ishs?.[0]?.interestExpenseNonOperating?.raw ?? ishs?.[0]?.interestExpenseNonOperating);
+  const preTax0 = num(ishs?.[0]?.incomeBeforeTax?.raw ?? ishs?.[0]?.incomeBeforeTax);
+  const taxExp0 = num(ishs?.[0]?.incomeTaxExpense?.raw ?? ishs?.[0]?.incomeTaxExpense);
 
-  const ni0 = n(is0?.netIncome?.raw ?? is0?.netIncome);
-  const opInc0 = n(is0?.operatingIncome?.raw ?? is0?.operatingIncome);
-  // interestExpense chez Yahoo est souvent NEGATIF (sortie de cash) → on prendra abs() au besoin
-  const interestExp = n(is0?.interestExpense?.raw ?? is0?.interestExpense);
-  const preTax0 = n(is0?.incomeBeforeTax?.raw ?? is0?.incomeBeforeTax);
-  const taxExp0 = n(is0?.incomeTaxExpense?.raw ?? is0?.incomeTaxExpense);
+  const eq0 = num(bsh?.[0]?.totalStockholderEquity?.raw ?? bsh?.[0]?.totalStockholderEquity);
+  const eq1 = num(bsh?.[1]?.totalStockholderEquity?.raw ?? bsh?.[1]?.totalStockholderEquity);
+  const assets0 = num(bsh?.[0]?.totalAssets?.raw ?? bsh?.[0]?.totalAssets);
+  const totalLiab0 = num(bsh?.[0]?.totalLiab?.raw ?? bsh?.[0]?.totalLiab); // fallback dette “large”
 
-  const eq0 = n(bs0?.totalStockholderEquity?.raw ?? bs0?.totalStockholderEquity);
-  const eq1 = n(bs1?.totalStockholderEquity?.raw ?? bs1?.totalStockholderEquity);
-  const assets0 = n(bs0?.totalAssets?.raw ?? bs0?.totalAssets);
-  const totalLiab0 = n(bs0?.totalLiab?.raw ?? bs0?.totalLiab);
+  // --- Market cap / Yields --------------------------------------------------
+  const mc = price && shares ? price * shares : null;
+  const ey = trailingPE && trailingPE > 0 ? 1 / trailingPE : null;
+  const fcfy = mc && fcf != null ? clip(fcf / mc, -0.05, 0.08) : null; // clamp pr éviter outliers
 
-  // --- Market cap / yields -------------------------------------------------
-  const mc = isFiniteNum(price) && isFiniteNum(shares) ? price! * shares! : null;
-  const trailingPE = isFiniteNum(trailingPE_raw) && trailingPE_raw! > 0 ? trailingPE_raw : null;
-  const ey = isFiniteNum(trailingPE) && trailingPE! > 0 ? 1.0 / trailingPE! : null;
+  // --- EV & dérivés ---------------------------------------------------------
+  const enterpriseValue = mc != null && debt != null && cash != null ? mc + debt - cash : null;
+  const evToEbitda = ebitda && ebitda !== 0 && enterpriseValue != null ? enterpriseValue / ebitda : null;
 
-  // clamp FCF yield pour éviter outliers si données incomplètes
-  const fcfy = isFiniteNum(mc) && isFiniteNum(fcf) ? clip(fcf! / mc!, -0.05, 0.08) : null;
+  // --- Safety ratios (direct + fallbacks) ----------------------------------
+  const debtLike = debt != null ? debt : (totalLiab0 ?? null);
+  const dToE_fallback = eq0 != null && eq0 !== 0 && debtLike != null ? debtLike / eq0 : null;
+  const debtToEquity_final = percentishToRatio(debtToEquity_direct != null ? debtToEquity_direct : dToE_fallback);
 
-  // --- EV & dérivés --------------------------------------------------------
-  const enterpriseValue =
-    isFiniteNum(mc) && isFiniteNum(debt) && isFiniteNum(cash) ? mc! + debt! - cash! : null;
-  const evToEbitda =
-    isFiniteNum(enterpriseValue) && isFiniteNum(ebitda) && ebitda! !== 0
-      ? clip(enterpriseValue! / ebitda!, -100, 200)
-      : null;
+  const netDebt = (debtLike != null && cash != null) ? (debtLike - cash) : null;
+  const netDebtToEbitda = ebitda && ebitda !== 0 && netDebt != null ? netDebt / ebitda : null;
 
-  // --- Safety --------------------------------------------------------------
-  // D/E : direct (normalisé) OU fallback via totalLiab/Equity si besoin
-  const debtLike = isFiniteNum(debt) ? debt : totalLiab0; // totalLiab ≈ dette “large” fallback
-  const dToE_fallback =
-    isFiniteNum(debtLike) && isFiniteNum(eq0) && eq0! !== 0 ? debtLike! / eq0! : null;
-  const debtToEquity_final = isFiniteNum(debtToEquity_direct) ? debtToEquity_direct : dToE_fallback;
-
-  const netDebt = isFiniteNum(debtLike) && isFiniteNum(cash) ? debtLike! - cash! : null;
-  const netDebtToEbitda =
-    isFiniteNum(netDebt) && isFiniteNum(ebitda) && ebitda! !== 0
-      ? clip(netDebt! / ebitda!, -50, 50)
-      : null;
-
-  // Interest coverage: EBIT (fallback opInc) / |interestExp|
-  const ebitOrOp = isFiniteNum(ebit) ? ebit : opInc0;
+  const interest = (interestExp != null ? interestExp : interestExpAlt);
+  const ebitOrOp = (ebit != null ? ebit : opInc0);
   const interestCoverage_fallback =
-    isFiniteNum(ebitOrOp) && isFiniteNum(interestExp) && Math.abs(interestExp!) > 1e-9
-      ? clip((ebitOrOp as number) / Math.abs(interestExp!), -200, 200)
+    (ebitOrOp != null && interest != null && interest !== 0)
+      ? (ebitOrOp as number) / Math.abs(interest)
       : null;
 
-  // --- Net cash proxy ------------------------------------------------------
+  // --- Net cash proxy -------------------------------------------------------
   let netCash: number | null = null;
-  if (isFiniteNum(cash) && isFiniteNum(debtLike)) {
-    netCash = cash! - debtLike! > 0 ? 1 : 0;
-  } else if (isFiniteNum(priceToBook_raw) && priceToBook_raw! > 0) {
-    netCash = priceToBook_raw! < 1.2 ? 1 : 0;
+  if (cash != null && debtLike != null) {
+    netCash = cash - debtLike > 0 ? 1 : 0;
+  } else if (priceToBook && priceToBook > 0) {
+    netCash = priceToBook < 1.2 ? 1 : 0;
   }
 
   // --- ROE / ROA / ROIC ----------------------------------------------------
-  const roe_direct = toRatio(n(r?.financialData?.returnOnEquity?.raw ?? r?.financialData?.returnOnEquity), -10, 10);
-  const avgEq = isFiniteNum(eq0) && isFiniteNum(eq1) ? (eq0! + eq1!) / 2 : eq0;
-  const roe_calc = isFiniteNum(ni0) && isFiniteNum(avgEq) && avgEq! !== 0 ? ni0! / avgEq! : null;
-  const roe = isFiniteNum(roe_direct) ? roe_direct : roe_calc;
+  const roe_direct = num(r?.financialData?.returnOnEquity?.raw ?? r?.financialData?.returnOnEquity);
+  const avgEq = (eq0 != null && eq1 != null) ? (eq0 + eq1) / 2 : (eq0 ?? null);
+  const roe_calc = (ni0 != null && avgEq) ? (avgEq !== 0 ? ni0 / avgEq : null) : null;
+  const roe = roe_direct ?? roe_calc;
 
-  const roa_direct = toRatio(n(r?.financialData?.returnOnAssets?.raw ?? r?.financialData?.returnOnAssets), -10, 10);
-  const roa =
-    isFiniteNum(roa_direct)
-      ? roa_direct
-      : isFiniteNum(ni0) && isFiniteNum(assets0) && assets0! !== 0
-        ? ni0! / assets0!
-        : null;
+  const roa_direct = num(r?.financialData?.returnOnAssets?.raw ?? r?.financialData?.returnOnAssets);
+  const roa = roa_direct ?? ((ni0 != null && assets0) ? (assets0 !== 0 ? ni0 / assets0 : null) : null);
 
-  const fcf_over_ni = isFiniteNum(fcf) && isFiniteNum(ni0) && ni0! !== 0 ? clip(fcf! / ni0!, -10, 10) : null;
+  const fcf_over_ni = (fcf != null && ni0 != null && ni0 !== 0) ? fcf / ni0 : null;
 
-  const taxRate = isFiniteNum(preTax0) && isFiniteNum(taxExp0) && preTax0! !== 0
-    ? Math.min(0.5, Math.max(0, (taxExp0 as number) / (preTax0 as number)))
-    : 0.21;
-  const nopat = isFiniteNum(opInc0) ? (opInc0 as number) * (1 - taxRate) : (isFiniteNum(ni0) ? ni0 : null);
+  const taxRate = preTax0 && taxExp0 != null && preTax0 !== 0 ? Math.min(0.5, Math.max(0, taxExp0 / preTax0)) : 0.21;
+  const nopat = opInc0 != null ? opInc0 * (1 - taxRate) : (ni0 != null ? ni0 : null);
 
-  // Capital investi: debtLike + equity - cash ; si ≤ 0 → neutralise ROIC (évite artefacts)
   const investedRaw =
-    (isFiniteNum(debtLike) ? (debtLike as number) : 0) +
-    (isFiniteNum(eq0) ? (eq0 as number) : 0) -
-    (isFiniteNum(cash) ? (cash as number) : 0);
+    (debtLike ?? null) != null || (eq0 ?? null) != null ? ((debtLike ?? 0) + (eq0 ?? 0) - (cash ?? 0)) : null;
 
   let roic: number | null = null;
-  if (isFiniteNum(nopat) && isFiniteNum(investedRaw) && investedRaw !== 0) {
+  if (nopat != null && investedRaw != null && investedRaw !== 0) {
     if (investedRaw > 0) {
-      roic = clip((nopat as number) / investedRaw, -10, 10);
+      roic = nopat / investedRaw;
     } else {
-      roic = null;
+      roic = null; // neutralise cas invested ≤ 0
     }
   }
 
-  // --- Governance ----------------------------------------------------------
-  const payoutRatio_raw = n(r?.summaryDetail?.payoutRatio?.raw ?? r?.summaryDetail?.payoutRatio);
-  const payoutRatio = toRatio(payoutRatio_raw, 0, 2); // 0..200%
-  const insiderOwnership_raw = n(r?.defaultKeyStatistics?.heldPercentInsiders?.raw ?? r?.defaultKeyStatistics?.heldPercentInsiders);
-  const insiderOwnership = toRatio(insiderOwnership_raw, 0, 1);
+  // --- Governance -----------------------------------------------------------
+  const payoutRatio = num(r?.summaryDetail?.payoutRatio?.raw ?? r?.summaryDetail?.payoutRatio);
+  const insiderOwnership = num(
+    r?.defaultKeyStatistics?.heldPercentInsiders?.raw ?? r?.defaultKeyStatistics?.heldPercentInsiders
+  );
 
-  // --- ESG placeholders ----------------------------------------------------
+  // --- ESG / controverses (placeholders) -----------------------------------
   const esgScore = null;
   const controversiesLow = null;
 
-  // --- Buyback yield approx ------------------------------------------------
-  const repurchase = getRepurchaseFromCashflow(cf0); // souvent négatif (sortie de cash)
+  // --- Buyback yield approx -------------------------------------------------
+  const cfs0 = cfsh?.[0] ?? {};
+  const repurchaseKeys = Object.keys(cfs0).filter((k) => /repurchase.*stock/i.test(k));
+  let repurchase: number | null = null;
+  for (const k of repurchaseKeys) {
+    const v = num((cfs0 as any)[k]?.raw ?? (cfs0 as any)[k]);
+    if (typeof v === "number") {
+      repurchase = v;
+      break;
+    }
+  }
   let buybackYieldApprox: number | null = null;
-  if (isFiniteNum(mc) && isFiniteNum(repurchase) && (repurchase as number) < 0) {
-    buybackYieldApprox = clip(Math.abs(repurchase as number) / (mc as number), -0.12, 0.10);
+  if (mc && typeof repurchase === "number" && repurchase < 0) {
+    buybackYieldApprox = Math.min(0.10, Math.max(-0.12, Math.abs(repurchase) / mc));
   }
 
-  // --- Normalisations finales ---------------------------------------------
-  const opm = toRatio(opm_raw, -1, 1); // marge opé. (0.30 = 30%)
-  const priceToBook = isFiniteNum(priceToBook_raw) ? clip(priceToBook_raw!, -1, 200) : null;
+  // --- Moat proxy (ROIC/ROE/marge - pénalités levier & décroissance) -------
+  // Scores "force du moteur"
+  const s_roic = scoreBand(roic, [0.20, 0.15, 0.10, 0.05]); // 20% / 15% / 10% / 5%
+  const s_roe = scoreBand(roe, [0.25, 0.18, 0.12, 0.08]);   // 25% / 18% / 12% / 8%
+  const s_opm = scoreBand(opm, [0.25, 0.18, 0.12, 0.08]);   // 25% / 18% / 12% / 8%
 
-  // --- Construction finale -------------------------------------------------
+  let baseMoat: number | null = null;
+  if (s_roic != null || s_roe != null || s_opm != null) {
+    const _roic = s_roic ?? 0;
+    const _roe  = s_roe  ?? 0;
+    const _opm  = s_opm  ?? 0;
+    baseMoat = 0.45 * _roic + 0.30 * _roe + 0.25 * _opm;
+  }
+
+  // Pénalités : levier & instabilité
+  let leveragePenalty = 0;
+  const d2e = debtToEquity_final ?? null;
+  if (d2e != null) {
+    if (d2e > 1.5) {
+      leveragePenalty = 0.25;
+    } else if (d2e > 1.0) {
+      leveragePenalty = 0.15;
+    } else if (d2e > 0.7) {
+      leveragePenalty = 0.08;
+    }
+  }
+
+  let stabilityPenalty = 0;
+  if ((revGrowth ?? 0) < 0 && (opm ?? 0) < 0.15) {
+    stabilityPenalty = 0.10;
+  }
+
+  let moatProxy: number | null = null;
+  if (baseMoat != null) {
+    moatProxy = clamp01(baseMoat - leveragePenalty - stabilityPenalty);
+  }
+
+  // --- Construction finale --------------------------------------------------
   return {
     // Core
-    op_margin:         asMetric(opm,                 opm != null ? 0.45 : 0, "yahoo-v10"),
-    current_ratio:     asMetric(currentRatio,        currentRatio != null ? 0.4  : 0, "yahoo-v10"),
-    fcf_yield:         asMetric(fcfy,                fcfy != null ? 0.45 : 0, "yahoo-v10"),
-    earnings_yield:    asMetric(ey,                  ey != null ? 0.45 : 0, "yahoo-v10"),
-    net_cash:          asMetric(netCash,             netCash != null ? 0.35 : 0, "yahoo-v10"),
+    op_margin: asMetric(opm, opm != null ? 0.45 : 0, "yahoo-v10"),
+    current_ratio: asMetric(currentRatio, currentRatio != null ? 0.4 : 0, "yahoo-v10"),
+    fcf_yield: asMetric(fcfy, fcfy != null ? 0.45 : 0, "yahoo-v10"),
+    earnings_yield: asMetric(ey, ey != null ? 0.45 : 0, "yahoo-v10"),
+    net_cash: asMetric(netCash, netCash != null ? 0.35 : 0, "yahoo-v10"),
 
     // Qualité
-    roe:                asMetric(roe ?? null,               roe != null ? 0.45 : 0, (roe_direct != null ? "yahoo-v10" : "calc")),
-    roa:                asMetric(roa ?? null,               roa != null ? 0.4  : 0, (roa_direct != null ? "yahoo-v10" : "calc")),
-    fcf_over_netincome: asMetric(fcf_over_ni,               fcf_over_ni != null ? 0.35 : 0, "calc"),
-    roic:               asMetric(roic,                      roic != null ? 0.3  : 0, "calc"),
+    roe: asMetric(roe ?? null, roe != null ? 0.45 : 0, roe_direct != null ? "yahoo-v10" : "calc"),
+    roa: asMetric(roa ?? null, roa != null ? 0.4 : 0, roa_direct != null ? "yahoo-v10" : "calc"),
+    fcf_over_netincome: asMetric(fcf_over_ni, fcf_over_ni != null ? 0.35 : 0, "calc"),
+    roic: asMetric(roic, roic != null ? 0.3 : 0, "calc"),
 
     // Croissance
-    rev_growth:         asMetric(revGrowth,          revGrowth != null ? 0.4 : 0, "yahoo-v10"),
-    eps_growth:         asMetric(epsGrowth,          epsGrowth != null ? 0.4 : 0, "yahoo-v10"),
+    rev_growth: asMetric(revGrowth, revGrowth != null ? 0.4 : 0, "yahoo-v10"),
+    eps_growth: asMetric(epsGrowth, epsGrowth != null ? 0.4 : 0, "yahoo-v10"),
 
-    // Safety
-    debt_to_equity:     asMetric(debtToEquity_final, debtToEquity_final != null ? 0.35 : 0, (debtToEquity_direct != null ? "yahoo-v10" : "calc")),
-    net_debt_to_ebitda: asMetric(netDebtToEbitda,    netDebtToEbitda != null ? 0.35 : 0, "calc"),
-    interest_coverage:  asMetric(interestCoverage_fallback, interestCoverage_fallback != null ? 0.35 : 0, "calc"),
+    // Safety (direct + fallback)
+    debt_to_equity: asMetric(
+      debtToEquity_final,
+      debtToEquity_final != null ? (debtToEquity_direct != null ? 0.45 : 0.35) : 0,
+      debtToEquity_direct != null ? "yahoo-v10" : "calc"
+    ),
+    net_debt_to_ebitda: asMetric(netDebtToEbitda, netDebtToEbitda != null ? 0.35 : 0, "calc"),
+    interest_coverage: asMetric(interestCoverage_fallback, interestCoverage_fallback != null ? 0.35 : 0, "calc"),
 
-    // Valuation
-    ev_to_ebitda:       asMetric(evToEbitda,         evToEbitda != null ? 0.35 : 0, "calc"),
+    // Valorisation
+    ev_to_ebitda: asMetric(evToEbitda, evToEbitda != null ? 0.35 : 0, "calc"),
 
     // Gouvernance
-    payout_ratio:       asMetric(payoutRatio,        payoutRatio != null ? 0.3  : 0, "yahoo-v10"),
-    dividend_cagr_3y:   asMetric(null,               0, "none"),
-    buyback_yield:      asMetric(buybackYieldApprox, buyback_yield != null ? 0.25 : 0, "calc"), // var name used below; TS ok
-    insider_ownership:  asMetric(insiderOwnership,   insiderOwnership != null ? 0.3  : 0, "yahoo-v10"),
+    payout_ratio: asMetric(payoutRatio, payoutRatio != null ? 0.3 : 0, "yahoo-v10"),
+    dividend_cagr_3y: asMetric(null, 0, "none"),
+    buyback_yield: asMetric(buybackYieldApprox, buybackYieldApprox != null ? 0.25 : 0, "calc"),
+    insider_ownership: asMetric(insiderOwnership, insiderOwnership != null ? 0.3 : 0, "yahoo-v10"),
 
     // ESG
-    esg_score:          asMetric(esgScore,           0, "none"),
-    controversies_low:  asMetric(controversiesLow,   0, "none"),
+    esg_score: asMetric(esgScore, 0, "none"),
+    controversies_low: asMetric(controversiesLow, 0, "none"),
+
+    // Moat proxy (NOUVEAU)
+    moat_proxy: asMetric(moatProxy, moatProxy != null ? 0.30 : 0, "proxy:roic-roe-opm -pen(d/e,growth)")
   };
 }

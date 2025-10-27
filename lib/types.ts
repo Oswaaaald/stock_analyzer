@@ -38,6 +38,9 @@ export type Fundamentals = {
   // ESG
   esg_score?: Metric;             // autre source
   controversies_low?: Metric;     // 1 = peu de controverses (proxy)
+
+  // Moat (proxy quantitatif ajouté)
+  moat_proxy?: Metric;            // proxy basé sur ROIC/ROE/marge - pénalités levier & décroissance
 };
 
 export type Prices = {
