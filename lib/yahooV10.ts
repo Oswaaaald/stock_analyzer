@@ -180,6 +180,45 @@ export function computeFundamentalsFromV10(r: any): Fundamentals {
     buybackYieldApprox = Math.min(0.10, Math.max(-0.12, Math.abs(repurchase) / mc));
   }
 
+  // --- DEBUG: yahooV10 fundamentals snapshot ---
+try {
+  console.log("[fundamentals][DEBUG]", {
+    ticker: r?.price?.symbol,
+    // sources brutes
+    price: r?.price?.regularMarketPrice?.raw ?? r?.price?.regularMarketPrice,
+    shares: r?.defaultKeyStatistics?.sharesOutstanding?.raw ?? r?.defaultKeyStatistics?.sharesOutstanding,
+    trailingPE: r?.summaryDetail?.trailingPE?.raw ?? r?.defaultKeyStatistics?.trailingPE?.raw,
+    priceToBook: r?.defaultKeyStatistics?.priceToBook?.raw ?? r?.defaultKeyStatistics?.priceToBook,
+    totalCash: r?.financialData?.totalCash?.raw ?? r?.financialData?.totalCash,
+    totalDebt: r?.financialData?.totalDebt?.raw ?? r?.financialData?.totalDebt,
+    ebitda: r?.financialData?.ebitda?.raw ?? r?.financialData?.ebitda,
+    ebit: r?.financialData?.ebit?.raw ?? r?.financialData?.ebit,
+    currentRatio: r?.financialData?.currentRatio?.raw ?? r?.financialData?.currentRatio,
+    opMargin: r?.financialData?.operatingMargins?.raw ?? r?.financialData?.operatingMargins,
+    fcf: r?.financialData?.freeCashflow?.raw ?? r?.financialData?.freeCashflow,
+    debtToEquity_rawPct: r?.financialData?.debtToEquity?.raw ?? r?.financialData?.debtToEquity,
+  });
+
+  console.log("[fundamentals][DERIVED]", {
+    enterpriseValue,
+    evToEbitda,
+    debtLike,
+    debtToEquity_final, // attention: pourcent Yahoo converti en ratio si direct dispo
+    netDebt: (debtLike ?? 0) - (r?.financialData?.totalCash?.raw ?? r?.financialData?.totalCash ?? 0),
+    netDebtToEbitda,
+    interestCoverage_fallback,
+    roe_calc_inputs: {
+      ni0, eq0, eq1, avgEq: (eq0 != null && eq1 != null) ? (eq0 + eq1) / 2 : (eq0 ?? null)
+    },
+    roa_calc_inputs: { ni0, assets0 },
+    roic_inputs: { nopat, investedRaw },
+    yields: { ey, fcfy },
+    buybackYieldApprox
+  });
+} catch (e) {
+  console.warn("[fundamentals][DEBUG] logging failed:", e);
+}
+
   // --- Construction finale --------------------------------------------------
   return {
     // Core
