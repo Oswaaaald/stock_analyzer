@@ -1,20 +1,24 @@
-// /lib/types.ts
+// lib/types.ts
+
+// --- Metrics de base ---
 export type Metric = { value: number | null; confidence: number; source?: string };
 
+// --- Fundamentals extraits de Yahoo v10 ---
 export type Fundamentals = {
-  op_margin: Metric;          // financialData.operatingMargins
-  current_ratio: Metric;      // financialData.currentRatio
-  fcf_yield: Metric;          // FCF / MarketCap
-  earnings_yield: Metric;     // 1 / trailingPE
-  net_cash: Metric;           // proxy (cash>debt) sinon PB<1.2
+  op_margin: Metric;
+  current_ratio: Metric;
+  fcf_yield: Metric;
+  earnings_yield: Metric;
+  net_cash: Metric;
 
-  // Ratios avancés (affichage)
+  // ratios affichage
   roe?: Metric;
   roa?: Metric;
   fcf_over_netincome?: Metric;
   roic?: Metric;
 };
 
+// --- Prix + série pour le graphe ---
 export type Prices = {
   px: Metric;
   px_vs_200dma: Metric;
@@ -26,8 +30,10 @@ export type Prices = {
   series?: { ts: number[]; closes: number[] };
 };
 
+// --- Point “opportunité” pour le bandeau vert/rouge ---
 export type OppPoint = { t: number; close: number; opp: number };
 
+// --- Bundle interne au scoring ---
 export type DataBundle = {
   ticker: string;
   fundamentals: Fundamentals;
@@ -35,6 +41,7 @@ export type DataBundle = {
   sources_used: string[];
 };
 
+// --- Payload renvoyé par l’API /api/score/[ticker] ---
 export type ScorePayload = {
   ticker: string;
   company_name?: string | null;
@@ -49,7 +56,7 @@ export type ScorePayload = {
   reasons_positive: string[];
   red_flags: string[];
 
-  subscores: Record<string, number>; // { quality,safety,valuation,momentum }
+  subscores: Record<string, number>; // { quality:0..35, safety:0..25, valuation:0..25, momentum:0..15, ... }
   coverage: number;       // 0..100
 
   opportunity_series?: OppPoint[];
