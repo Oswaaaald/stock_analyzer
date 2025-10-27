@@ -376,7 +376,7 @@ export default function Page() {
               {/* Header line: name + chips */}
               <div className="flex items-start gap-4">
                 <div className="flex-1">
-                  <div className="flex flex-col gap-1">
+                  <div className="flex flex-col gap-2">
                     <h2 className="text-2xl font-semibold tracking-tight">
                       {selected?.name
                         ? `${selected.name}${selected.exchange ? " — " + selected.exchange?.toUpperCase() : ""}`
@@ -386,7 +386,7 @@ export default function Page() {
                     </h2>
                         
                     {/* Badges ligne flexibles */}
-                    <div className="flex flex-wrap items-center gap-2 text-xs">
+                    <div className="mt-1.5 flex flex-wrap items-center gap-x-2 gap-y-2 text-xs">
                       <abbr
                         title="Estimation de la part des données réellement disponibles pour calculer la note finale."
                         className="no-underline"
