@@ -30,11 +30,18 @@ type Prices = {
   max_dd_1y: Metric;
   ret_20d: Metric;
   ret_60d: Metric;
-  series?: { t: number; close: number; ma200?: number }[]; // ← ajouté
   meta?: { source_primary: "yahoo"; points: number; recency_days: number };
+  series?: { ts: number[]; closes: number[] }; // timestamps (ms) + prix journaliers
 };
 
-type DataBundle = { ticker: string; fundamentals: Fundamentals; prices: Prices; sources_used: string[] };
+type OppPoint = { t: number; close: number; opp: number };
+
+type DataBundle = {
+  ticker: string;
+  fundamentals: Fundamentals;
+  prices: Prices;
+  sources_used: string[];
+};
 
 type ScorePayload = {
   ticker: string;
@@ -49,10 +56,11 @@ type ScorePayload = {
 
   reasons_positive: string[];
   red_flags: string[];
+
   subscores: Record<string, number>;
   coverage: number;
 
-  opportunity_series?: { t: number; close: number; opp: number }[];
+  opportunity_series?: OppPoint[];
 
   proof?: {
     price_source?: string;
@@ -60,8 +68,10 @@ type ScorePayload = {
     price_has_200dma: boolean;
     price_recency_days?: number | null;
     price_last_date?: string | null;
+
     valuation_used?: boolean;
     valuation_metric?: "FCFY" | "EY" | null;
+
     sources_used?: string[];
   };
   ratios?: {
@@ -112,7 +122,7 @@ async function getYahooSession(): Promise<YSession> {
   const q = await fetch("https://finance.yahoo.com/quote/AAPL?guccounter=1", { headers: base, redirect: "manual" });
   cookie = collectCookies(q, cookie);
 
-  // 2) follow consent hops (si besoin)
+  // 2) follow consent hops
   let loc = q.headers.get("location") || "";
   for (let i = 0; i < 3 && loc && /guce|consent\.yahoo\.com/i.test(loc); i++) {
     const r = await fetch(loc, { headers: base, redirect: "manual" });
@@ -128,7 +138,7 @@ async function getYahooSession(): Promise<YSession> {
   const fin = await fetch("https://finance.yahoo.com/quote/AAPL", { headers: { ...base, Cookie: cookie }, redirect: "manual" });
   cookie = collectCookies(fin, cookie);
 
-  // 5) crumb (q2 -> q1)
+  // 5) crumb
   const ch = { ...base, Cookie: cookie, Origin: "https://finance.yahoo.com", Referer: "https://finance.yahoo.com/" };
   let crumb = "";
   for (const host of ["query2", "query1"] as const) {
@@ -158,7 +168,7 @@ export async function GET(req: Request, { params }: { params: { ticker: string }
   if (!isDebug && hit && hit.expires > now) return NextResponse.json(hit.data);
 
   try {
-    // 1) Prix & momentum (v8, sans cookies) + série MA200
+    // 1) Prix & momentum (v8, sans cookies)
     const priceFeed = await fetchYahooChartAndEnrich(t);
 
     // 2) Session + v10 (fundamentaux & historiques annuels pour ratios)
@@ -167,16 +177,25 @@ export async function GET(req: Request, { params }: { params: { ticker: string }
 
     // 3) Extraire fondamentaux + ratios
     const fundamentals = computeFundamentalsFromV10(v10);
-
-    // 4) Série d'opportunité (0..100 absolu)
-    const opportunity_series = computeOpportunitySeries(priceFeed, fundamentals);
-
     const sources_used = ["price:yahoo(v8)", "yahoo:v10"];
+
+    // 4) Bundle
     const bundle: DataBundle = { ticker: t, fundamentals, prices: priceFeed, sources_used };
 
+    // 5) Opportunity series (0..100, vert = opportunité d’achat)
+    let opportunity_series: OppPoint[] | undefined = undefined;
+    if (priceFeed.series?.closes?.length && priceFeed.series?.ts?.length) {
+      opportunity_series = buildOpportunitySeries(
+        priceFeed.series.closes,
+        priceFeed.series.ts,
+        fundamentals
+      );
+    }
+
+    // 6) Score
     const { subscores, maxes } = computeScore(bundle);
 
-    // ===== Couverture (UI) basée sur les *maxes* disponibles =====
+    // ===== Fiabilité (UI) basée sur les *maxes* réellement disponibles =====
     const covQuality = Math.min(1, (maxes.quality || 0) / 8) * 35;   // 0..35
     const covSafety  = Math.min(1, (maxes.safety  || 0) / 6) * 25;   // 0..25
     const covVal     = Math.min(1, (maxes.valuation|| 0) / 10) * 25; // 0..25
@@ -184,15 +203,20 @@ export async function GET(req: Request, { params }: { params: { ticker: string }
     const coverage_display = Math.round(covQuality + covSafety + covVal + covMom); // 0..100
 
     // ===== Couverture pour la normalisation du score (dénominateur) =====
-    const denom = Math.max(1, Math.round(maxes.quality + maxes.safety + maxes.valuation + maxes.momentum));
+    const denom = Math.max(
+      1,
+      Math.round(maxes.quality + maxes.safety + maxes.valuation + maxes.momentum)
+    );
+
     const total = subscores.quality + subscores.safety + subscores.valuation + subscores.momentum;
     const raw = Math.max(0, Math.min(100, Math.round(total)));
     const score_adj = Math.round((total / denom) * 100); // normalisation → 0..100
 
+    // Couleur & verdict basés sur le score affiché (shown)
     const shown = score_adj ?? raw;
     const color: ScorePayload["color"] = shown >= 65 ? "green" : shown >= 50 ? "orange" : "red";
 
-    // Momentum “présent” uniquement si la 200DMA est calculable
+    // Momentum “présent” uniquement si la 200DMA est vraiment calculable (≥200 points)
     const momentumPresent = typeof priceFeed.px_vs_200dma.value === "number";
 
     const { verdict, reason } = makeVerdict({
@@ -204,24 +228,26 @@ export async function GET(req: Request, { params }: { params: { ticker: string }
 
     const reasons = buildReasons(bundle, subscores);
 
-    // Nom & place si dispo (pour l’UI)
-    const company_name = v10?.price?.longName ?? v10?.price?.shortName ?? null;
-    const exchange = v10?.price?.exchangeName ?? v10?.price?.exchange ?? null;
+    // company & exchange depuis v10.price
+    const company_name =
+      v10?.price?.longName ?? v10?.price?.shortName ?? null;
+    const exchange =
+      v10?.price?.exchangeName ?? v10?.price?.exchange ?? null;
 
-    // métrique de valo utilisée
+    // valuation metric utilisée
     const valuation_metric: "FCFY" | "EY" | null =
-      fundamentals.fcf_yield.value != null ? "FCFY"
-      : fundamentals.earnings_yield.value != null ? "EY"
-      : null;
+      typeof fundamentals.fcf_yield.value === "number" ? "FCFY" :
+      typeof fundamentals.earnings_yield.value === "number" ? "EY" : null;
 
-    // date du dernier prix (si série)
-    const lastTs = priceFeed.series?.at(-1)?.t ?? null;
-    const lastDate = lastTs ? new Date(lastTs).toISOString().slice(0, 10) : null;
+    // date dernier prix
+    const lastTs = priceFeed.series?.ts?.at(-1) ?? null;
+    const price_last_date = lastTs ? new Date(lastTs).toISOString().slice(0, 10) : null;
 
     const payload: ScorePayload = {
       ticker: t,
       company_name,
       exchange,
+
       score: raw,
       score_adj,
       color,
@@ -230,15 +256,16 @@ export async function GET(req: Request, { params }: { params: { ticker: string }
       reasons_positive: reasons.slice(0, 3),
       red_flags: [],
       subscores,
-      coverage: coverage_display,
+      coverage: coverage_display, // UI
       opportunity_series,
+
       proof: {
         price_source: priceFeed.meta?.source_primary,
         price_points: priceFeed.meta?.points,
         price_has_200dma: priceFeed.px_vs_200dma.value !== null,
         price_recency_days: priceFeed.meta?.recency_days ?? null,
-        price_last_date: lastDate,
-        valuation_used: valuation_metric !== null,
+        price_last_date,
+        valuation_used: (fundamentals.fcf_yield.value ?? fundamentals.earnings_yield.value) != null,
         valuation_metric,
         sources_used,
       },
@@ -285,17 +312,6 @@ async function fetchYahooChartAndEnrich(ticker: string): Promise<Prices> {
   const arr = (closes || []).filter((v: any) => typeof v === "number" && Number.isFinite(v));
   if (!arr.length) throw new Error("Clôtures vides (v8)");
 
-  // Série + MA200 glissante
-  let runSum = 0;
-  const series: { t: number; close: number; ma200?: number }[] = [];
-  for (let i = 0; i < arr.length; i++) {
-    const c = arr[i];
-    runSum += c;
-    if (i >= 200) runSum -= arr[i - 200];
-    const ma = i >= 199 ? runSum / 200 : undefined;
-    series.push({ t: ts[i], close: c, ma200: ma });
-  }
-
   const enriched = enrichCloses(arr);
   return {
     px: asMetric(enriched.px, confFromPts(arr.length), "yahoo"),
@@ -304,12 +320,12 @@ async function fetchYahooChartAndEnrich(ticker: string): Promise<Prices> {
     max_dd_1y: asMetric(enriched.max_dd_1y, confFromPts(arr.length), "yahoo"),
     ret_20d: asMetric(enriched.ret_20d, confFromPts(arr.length), "yahoo"),
     ret_60d: asMetric(enriched.ret_60d, confFromPts(arr.length), "yahoo"),
-    series, // ← renvoyé
     meta: {
       source_primary: "yahoo",
       points: arr.length,
       recency_days: Math.round((Date.now() - (ts.at(-1) ?? Date.now())) / (1000 * 3600 * 24)),
     },
+    series: { ts, closes: arr }, // <— pour le graphique d'opportunité
   };
 }
 function enrichCloses(closes: number[]) {
@@ -460,104 +476,7 @@ function computeFundamentalsFromV10(r: any): Fundamentals {
 }
 const clampFcfy = (y: number) => Math.max(-0.05, Math.min(0.08, y));
 
-/* ============================== Opportunité d’achat (0..100) ============================== */
-
-// Mappe une valeur (FCFY / EY) vers 0..100 “attractivité prix”
-function mapValuationTo100(args: { fcfy?: number | null; ey?: number | null }) {
-  const { fcfy, ey } = args;
-  if (typeof fcfy === "number") {
-    const y = fcfy;
-    if (y <= 0) return 0;
-    if (y >= 0.08) return 100;
-    if (y >= 0.06) return 85 + ((y - 0.06) / 0.02) * (100 - 85);
-    if (y >= 0.04) return 60 + ((y - 0.04) / 0.02) * (85 - 60);
-    if (y >= 0.02) return 30 + ((y - 0.02) / 0.02) * (60 - 30);
-    return (y / 0.02) * 30;
-  }
-  if (typeof ey === "number") {
-    const y = ey;
-    if (y <= 0.01) return 0;
-    if (y >= 0.09) return 100;
-    if (y >= 0.07) return 85 + ((y - 0.07) / 0.02) * (100 - 85);
-    if (y >= 0.05) return 60 + ((y - 0.05) / 0.02) * (85 - 60);
-    if (y >= 0.03) return 30 + ((y - 0.03) / 0.02) * (60 - 30);
-    return (y / 0.03) * 30;
-  }
-  return 0;
-}
-
-function computeOpportunitySeries(prices: Prices, f: Fundamentals) {
-  const rows = prices.series || [];
-  if (!rows.length) return [] as { t: number; close: number; opp: number }[];
-
-  // Composantes fixes (qualité/sécurité pour "gate")
-  const opm = typeof f.op_margin.value === "number" ? f.op_margin.value : null;
-  const cur = typeof f.current_ratio.value === "number" ? f.current_ratio.value : null;
-  const netcash = typeof f.net_cash.value === "number" ? f.net_cash.value : null;
-  const fcfy = typeof f.fcf_yield.value === "number" ? f.fcf_yield.value : null;
-  const ey   = typeof f.earnings_yield.value === "number" ? f.earnings_yield.value : null;
-
-  // Qualité/Sécurité → Q (0..100)
-  let Q = 0;
-  if (opm != null) Q += opm >= 0.20 ? 60 : opm >= 0.10 ? 40 : opm >= 0.05 ? 25 : 10;
-  if (cur != null) Q += cur > 1.5 ? 20 : cur >= 1 ? 10 : 0;
-  if (netcash != null) Q += netcash > 0 ? 20 : 0;
-  Q = Math.max(0, Math.min(100, Q));
-  // Gate multiplicatif: faible qualité = gros frein (0.4..1.0)
-  const Gate = (40 + Q * 0.6) / 100;
-
-  // Attractivité prix (0..100) selon FCFY/EY
-  const V = mapValuationTo100({ fcfy, ey });
-
-  // Pour momentum & placement
-  const closes = rows.map(r => r.close);
-  function pct52wAt(i: number) {
-    const start = Math.max(0, i - 251);
-    const win = closes.slice(start, i + 1);
-    const c = closes[i];
-    const hi = Math.max(...win), lo = Math.min(...win);
-    if (hi === lo) return 0.5;
-    return (c - lo) / (hi - lo);
-  }
-
-  const out: { t: number; close: number; opp: number }[] = [];
-
-  for (let i = 0; i < rows.length; i++) {
-    const { t, close, ma200 } = rows[i];
-
-    // Trend (T, 0..100)
-    let T = 50;
-    if (typeof ma200 === "number") {
-      const delta = (close - ma200) / ma200;
-      if (delta <= -0.10) T = 10;
-      else if (delta >= 0.10) T = 85;
-      else if (delta >= 0.05) T = 70;
-      else if (delta >= 0) T = 50 + (delta / 0.05) * (70 - 50);
-      else T = 50 + (delta / 0.10) * (10 - 50);
-    }
-    const r20 = i >= 20 && closes[i - 20] > 0 ? close / closes[i - 20] - 1 : 0;
-    const r60 = i >= 60 && closes[i - 60] > 0 ? close / closes[i - 60] - 1 : 0;
-    T += (r20 > 0 ? Math.min(3, (r20 / 0.03) * 3) : Math.max(-3, (r20 / 0.03) * 3));
-    T += (r60 > 0 ? Math.min(5, (r60 / 0.06) * 5) : Math.max(-5, (r60 / 0.06) * 5));
-    T = Math.max(0, Math.min(100, T));
-
-    // Pullback / placement vs 52w (P)
-    const pctl = pct52wAt(i);
-    let P = (1 - pctl) * 100; // plus bas → plus “attractif”
-    const downtrend = typeof ma200 === "number" && close < ma200 && r60 < -0.10;
-    if (downtrend) P *= 0.6;
-
-    // Scoring final (0..100), pondérations + Gate Qualité
-    let opp = 0.55 * V + 0.25 * P + 0.20 * T;
-    opp = Math.max(0, Math.min(100, opp)) * Gate;
-
-    out.push({ t, close, opp: Math.round(opp) });
-  }
-
-  return out;
-}
-
-/* ============================== Scoring (global) ============================== */
+/* ============================== Scoring ============================== */
 function computeScore(d: DataBundle) {
   const f = d.fundamentals,
     p = d.prices;
@@ -592,7 +511,7 @@ function computeScore(d: DataBundle) {
     v += y > 0.07 ? 9 : y >= 0.05 ? 6 : y >= 0.03 ? 3 : 1;
   }
 
-  // Momentum (15) — plafond interne 15
+  // Momentum (15) — plafond interne 15  (inchangé)
   let m = 0, mMax = 0;
   if (typeof p.px_vs_200dma.value === "number") {
     mMax += 10;
@@ -618,7 +537,7 @@ function computeScore(d: DataBundle) {
   return { subscores, maxes };
 }
 
-function buildReasons(d: DataBundle, subs: Record<string, number>) {
+function buildReasons(_d: DataBundle, subs: Record<string, number>) {
   const out: string[] = [];
   if (subs.quality >= 6) out.push("Entreprise rentable et efficace");
   if (subs.safety >= 4) out.push("Bilans plutôt sains");
@@ -634,6 +553,118 @@ function makeVerdict(args: { coverage: number; total: number; momentumPresent: b
   if (score_adj >= 70 && coverageOk && momentumPresent) return { verdict: "sain" as const, reason: "Score élevé et couverture suffisante" };
   if (score_adj >= 50 || momentumPresent) return { verdict: "a_surveiller" as const, reason: "Signal positif mais incomplet" + (coverageOk ? "" : " (couverture limitée)") };
   return { verdict: "fragile" as const, reason: "Signal faible" + (coverageOk ? "" : " (données partielles)") };
+}
+
+/* ============================== Opportunity (contrarian) ============================== */
+function clamp01(x: number) { return Math.max(0, Math.min(1, x)); }
+function linMap(x: number, a: number, b: number) {
+  if (!Number.isFinite(x)) return 0.5;
+  if (a < b) return clamp01((x - a) / (b - a));
+  return clamp01((x - b) / (a - b));
+}
+
+/**
+ * Score d’opportunité *d’achat* (0..100) :
+ * - plus bon marché (FCFY/EY élevés) => mieux
+ * - plus bas vs MM200 => mieux
+ * - performance récente négative (20/60 j) => mieux
+ * - proche du bas 52s => mieux
+ * - qualité/sécurité très faibles pénalisent
+ */
+function buildOpportunitySeries(closes: number[], ts: number[], f: Fundamentals): OppPoint[] {
+  const n = Math.min(closes.length, ts.length);
+  if (n === 0) return [];
+
+  // 200DMA glissante
+  const roll200: (number | null)[] = Array(n).fill(null);
+  let runSum = 0;
+  for (let i = 0; i < n; i++) {
+    runSum += closes[i];
+    if (i >= 200) runSum -= closes[i - 200];
+    if (i >= 199) roll200[i] = runSum / 200;
+  }
+
+  // ret_20 / ret_60 glissants
+  const ret20: (number | null)[] = Array(n).fill(null);
+  const ret60: (number | null)[] = Array(n).fill(null);
+  for (let i = 0; i < n; i++) {
+    if (i >= 20 && closes[i - 20] > 0) ret20[i] = closes[i] / closes[i - 20] - 1;
+    if (i >= 60 && closes[i - 60] > 0) ret60[i] = closes[i] / closes[i - 60] - 1;
+  }
+
+  // 52w window (~252 j)
+  const low252: number[] = Array(n).fill(NaN);
+  const high252: number[] = Array(n).fill(NaN);
+  for (let i = 0; i < n; i++) {
+    const start = Math.max(0, i - 251);
+    const slice = closes.slice(start, i + 1);
+    low252[i] = Math.min(...slice);
+    high252[i] = Math.max(...slice);
+  }
+
+  // Valuation score (0..1)
+  const fcfy = typeof f.fcf_yield.value === "number" ? f.fcf_yield.value : null;
+  const ey   = typeof f.earnings_yield.value === "number" ? f.earnings_yield.value : null;
+  const valFrom = (y: number | null) =>
+    y == null ? 0.0 :
+    (y <= 0.00 ? 0.0 :
+     y <= 0.02 ? linMap(y, 0.00, 0.02) * 0.3 :
+     y <= 0.04 ? 0.3 + linMap(y, 0.02, 0.04) * 0.3 :
+     y <= 0.06 ? 0.6 + linMap(y, 0.04, 0.06) * 0.2 :
+     0.8 + linMap(Math.min(y, 0.08), 0.06, 0.08) * 0.2);
+  const valuationScore = fcfy != null ? valFrom(fcfy) : valFrom(ey);
+
+  // Qualité / Sécurité
+  const qualityOk =
+    typeof f.op_margin.value === "number" ? linMap(f.op_margin.value, 0.05, 0.25) : 0.5;
+  const safetyOk = (() => {
+    const cr = typeof f.current_ratio.value === "number" ? f.current_ratio.value : null;
+    const nc = typeof f.net_cash.value === "number" ? f.net_cash.value : null; // 1 = net cash, 0 = net debt
+    const crScore = cr == null ? 0.5 : (cr >= 1.5 ? 1 : cr >= 1 ? 0.6 : 0.2);
+    const ncScore = nc == null ? 0.5 : (nc > 0 ? 1 : 0.3);
+    return (crScore * 0.6 + ncScore * 0.4);
+  })();
+
+  const out: OppPoint[] = [];
+  for (let i = 0; i < n; i++) {
+    const px = closes[i];
+
+    // Distance à MM200 (plus bas = mieux)
+    const ma = roll200[i];
+    const dist200 = (ma && ma > 0) ? (px - ma) / ma : 0;
+    const dist200Score = 1 - linMap(dist200, -0.20, +0.10); // -20% ⇒ 1 ; +10% ⇒ 0
+
+    // Perf récente inversée
+    const r20 = ret20[i] ?? 0;
+    const r60 = ret60[i] ?? 0;
+    const r20Score = 1 - linMap(r20, -0.15, +0.10);
+    const r60Score = 1 - linMap(r60, -0.25, +0.15);
+    const recentScore = clamp01(r20Score * 0.4 + r60Score * 0.6);
+
+    // Position fourchette 52s
+    const lo = low252[i], hi = high252[i];
+    const pct52 = (Number.isFinite(lo) && Number.isFinite(hi) && hi > lo)
+      ? (px - lo) / (hi - lo)
+      : 0.5;
+    const pct52Score = 1 - pct52; // bas→1 ; haut→0
+
+    // Pondération finale
+    const wVal = 0.45, w200 = 0.20, wRecent = 0.15, w52 = 0.10, wQS = 0.10;
+    let opp01 =
+      valuationScore * wVal +
+      dist200Score   * w200 +
+      recentScore    * wRecent +
+      pct52Score     * w52 +
+      (0.5 * qualityOk + 0.5 * safetyOk) * wQS;
+
+    // pénalité si Qualité/Sécurité très faibles
+    const penal = Math.min(qualityOk, safetyOk);
+    if (penal < 0.35) opp01 *= (0.6 + penal);
+
+    opp01 = clamp01(opp01);
+    out.push({ t: ts[i], close: px, opp: Math.round(opp01 * 100) });
+  }
+  return out;
 }
 
 /* ============================== Fetch util ============================== */
