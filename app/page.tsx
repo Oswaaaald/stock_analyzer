@@ -583,15 +583,16 @@ export default function Page() {
 
 /* ---------------- Opportunity Chart ---------------- */
 function OpportunityChart({ rows }: { rows: { t: number; close: number; opp: number }[] }) {
-  const W = 760;
-  const H = 270;                              // ↓ moins haut
-  const M = { top: 16, right: 48, bottom: 36, left: 56 }; // ↓ marge basse
+  // --- Dimensions & mise en page -------------------------------------------
+  const W = 760;                  // largeur logique du SVG
+  const H = 290;                  // ↑ un peu plus haut pour laisser de la place
+  const M = { top: 16, right: 48, bottom: 16, left: 56 };
   const innerW = W - M.left - M.right;
-  const priceH = 150;
-  const bandH = 20;
-  const gap = 14;                             // ↓ espace entre courbe et bande
-  const bandY = priceH + gap;
-  const axisY = bandY + bandH + 6;            // ↓ axe plus proche de la bande
+  const priceH = 150;             // zone prix
+  const bandH = 20;               // bande "opportunité"
+  const gap = 22;                 // ↑ espace entre la courbe et la bande
+  const bandY = priceH + gap;     // position verticale de la bande
+  const axisY = bandY + bandH + 12; // position de l’axe X sous la bande
 
   const n = rows.length || 0;
   if (n === 0) {
@@ -602,23 +603,29 @@ function OpportunityChart({ rows }: { rows: { t: number; close: number; opp: num
     );
   }
 
+  // --- Scales ---------------------------------------------------------------
   const closes = rows.map(r => r.close);
   const pMin = Math.min(...closes);
   const pMax = Math.max(...closes);
 
   const x = (i: number) => (i * innerW) / Math.max(1, n - 1);
-  const y = (p: number) => priceH - ((p - pMin) * priceH) / Math.max(1e-9, pMax - pMin);
+  const y = (p: number) =>
+    priceH - ((p - pMin) * priceH) / Math.max(1e-9, pMax - pMin);
+
+  // Chemin de la courbe
   const path = rows.map((r, i) => `${i === 0 ? "M" : "L"} ${x(i)} ${y(r.close)}`).join(" ");
 
+  // Recalibrage local de l’opportunité (couleurs rouge→vert)
   const oppVals = rows.map(r => r.opp);
   const oMin = Math.min(...oppVals), oMax = Math.max(...oppVals);
   const scaleOpp01 = (v: number) => (oMax > oMin ? (v - oMin) / (oMax - oMin) : 0.5);
   const oppColor = (v: number) => {
     const s = Math.max(0, Math.min(1, scaleOpp01(v)));
-    const hue = 10 + s * 120; // rouge→vert
+    const hue = 10 + s * 120;
     return `hsl(${hue} 85% 48%)`;
   };
 
+  // Axes X: ~5 ticks + première/dernière
   const tickCount = 5;
   const step = Math.max(1, Math.floor(n / (tickCount + 1)));
   const tickIdx = [0, ...Array.from({ length: tickCount }, (_, k) => Math.min(n - 1, (k + 1) * step)), n - 1]
@@ -626,18 +633,27 @@ function OpportunityChart({ rows }: { rows: { t: number; close: number; opp: num
   const fmtDate = (ms: number) =>
     new Date(ms).toLocaleDateString("fr-FR", { year: "2-digit", month: "short" }).replace(".", "");
 
-  const yTicks = [0, 1/3, 2/3, 1].map(f => pMax - f * (pMax - pMin));
-  const fmtPrice = (v: number) => (Math.abs(v) >= 1000 ? v.toFixed(0) : Math.abs(v) >= 100 ? v.toFixed(1) : v.toFixed(2));
+  // Axes Y: 4 ticks (min..max)
+  const yTicks = [0, 1 / 3, 2 / 3, 1].map(f => pMax - f * (pMax - pMin));
+  const fmtPrice = (v: number) => {
+    const abs = Math.abs(v);
+    if (abs >= 1000) return v.toFixed(0);
+    if (abs >= 100) return v.toFixed(1);
+    return v.toFixed(2);
+  };
 
+  // Min/Max markers
   const iMin = closes.indexOf(pMin);
   const iMax = closes.indexOf(pMax);
 
+  // --- Tooltip (survol) -----------------------------------------------------
   const [hover, setHover] = React.useState<number | null>(null);
   const onMove = (e: React.MouseEvent<SVGSVGElement>) => {
     const svg = e.currentTarget;
     const pt = svg.createSVGPoint();
     pt.x = e.clientX; pt.y = e.clientY;
-    const ctm = svg.getScreenCTM(); if (!ctm) return;
+    const ctm = svg.getScreenCTM();
+    if (!ctm) return;
     const loc = pt.matrixTransform(ctm.inverse());
     const xi = Math.max(0, Math.min(innerW, loc.x - M.left));
     const idx = Math.round((xi / innerW) * (n - 1));
@@ -653,55 +669,96 @@ function OpportunityChart({ rows }: { rows: { t: number; close: number; opp: num
     <div className="mt-3 rounded-2xl border border-slate-800 bg-slate-900/40 overflow-hidden">
       <svg
         viewBox={`0 0 ${W} ${H}`}
-        className="w-full h-[270px]"          // aligné avec H
+        className="w-full h-[290px]" // ↑ hauteur tailwind alignée avec H
         onMouseMove={onMove}
         onMouseLeave={onLeave}
       >
+        {/* Fond */}
         <rect x={0} y={0} width={W} height={H} fill="rgb(2,6,23)" />
 
         <g transform={`translate(${M.left},${M.top})`}>
-          {/* Grille horizontale */}
-          {yTicks.map((v, i) => (
-            <line key={i} x1={0} x2={innerW} y1={y(v)} y2={y(v)} stroke="rgba(148,163,184,0.18)" strokeWidth={1} />
-          ))}
+          {/* Grille horizontale (prix) */}
+          <g>
+            {yTicks.map((v, i) => (
+              <g key={i}>
+                <line
+                  x1={0} x2={innerW}
+                  y1={y(v)} y2={y(v)}
+                  stroke="rgba(148,163,184,0.18)" strokeWidth={1}
+                />
+              </g>
+            ))}
+          </g>
 
           {/* Courbe de prix */}
-          <path d={path} fill="none" stroke="rgba(226,232,240,0.92)" strokeWidth={2} strokeLinejoin="round" strokeLinecap="round" />
+          <path
+            d={path}
+            fill="none"
+            stroke="rgba(226,232,240,0.92)"
+            strokeWidth={2}
+            strokeLinejoin="round"
+            strokeLinecap="round"
+          />
 
           {/* Repères min/max */}
+          {/* MAX */}
           <g transform={`translate(${x(iMax)}, ${y(pMax)})`}>
             <circle r={3.2} fill="rgba(34,197,94,0.9)" />
             <text x={6} y={-6} fontSize="10" fill="rgba(148,163,184,0.9)">Max {fmtPrice(pMax)}</text>
           </g>
+          {/* MIN */}
           <g transform={`translate(${x(iMin)}, ${y(pMin)})`}>
             <circle r={3.2} fill="rgba(244,63,94,0.9)" />
             <text x={6} y={12} fontSize="10" fill="rgba(148,163,184,0.9)">Min {fmtPrice(pMin)}</text>
           </g>
 
-          {/* Bande opportunité — plus bas mais moins d’espace dessous */}
+          {/* Bande opportunité (heat strip) — ↓ plus bas */}
           <g transform={`translate(0, ${bandY})`}>
             <rect x={0} y={0} width={innerW} height={bandH} fill="rgba(2,6,23,0.6)" />
             <rect x={0} y={0} width={innerW} height={bandH} fill="url(#bandShine)" />
             {rows.map((r, i) => {
               const curX = x(i);
               const nextX = x(Math.min(n - 1, i + 1));
-              return <rect key={i} x={curX} y={0} width={Math.max(1, nextX - curX)} height={bandH} fill={oppColor(r.opp)} />;
+              const w = Math.max(1, nextX - curX);
+              return (
+                <rect
+                  key={i}
+                  x={curX} y={0} width={w} height={bandH}
+                  fill={oppColor(r.opp)}
+                />
+              );
             })}
-            <rect x={0} y={0} width={innerW} height={bandH} fill="none" stroke="rgba(148,163,184,0.25)" />
+            <rect x={0} y={0} width={innerW} height={bandH}
+              fill="none" stroke="rgba(148,163,184,0.25)" />
           </g>
 
-          {/* Axe Y (prix) */}
-          {yTicks.map((v, i) => (
-            <text key={i} x={innerW + 6} y={y(v) + 3} fontSize="11" fill="rgba(148,163,184,0.75)">{fmtPrice(v)}</text>
-          ))}
+          {/* Axe Y (prix) : labels à droite */}
+          <g>
+            {yTicks.map((v, i) => (
+              <text
+                key={i}
+                x={innerW + 6}
+                y={y(v) + 3}
+                fontSize="11"
+                fill="rgba(148,163,184,0.75)"
+              >
+                {fmtPrice(v)}
+              </text>
+            ))}
+          </g>
 
-          {/* Axe X (dates) — juste sous la bande */}
+          {/* Axe X (dates) — ↓ sous la bande */}
           <g transform={`translate(0, ${axisY})`}>
             <line x1={0} x2={innerW} y1={0} y2={0} stroke="rgba(148,163,184,0.18)" />
             {tickIdx.map((idx, k) => (
               <g key={k} transform={`translate(${x(idx)},0)`}>
                 <line y1={0} y2={5} stroke="rgba(148,163,184,0.35)" />
-                <text y={18} textAnchor="middle" fontSize="11" fill="rgba(148,163,184,0.75)">
+                <text
+                  y={18}
+                  textAnchor="middle"
+                  fontSize="11"
+                  fill="rgba(148,163,184,0.75)"
+                >
                   {fmtDate(rows[idx].t)}
                 </text>
               </g>
@@ -711,23 +768,40 @@ function OpportunityChart({ rows }: { rows: { t: number; close: number; opp: num
           {/* Crosshair + tooltip */}
           {hoverRow && (
             <g>
-              <line x1={hx} x2={hx} y1={0} y2={axisY} stroke="rgba(148,163,184,0.35)" strokeDasharray="3 3" />
+              {/* ligne verticale qui descend jusqu’à l’axe */}
+              <line
+                x1={hx} x2={hx}
+                y1={0} y2={axisY}
+                stroke="rgba(148,163,184,0.35)"
+                strokeDasharray="3 3"
+              />
+              {/* point */}
               <circle cx={hx} cy={hy} r={3.8} fill="rgb(56,189,248)" stroke="white" strokeWidth={1} />
+
+              {/* tooltip card */}
               {(() => {
-                const pad = 8, w = 160, h = 64;
+                const pad = 8;
+                const w = 160, h = 64;
                 const left = hx + 12 + w > innerW ? hx - 12 - w : hx + 12;
                 const top = Math.max(0, Math.min(priceH - h, hy - h / 2));
                 return (
                   <g transform={`translate(${left}, ${top})`}>
-                    <rect width={w} height={h} rx={10} fill="rgba(2,6,23,0.92)" stroke="rgba(148,163,184,0.35)" />
-                    <text x={pad} y={pad + 10} fontSize="11" fill="rgba(148,163,184,0.9)">
-                      {new Date(hoverRow.t).toLocaleDateString("fr-FR",{ day:"2-digit", month:"short", year:"2-digit"}).replace(".","")}
+                    <rect width={w} height={h} rx={10}
+                      fill="rgba(2,6,23,0.92)"
+                      stroke="rgba(148,163,184,0.35)" />
+                    <text x={pad} y={pad + 10} fontSize="11"
+                      fill="rgba(148,163,184,0.9)">
+                      {new Date(hoverRow.t).toLocaleDateString("fr-FR",
+                        { day: "2-digit", month: "short", year: "2-digit" }).replace(".", "")}
                     </text>
                     <text x={pad} y={pad + 26} fontSize="12" fill="white">
                       Prix: <tspan fontWeight={600}>{fmtPrice(hoverRow.close)}</tspan>
                     </text>
                     <text x={pad} y={pad + 42} fontSize="12" fill="white">
-                      Opportunité: <tspan fontWeight={600}>{Math.max(0, Math.min(100, hoverRow.opp)).toFixed(0)}%</tspan>
+                      Opportunité:{" "}
+                      <tspan fontWeight={600}>
+                        {(Math.max(0, Math.min(100, hoverRow.opp))).toFixed(0)}%
+                      </tspan>
                     </text>
                   </g>
                 );
@@ -736,6 +810,7 @@ function OpportunityChart({ rows }: { rows: { t: number; close: number; opp: num
           )}
         </g>
 
+        {/* Dégradé subtil pour la bande (gloss) */}
         <defs>
           <linearGradient id="bandShine" x1="0" y1="0" x2="0" y2="1">
             <stop offset="0" stopColor="rgba(255,255,255,0.06)" />
