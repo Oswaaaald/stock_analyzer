@@ -19,14 +19,19 @@ function num(x: any): number | null {
   return isNum(x) ? x : raw(x);
 }
 
-/** Normalise un pourcentage vers décimal (12.3 => 0.123 ; 0.123 => 0.123) */
+/** Normalise un pourcentage vers décimal (auto-détection Yahoo : déjà 0.x ou encore %) */
 function normPct(x: any): number | null {
   const v = num(x);
-  if (v == null) return null;
-  if (!isFinite(v)) return null;
-  if (v > 1 && v <= 100) return v / 100;
-  if (v > 100 || v < -100) return null; // aberrations
-  return v;
+  if (v == null || !isFinite(v)) return null;
+
+  // Cas déjà en décimal (ex: 0.15 = 15 %)
+  if (v > 0 && v < 1.2) return v;
+
+  // Cas clairement en % (ex: 15.3 = 15 %)
+  if (v >= 1.2 && v <= 120) return v / 100;
+
+  // Cas aberrant (genre 3000 ou -900)
+  return null;
 }
 
 /** Clamp utilitaire */
