@@ -100,6 +100,9 @@ export type Metrics = {
   grossMarginLevel?: number | null;
   marketShareTrend?: number | null;
 
+  // ✅ Nouveau : proxy unifié (0..1)
+  moatProxy?: number | null;
+
   // ESG
   esgScore?: number | null;
   controversiesLow?: boolean | null;
@@ -117,7 +120,7 @@ export type PillarScores = {
   valuation: number;   // /25
   growth: number;      // /15
   momentum: number;    // /15
-  moat: number;        // /10
+  moat: number | null; // /10 (peut être null si proxy manquant)
   esg: number;         // /5
   governance: number;  // /5
 };
@@ -144,8 +147,8 @@ export type ScorePayload = {
   reasons_positive: string[];
   red_flags: string[];
 
-  subscores: PillarScores; // ← typé strictement
-  coverage: number;        // 0..100
+  subscores: PillarScores;
+  coverage: number;
 
   opportunity_series?: OppPoint[];
 
