@@ -34,6 +34,49 @@ function rsi14FromCloses(closes: number[] | undefined): number | null {
   return 100 - 100 / (1 + rs);
 }
 
+/** Approx ROIC (décimal, ex: 0.25 = 25%) à partir de proxies quand Yahoo ne donne rien. */
+function estimateRoicFromProxies(d: DataBundle): number | null {
+  const f = d.fundamentals;
+  const roe = f.roe?.value;                 // décimal (0.20 = 20%)
+  const opm = f.op_margin?.value;           // décimal
+  const conv = f.fcf_over_netincome?.value; // ~1 idéal
+  const dte = f.debt_to_equity?.value;      // ratio
+
+  // Besoin d'au moins ROE ou marge pour tenter quelque chose
+  if ((roe == null || !isFinite(roe)) && (opm == null || !isFinite(opm))) {
+    return null;
+  }
+
+  // Normalisations 0..1 (bornes larges et robustes)
+  const lin = (v: number | null | undefined, a: number, b: number) => {
+    if (v == null || !isFinite(v)) return 0;
+    const lo = Math.min(a, b), hi = Math.max(a, b);
+    const t = Math.max(0, Math.min(1, (v - lo) / (hi - lo)));
+    return t;
+  };
+
+  const s_roe  = lin(roe, 0.08, 0.35);      // 8% → 35%
+  const s_opm  = lin(opm, 0.08, 0.30);      // 8% → 30%
+  const s_conv = lin(conv, 0.6, 1.2);       // 0.6 → 1.2
+
+  // Score proxy 0..1
+  const score01 = 0.6 * s_roe + 0.3 * s_opm + 0.1 * s_conv;
+
+  // Map vers une plage plausible de ROIC (8%..45%)
+  let roic_est = 0.08 + score01 * (0.45 - 0.08); // décimal
+
+  // Pénalité simple du levier si très élevé
+  if (dte != null && isFinite(dte) && dte > 1.5) {
+    const penalty = Math.min(0.25, 0.05 * (dte - 1.5)); // jusqu'à -25 bps
+    roic_est = Math.max(0, roic_est - penalty);
+  }
+
+  // Clamp final de sécurité
+  roic_est = Math.max(0, Math.min(0.6, roic_est)); // 0%..60%
+
+  return roic_est;
+}
+
 /**
  * Convertit un DataBundle (Yahoo v8/v10) en Metrics pour computePillars().
  * Couvre les 8 piliers quand les champs Fundamentals sont présents.
@@ -50,16 +93,12 @@ export function bundleToMetrics(d: DataBundle): Metrics {
 
   // --- Quality ---
   m.roe = f.roe?.value ?? null;
-  m.roic = f.roic?.value ?? null;
-
-// --- ROIC fallback (approximation si manquant ou non fourni) ---
-  if (m.roic == null && m.roe != null) {
-    let de = f.debt_to_equity?.value ?? 0;
-    if (typeof de !== "number" || !isFinite(de)) de = 0;
-    // Si D/E = 0 (pas de dette), ROIC ≈ ROE
-    m.roic = m.roe / (1 + de);
+  // ✅ ROIC: valeur Yahoo si dispo, sinon fallback estimé
+  m.roic = (f.roic?.value ?? null);
+  if (m.roic == null || !isFinite(m.roic)) {
+    const est = estimateRoicFromProxies(d);
+    if (est != null && isFinite(est)) m.roic = est;
   }
-
   m.netMargin = f.op_margin.value ?? null;                 // proxy net margin
   m.fcfOverNetIncome = f.fcf_over_netincome?.value ?? null;
   m.marginStability = null;                                // à nourrir plus tard (séries pluriannuelles)
@@ -79,19 +118,18 @@ export function bundleToMetrics(d: DataBundle): Metrics {
   m.evToEbitda = f.ev_to_ebitda?.value ?? null;
 
   // --- Growth ---
-  // Yahoo financialData.revenueGrowth / earningsGrowth (YoY) → proxies
-  m.forwardRevGrowth = f.rev_growth?.value ?? null;
-  m.cagrEps3y = f.eps_growth?.value ?? null;
-  m.cagrRevenue3y = null; // restera null tant qu'on n'a pas une série revenue multi-années
+  m.forwardRevGrowth = f.rev_growth?.value ?? null;  // YoY proxy
+  m.cagrEps3y = f.eps_growth?.value ?? null;         // YoY proxy pour 3y
+  m.cagrRevenue3y = null;
 
   // --- Momentum ---
-  m.perf6m  = perf6mFromSeries  ?? (p.ret_60d.value ?? null); // fallback 60j ≈ 3 mois
-  m.perf12m = perf12mFromSeries ?? null;                      // 12m depuis série uniquement
+  m.perf6m  = perf6mFromSeries  ?? (p.ret_60d.value ?? null);
+  m.perf12m = perf12mFromSeries ?? null;
   m.above200dma = (p.px_vs_200dma.value ?? 0) >= 0;
-  m.rsi = rsi14FromCloses(p.series?.closes);                 // RSI(14) depuis la série des prix
+  m.rsi = rsi14FromCloses(p.series?.closes);
 
   // --- Moat (proxy unifié + placeholders) ---
-  m.moatProxy = f.moat_proxy?.value ?? null; // ✅ nouveau proxy (0..1 si dispo)
+  m.moatProxy = f.moat_proxy?.value ?? null;
   m.roicPersistence = null;
   m.grossMarginLevel = null;
   m.marketShareTrend = null;

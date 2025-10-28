@@ -140,7 +140,7 @@ export async function GET(req: Request, { params }: { params: { ticker: string }
         roe: fundamentals.roe?.value ?? null,
         roa: fundamentals.roa?.value ?? null,
         fcf_over_netincome: fundamentals.fcf_over_netincome?.value ?? null,
-        roic: fundamentals.roic?.value ?? null,
+        roic: fundamentals.roic?.value ?? (metrics.roic ?? null),
       },
     };
 
