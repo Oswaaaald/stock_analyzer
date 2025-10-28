@@ -190,19 +190,31 @@ export function computePillars(m: Metrics): ComputeResult {
   let s_momentum =
     (mo_6 * 0.3 + mo_12 * 0.35 + mo_200 * 0.25 + mo_rsi * 0.1) * 15;
 
-  // ---- Moat /10
+  // ---- Moat /10 (avec proxy) ----
   has(m.roicPersistence);
   has(m.grossMarginLevel);
   has(m.marketShareTrend);
-  const mt_roic = clamp(nz(m.roicPersistence) ?? 0, 0, 1);
-  const mt_gm = clamp(nz(m.grossMarginLevel) ?? 0, 0, 1);
-  const mt_ms = clamp(nz(m.marketShareTrend) ?? 0, 0, 1);
-  let s_moat = (mt_roic * 0.5 + mt_gm * 0.3 + mt_ms * 0.2) * 10;
+  let s_moat: number | null = null;
 
-  if ((m.roicPersistence ?? 0) > 0.6)
-    reasons.push("ROIC > WACC de façon durable (moat)");
-  if ((m.marketShareTrend ?? 1) < 0.3)
-    flags.push("Part de marché peu défendue");
+  if (m.moatProxy != null && isFinite(m.moatProxy)) {
+    // proxy déjà 0..1 → échelle /10
+    s_moat = clamp(m.moatProxy, 0, 1) * 10;
+  } else {
+    const mt_roic = clamp(nz(m.roicPersistence) ?? 0, 0, 1);
+    const mt_gm = clamp(nz(m.grossMarginLevel) ?? 0, 0, 1);
+    const mt_ms = clamp(nz(m.marketShareTrend) ?? 0, 0, 1);
+    const hasAny = [mt_roic, mt_gm, mt_ms].some((v) => v > 0);
+    if (hasAny) {
+      s_moat = (mt_roic * 0.5 + mt_gm * 0.3 + mt_ms * 0.2) * 10;
+    } else {
+      s_moat = null; // ➜ pas de data : pilier null (sera ignoré au total via route.ts)
+    }
+  }
+
+  if ((s_moat ?? 0) > 7)
+    reasons.push("Rendements élevés & marges solides (moat probable)");
+  if (s_moat != null && s_moat < 3)
+    flags.push("Avantage concurrentiel limité");
 
   // ---- ESG /5
   has(m.esgScore);
@@ -237,19 +249,14 @@ export function computePillars(m: Metrics): ComputeResult {
   let s_gov =
     (gv_div * 0.3 + gv_pay * 0.25 + gv_bb * 0.25 + gv_in * 0.2) * 5;
 
-  if ((m.buybackYield ?? 0) > 0.03)
-    reasons.push("Rachats d’actions significatifs");
-  if ((m.payoutRatio ?? 0) > 1.0)
-    flags.push("Payout >100% (risque sur dividende)");
-
-  // ---- Clamp par pilier (sécurité future)
+  // ---- Clamp par pilier (avec moat potentiellement null) ----
   const subscores: PillarScores = {
     quality: clamp(s_quality, 0, 35),
     safety: clamp(s_safety, 0, 25),
     valuation: clamp(s_valuation, 0, 25),
     growth: clamp(s_growth, 0, 15),
     momentum: clamp(s_momentum, 0, 15),
-    moat: clamp(s_moat, 0, 10),
+    moat: s_moat == null ? null : clamp(s_moat, 0, 10),
     esg: clamp(s_esg, 0, 5),
     governance: clamp(s_gov, 0, 5),
   };

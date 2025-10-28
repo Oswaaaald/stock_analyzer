@@ -79,9 +79,10 @@ export function bundleToMetrics(d: DataBundle): Metrics {
   m.perf6m  = perf6mFromSeries  ?? (p.ret_60d.value ?? null); // fallback 60j ≈ 3 mois
   m.perf12m = perf12mFromSeries ?? null;                      // 12m depuis série uniquement
   m.above200dma = (p.px_vs_200dma.value ?? 0) >= 0;
-  m.rsi = rsi14FromCloses(p.series?.closes);                 // NEW: RSI(14) depuis la série des prix
+  m.rsi = rsi14FromCloses(p.series?.closes);                 // RSI(14) depuis la série des prix
 
-  // --- Moat (placeholders) ---
+  // --- Moat (proxy unifié + placeholders) ---
+  m.moatProxy = f.moat_proxy?.value ?? null; // ✅ nouveau proxy (0..1 si dispo)
   m.roicPersistence = null;
   m.grossMarginLevel = null;
   m.marketShareTrend = null;

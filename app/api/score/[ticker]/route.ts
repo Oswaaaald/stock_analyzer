@@ -69,9 +69,24 @@ export async function GET(req: Request, { params }: { params: { ticker: string }
     const metrics = bundleToMetrics(bundle);
     const pillars = computePillars(metrics);
 
-    // --- 5) Score global et couleur
-    const totalScore = Object.values(pillars.subscores).reduce((a, b) => a + b, 0);
-    const score_adj = Math.round(totalScore);
+    // --- 5) Score global (renormalisé : ignore les piliers null)
+    const weights: Record<keyof ScorePayload["subscores"], number> = {
+      quality: 35, safety: 25, valuation: 25, growth: 15,
+      momentum: 15, moat: 10, esg: 5, governance: 5,
+    };
+
+    let sum = 0;
+    let maxPossible = 0;
+    for (const [k, w] of Object.entries(weights) as [keyof typeof weights, number][]) {
+      const v = pillars.subscores[k];
+      if (typeof v === "number" && isFinite(v)) {
+        sum += v;
+        maxPossible += w;
+      }
+    }
+    // évite division par 0 (cas extrême data absente)
+    const score_adj = maxPossible > 0 ? Math.round((sum / maxPossible) * 100) : 0;
+
     const color: ScorePayload["color"] =
       score_adj >= 65 ? "green" : score_adj >= 50 ? "orange" : "red";
 
@@ -142,11 +157,10 @@ export async function GET(req: Request, { params }: { params: { ticker: string }
           metrics: missingMetrics(metrics as any),
         },
       };
-      // Log serveur compact
       console.log(`[score dbg ${t}]`, JSON.stringify((payload as any).debug.missing));
     }
 
-    // --- 9) Mise en cache et retour
+    // --- 9) Cache & retour
     if (!isDebug) MEM[cacheKey] = { expires: now + TTL_MS, data: payload };
     return NextResponse.json(payload, {
       headers: { "Cache-Control": "s-maxage=600, stale-while-revalidate=1200" },
