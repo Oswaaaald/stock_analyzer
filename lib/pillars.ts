@@ -55,20 +55,20 @@ export function computePillars(m: Metrics): ComputeResult {
       fieldsPresent++;
   }
 
-  // ---- Sanitize anti-outliers (n’influe pas sur les champs absents) ----
+  // ---- Sanitize anti-outliers (calibrage v2) ----
   const S = {
-    pe: [0, 80] as const,
-    ev: [0, 40] as const,
-    y: [-0.05, 0.15] as const, // yields & EPS/Rev growth clamp
-    g: [-0.2, 0.6] as const, // CAGR / forward growth
-    p6: [-0.5, 1.0] as const, // perf 6m
-    p12: [-0.5, 1.0] as const, // perf 12m
+    pe: [0, 100] as const,
+    ev: [0, 50] as const,
+    y: [-0.1, 0.2] as const, // yields & EPS/Rev growth clamp
+    g: [-0.25, 0.8] as const, // CAGR / forward growth
+    p6: [-0.5, 1.0] as const,
+    p12: [-0.5, 1.0] as const,
     rsi: [0, 100] as const,
-    dte: [0, 6] as const,
-    nde: [-2, 8] as const, // netDebt/EBITDA (autorise net cash < 0)
-    ic: [0, 80] as const, // interest coverage
-    cr: [0, 4] as const, // current ratio
-    pct: [0, 1] as const, // 0..1 metrics
+    dte: [0, 7] as const,
+    nde: [-3, 9] as const,
+    ic: [0, 80] as const,
+    cr: [0, 4] as const,
+    pct: [0, 1] as const,
   };
   const clampIf = (
     v: number | null | undefined,
@@ -103,7 +103,7 @@ export function computePillars(m: Metrics): ComputeResult {
   m.grossMarginLevel = clampIf(m.grossMarginLevel ?? null, S.pct);
   m.marketShareTrend = clampIf(m.marketShareTrend ?? null, S.pct);
   m.insiderOwnership = clampIf(m.insiderOwnership ?? null, S.pct);
-  // NB: roe/roic/netMargin/fcfOverNetIncome restent débornés ici, ils sont mappés via lin(...)
+  // NB: roe/roic/netMargin/fcfOverNetIncome restent débornés ici
 
   // ---- Quality /35
   has(m.roe);
@@ -130,14 +130,14 @@ export function computePillars(m: Metrics): ComputeResult {
   has(m.netDebtToEbitda);
   has(m.interestCoverage);
   has(m.currentRatio);
-  const s_dte = lin(nz(m.debtToEquity), 2.0, 0.2, true) ?? 0;
-  const s_ndebt = lin(nz(m.netDebtToEbitda), 3.5, 0.0, true) ?? 0;
-  const s_cov = lin(nz(m.interestCoverage), 2, 15) ?? 0;
-  const s_curr = lin(nz(m.currentRatio), 1.0, 2.0) ?? 0;
+  const s_dte = lin(nz(m.debtToEquity), 2.5, 0.25, true) ?? 0;
+  const s_ndebt = lin(nz(m.netDebtToEbitda), 4.5, 0.5, true) ?? 0;
+  const s_cov = lin(nz(m.interestCoverage), 1.5, 12) ?? 0;
+  const s_curr = lin(nz(m.currentRatio), 0.9, 1.8) ?? 0;
   let s_safety =
     (s_dte * 0.28 + s_ndebt * 0.32 + s_cov * 0.24 + s_curr * 0.16) * 25;
 
-  if ((m.netDebtToEbitda ?? 0) > 3.5)
+  if ((m.netDebtToEbitda ?? 0) > 4.5)
     flags.push("Levier financier élevé");
   if ((m.interestCoverage ?? 999) < 2)
     flags.push("Couverture des intérêts faible");
@@ -147,16 +147,16 @@ export function computePillars(m: Metrics): ComputeResult {
   has(m.evToEbitda);
   has(m.fcfYield);
   has(m.earningsYield);
-  const v_pe = lin(nz(m.pe), 30, 10, true) ?? 0;
-  const v_ev = lin(nz(m.evToEbitda), 20, 6, true) ?? 0;
-  const v_fcf = lin(nz(m.fcfYield), 0.02, 0.08) ?? 0;
-  const v_ey = lin(nz(m.earningsYield), 0.03, 0.1) ?? 0;
+  const v_pe = lin(nz(m.pe), 40, 15, true) ?? 0;
+  const v_ev = lin(nz(m.evToEbitda), 22, 8, true) ?? 0;
+  const v_fcf = lin(nz(m.fcfYield), 0.015, 0.06) ?? 0;
+  const v_ey = lin(nz(m.earningsYield), 0.025, 0.09) ?? 0;
   let s_valuation =
-    (v_pe * 0.3 + v_ev * 0.2 + v_fcf * 0.35 + v_ey * 0.15) * 25;
+    (v_pe * 0.25 + v_ev * 0.20 + v_fcf * 0.35 + v_ey * 0.20) * 25;
 
   if ((m.fcfYield ?? 0) >= 0.08)
     reasons.push("Rendement FCF attractif");
-  if ((m.pe ?? 0) > 40)
+  if ((m.pe ?? 0) > 45)
     flags.push("Multiples de valorisation élevés");
 
   // ---- Growth /15
@@ -197,7 +197,6 @@ export function computePillars(m: Metrics): ComputeResult {
   let s_moat: number | null = null;
 
   if (m.moatProxy != null && isFinite(m.moatProxy)) {
-    // proxy déjà 0..1 → échelle /10
     s_moat = clamp(m.moatProxy, 0, 1) * 10;
   } else {
     const mt_roic = clamp(nz(m.roicPersistence) ?? 0, 0, 1);
@@ -207,7 +206,7 @@ export function computePillars(m: Metrics): ComputeResult {
     if (hasAny) {
       s_moat = (mt_roic * 0.5 + mt_gm * 0.3 + mt_ms * 0.2) * 10;
     } else {
-      s_moat = null; // ➜ pas de data : pilier null (sera ignoré au total via route.ts)
+      s_moat = null;
     }
   }
 
@@ -216,20 +215,24 @@ export function computePillars(m: Metrics): ComputeResult {
   if (s_moat != null && s_moat < 3)
     flags.push("Avantage concurrentiel limité");
 
-  // ---- ESG /5
-  has(m.esgScore);
+  // ---- ESG /5 (proxy réaliste basé sur gouvernance + réputation) ----
+  has(m.insiderOwnership);
+  has(m.buybackYield);
   has(m.controversiesLow);
-  const esg_base =
-    m.esgScore == null
-      ? 0.5
-      : clamp((m.esgScore ?? 50) / 100, 0, 1);
-  const esg_bonus =
-    m.controversiesLow == null
-      ? 0.0
-      : m.controversiesLow
-      ? 0.1
-      : -0.1;
-  let s_esg = clamp(esg_base + esg_bonus, 0, 1) * 5;
+  has(m.payoutRatio);
+
+  const e_insider = lin(nz(m.insiderOwnership), 0.005, 0.03) ?? 0;
+  const e_buyback = lin(nz(m.buybackYield), 0, 0.03) ?? 0;
+  const e_contro = m.controversiesLow === true ? 1 : 0.6;
+  const e_payout = sweetSpot(m.payoutRatio, 0.3, 0.6, 0.0, 1.5);
+
+  const esg_proxy =
+    e_insider * 0.3 +
+    e_buyback * 0.2 +
+    e_contro * 0.3 +
+    e_payout * 0.2;
+
+  let s_esg = clamp(esg_proxy, 0, 1) * 5;
 
   // ---- Governance /5
   has(m.dividendCagr3y);
