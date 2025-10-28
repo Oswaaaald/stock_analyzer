@@ -51,6 +51,16 @@ export function bundleToMetrics(d: DataBundle): Metrics {
   // --- Quality ---
   m.roe = f.roe?.value ?? null;
   m.roic = f.roic?.value ?? null;
+
+  // --- ROIC fallback (approximation si manquant) ---
+  if (m.roic == null && m.roe != null && f.debt_to_equity?.value != null) {
+    // Approximation économique : ROIC ≈ ROE / (1 + D/E)
+    const de = f.debt_to_equity.value;
+    if (typeof de === "number" && isFinite(de)) {
+      m.roic = m.roe / (1 + de);
+    }
+  }
+
   m.netMargin = f.op_margin.value ?? null;                 // proxy net margin
   m.fcfOverNetIncome = f.fcf_over_netincome?.value ?? null;
   m.marginStability = null;                                // à nourrir plus tard (séries pluriannuelles)
