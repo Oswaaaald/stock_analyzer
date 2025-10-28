@@ -52,13 +52,12 @@ export function bundleToMetrics(d: DataBundle): Metrics {
   m.roe = f.roe?.value ?? null;
   m.roic = f.roic?.value ?? null;
 
-  // --- ROIC fallback (approximation si manquant) ---
-  if (m.roic == null && m.roe != null && f.debt_to_equity?.value != null) {
-    // Approximation économique : ROIC ≈ ROE / (1 + D/E)
-    const de = f.debt_to_equity.value;
-    if (typeof de === "number" && isFinite(de)) {
-      m.roic = m.roe / (1 + de);
-    }
+// --- ROIC fallback (approximation si manquant ou non fourni) ---
+  if (m.roic == null && m.roe != null) {
+    let de = f.debt_to_equity?.value ?? 0;
+    if (typeof de !== "number" || !isFinite(de)) de = 0;
+    // Si D/E = 0 (pas de dette), ROIC ≈ ROE
+    m.roic = m.roe / (1 + de);
   }
 
   m.netMargin = f.op_margin.value ?? null;                 // proxy net margin
